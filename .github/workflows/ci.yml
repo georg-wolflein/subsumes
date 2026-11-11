@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Both static checks share one job, and clippy runs even when the formatting is off, so one
+  # failure does not hide the other.
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: cargo fmt
+        run: cargo fmt --check
+      - name: cargo clippy
+        if: ${{ !cancelled() }}
+        run: cargo clippy --locked --all-targets -- --deny warnings
+
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: cargo test --locked
+
+  # The benchmark corpus that the Makefile pins. So far the job only downloads it and checks
+  # its SHA-256: nothing runs over it until the library has a harness.
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download the pinned corpus
+        run: make benchmark
