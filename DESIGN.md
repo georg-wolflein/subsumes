@@ -4,21 +4,21 @@
 
 The [README](README.md) states the goals, the verdicts and what is unsupported. This document is the plan for the implementation.
 
-**Status:** the API and the benchmark harness exist, and every check returns `UNKNOWN`. The [pipeline](#pipeline) is still to be built, in the [order of work](#order-of-work) below.
+**Status:** the API and the benchmark harness exist, and every check returns `Unknown`. The [pipeline](#pipeline) is still to be built, in the [order of work](#order-of-work) below.
 
 ## Method
 
 A subsumes B exactly when no instance satisfies `all[B, not A]`. The engine normalizes that conjunction into a disjunction of *canonical conjunctions*, each of them satisfiable by construction or refuted to `false`.
 
-- No conjunction is left: `YES`.
-- A conjunction is left: a counterexample is generated from it, and the verdict is `NO`.
-- Every conjunction left contains something the engine cannot model, or the budget ran out: `UNKNOWN`.
+- No conjunction is left: `Yes`.
+- A conjunction is left: a counterexample is generated from it, and the verdict is `No`.
+- Every conjunction left contains something the engine cannot model, or the budget ran out: `Unknown`.
 
 ## Decisions
 
 - **Sound before complete.** What cannot be modelled exactly becomes an `Unknown` leaf. A leaf never refutes a conjunction and never contributes to a counterexample.
 - **Equal leaves cancel.** Two leaves from the same keyword with the same value are one predicate, so `u ∧ ¬u` is refuted. A schema subsumes itself even if it contains `uniqueItems: true`.
-- **Two causes of `UNKNOWN`.** An unsupported construct, reported with its schema and location, or the budget. A check that needs the infinite unfolding of a recursive schema counts as the first, at the reference that closes the cycle.
+- **Two causes of the verdict `Unknown`.** An unsupported construct, reported with its schema and location, or the budget. A check that needs the infinite unfolding of a recursive schema counts as the first, at the reference that closes the cycle.
 - **One budget, in steps.** Everything that can blow up charges it: insertions into canonical conjunctions, automaton states, `unevaluated*` scenarios, the search for a counterexample, nesting depth. There is no other limit. Steps do not depend on the machine, so a pair gets the same verdict everywhere. The default of 500,000 comes from the Python version and is set anew once there are measurements.
 - **Invalid input is an error, not a verdict.** A root that is no schema, another dialect, a keyword of the wrong shape, a reference that resolves to nothing. Each error names the schema and the location. A pattern that the `regex` crate rejects is not an error but an `Unknown` leaf.
 - **No validator in the library.** A counterexample is returned unchecked. Tooling outside the library checks counterexamples; see [Testing](#testing).
@@ -95,7 +95,7 @@ The engine works on *terms*, not keywords:
 
 ### Generate
 
-- The normal form of B is computed first. Each of its conjunctions is conjoined with `not A` and searched for a counterexample before the next is touched, so a `NO` usually comes long before the whole normal form exists.
+- The normal form of B is computed first. Each of its conjunctions is conjoined with `not A` and searched for a counterexample before the next is touched, so a `No` usually comes long before the whole normal form exists.
 - Generation is bottom-up and memoized per c-reference. A reference in progress has no counterexample, which is the same least fixed point.
 - Numbers search the interval for a multiple that is none of the excluded ones. Strings take the shortest word within the length bounds. Objects choose members per fragment, arrays choose which positions satisfy which `contains`.
 
@@ -121,10 +121,10 @@ Regular languages of strings are a second library in the workspace, `subsumes-re
 ## Testing
 
 - **Unit tests** per module.
-- **The corpus.** CI runs every pull request over the pinned [benchmark](https://github.com/georg-wolflein/subsumes-benchmark) release and comments the comparison with `main`. It fails on a wrong verdict, on an error, and on a check that `main` decided and the pull request answers `UNKNOWN`, unless the pull request has the label `allow-lost-verdicts`. Steps and times are reported, not enforced.
+- **The corpus.** CI runs every pull request over the pinned [benchmark](https://github.com/georg-wolflein/subsumes-benchmark) release and comments the comparison with `main`. It fails on a wrong verdict, on an error, and on a check that `main` decided and the pull request answers `Unknown`, unless the pull request has the label `allow-lost-verdicts`. Steps and times are reported, not enforced.
 - **Languages.** In `subsumes-regex`, property tests on random patterns compare the automata with two oracles: the `regex` crate on which strings match, and `regexsolver` on intersection, complement and inclusion. Both are dependencies of its tests only.
-- **`NO`.** A checker outside the library validates each counterexample against both schemas, with patterns matched by the `regex` crate. It is not built yet.
-- **`YES`** has nothing to validate. Beyond the labels of the corpus there are metamorphic tests: `a` subsumes `a`, `a` subsumes `allOf[a, x]`, and `anyOf[a, x]` subsumes `a`.
+- **`No`.** A checker outside the library validates each counterexample against both schemas, with patterns matched by the `regex` crate. It is not built yet.
+- **`Yes`** has nothing to validate. Beyond the labels of the corpus there are metamorphic tests: `a` subsumes `a`, `a` subsumes `allOf[a, x]`, and `anyOf[a, x]` subsumes `a`.
 
 ## Layout
 
@@ -145,10 +145,10 @@ harness/          the benchmark runner (exists)
 
 ## Order of work
 
-Each step goes through all four stages for the keywords it adds, and lands as its own pull request. The benchmark comment shows what the step decides, and its table of `UNKNOWN` reasons shows what blocks the most checks.
+Each step goes through all four stages for the keywords it adds, and lands as its own pull request. The benchmark comment shows what the step decides, and its table of reasons for `Unknown` shows what blocks the most checks.
 
 1. **Schema graph:** nodes, locations, errors, references through `referencing`.
-2. **Engine skeleton:** context, budget, terms, variables, lazy negation and fast mode; `type`, booleans, `null`, the connectives, `$ref` with recursion. First `YES` and `NO`.
+2. **Engine skeleton:** context, budget, terms, variables, lazy negation and fast mode; `type`, booleans, `null`, the connectives, `$ref` with recursion. First `Yes` and `No`.
 3. **Numbers.**
 4. **Strings:** the `subsumes-regex` crate, then patterns, formats and lengths in the engine.
 5. **Objects.**

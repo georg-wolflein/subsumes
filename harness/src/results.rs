@@ -68,13 +68,13 @@ impl Outcome {
         }
     }
 
-    /// The verdict in capitals, with the reason of an `UNKNOWN` or the message of an error.
+    /// The verdict by its name, with the reason of an `Unknown` or the message of an error.
     pub fn label(&self) -> String {
         match self {
-            Self::Yes => "YES".to_owned(),
-            Self::No { .. } => "NO".to_owned(),
-            Self::Unknown { reason, .. } => format!("UNKNOWN ({reason})"),
-            Self::Error { message } => format!("ERROR ({message})"),
+            Self::Yes => "Yes".to_owned(),
+            Self::No { .. } => "No".to_owned(),
+            Self::Unknown { reason, .. } => format!("Unknown ({reason})"),
+            Self::Error { message } => format!("Error ({message})"),
         }
     }
 
@@ -83,7 +83,7 @@ impl Outcome {
     }
 }
 
-/// What the reasons for `UNKNOWN` are counted by.
+/// What the reasons for `Unknown` are counted by.
 fn group(reason: &Reason) -> String {
     match reason {
         Reason::Budget => "budget".to_owned(),
@@ -128,7 +128,7 @@ impl Record {
         self.case.split('/').next().unwrap_or(&self.case)
     }
 
-    /// A `YES` or `NO` that contradicts the label. An `UNKNOWN` is never wrong.
+    /// A `Yes` or `No` that contradicts the label. An `Unknown` is never wrong.
     pub fn is_wrong(&self) -> bool {
         matches!(
             (self.expected, &self.outcome),
