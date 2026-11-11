@@ -15,7 +15,7 @@ The same check is useful for APIs, where it tells you whether a schema change is
 Each check returns one of three verdicts:
 
 - **`YES`**: Every instance valid under B is also valid under A.
-- **`NO`**: Some instance is valid under B but invalid under A. The verdict carries such an instance as a counterexample, which is validated against both schemas before it is returned.
+- **`NO`**: Some instance is valid under B but invalid under A. The verdict carries such an instance as a counterexample.
 - **`UNKNOWN`**: The library cannot decide and provides a reason: either the answer depends on an [unsupported construct](#unsupported-constructs), or the check ran out of its work budget.
 
 ## Goals
