@@ -12,8 +12,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Both static checks share one job, and clippy runs even when the formatting is off, so one
-  # failure does not hide the other.
+  # clippy runs even when the formatting is off, so one failure does not hide the other.
   checks:
     runs-on: ubuntu-latest
     steps:
@@ -30,17 +29,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: cargo test --workspace --locked
 
-  # The library over the whole benchmark corpus: verdicts, steps and times. A push to main
-  # uploads its results as an artifact; a pull request fetches the artifact of its base commit
-  # and comments the comparison on the PR. The job fails on a wrong verdict, and on a check
-  # that the base decided and that is UNKNOWN now unless the PR has the label
-  # allow-lost-verdicts. Steps and times never fail it.
+  # Runs on every pull request, so that regressions and improvements show, and posts the results
+  # as a comment on the pull request.
   benchmark:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      actions: read # to find and download the artifact of the base commit
-      pull-requests: write # to read the labels and post the comment
+      actions: read # to download the results of the base branch
+      pull-requests: write # to post the comment
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Download the pinned corpus
@@ -57,9 +53,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        # The PR is checked out merged into the base branch's tip, so that tip is the baseline.
-        # Its run may still be in progress or have expired, so walk back along the base branch
-        # to the newest commit whose push run has the artifact.
+        # Every push to main uploads its results; take the newest that the base branch has.
         run: |
           for sha in $(gh api "repos/$GITHUB_REPOSITORY/commits?sha=$BASE_SHA&per_page=20" --jq '.[].sha'); do
             run_id=$(gh run list --workflow ci.yml --event push --commit "$sha" --status completed \
@@ -76,8 +70,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
-        # The labels are read now and not from the event, so that adding the label and running
-        # the job again is enough.
+        # The label is read here, so adding it and running the job again is enough.
         run: |
           arguments=()
           if [ -f baseline/results.jsonl ]; then
