@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::results::{Counts, Direction, Outcome, Record};
 
-/// The label on a pull request that accepts checks lost to `UNKNOWN`.
+/// The label on a pull request that accepts checks lost to `Unknown`.
 pub const LABEL: &str = "allow-lost-verdicts";
 
 /// At most this many entries per list: GitHub caps a comment at 65,536 characters.
@@ -21,7 +21,7 @@ pub struct Base<'a> {
 pub struct Comparison {
     /// The comment, as Markdown.
     pub comment: String,
-    /// The checks that the base decided and this run answers with `UNKNOWN` or an error.
+    /// The checks that the base decided and this run answers with `Unknown` or an error.
     pub lost: usize,
 }
 
@@ -125,9 +125,9 @@ fn tally(head: &[Record], base: Option<&Base>) -> String {
         &[
             "collection",
             "checks",
-            "YES",
-            "NO",
-            "UNKNOWN",
+            "Yes",
+            "No",
+            "Unknown",
             "wrong",
             "errors",
         ],
@@ -192,9 +192,9 @@ fn failures(head: &[Record]) -> Vec<String> {
         .filter(|record| record.is_wrong())
         .map(|record| {
             let expected = if record.expected == Some(true) {
-                "YES"
+                "Yes"
             } else {
-                "NO"
+                "No"
             };
             format!(
                 "{}: {}, and the corpus says {expected}",
@@ -234,14 +234,14 @@ fn lost(pairs: &[Pair], allowed: bool) -> Option<String> {
             ),
         )
     };
-    let heading = format!("{} lost to UNKNOWN", plural(pairs.len(), "check"));
+    let heading = format!("{} lost to Unknown", plural(pairs.len(), "check"));
     Some(format!(
         "### {mark} {heading}\n\n{consequence}\n\n{}",
         bullets(&transitions(pairs))
     ))
 }
 
-/// The reasons for `UNKNOWN`, counted.
+/// The reasons for `Unknown`, counted.
 fn reasons(head: &[Record], base: Option<&Base>) -> String {
     let now = per_reason(head);
     let before = base.map(|base| per_reason(base.records));
@@ -267,7 +267,7 @@ fn reasons(head: &[Record], base: Option<&Base>) -> String {
         table(&["reason", "checks"], &rows)
     };
     details(
-        &format!("Reasons for UNKNOWN ({})", plural(now.len(), "reason")),
+        &format!("Reasons for Unknown ({})", plural(now.len(), "reason")),
         &body,
     )
 }
@@ -294,7 +294,7 @@ fn verdict_changes(changes: &Changes) -> Vec<String> {
     }
     if !changes.flipped.is_empty() {
         let heading = format!(
-            ":warning: {} changed between YES and NO",
+            ":warning: {} changed between Yes and No",
             plural(changes.flipped.len(), "check")
         );
         parts.push(details(&heading, &bullets(&transitions(&changes.flipped))));
@@ -488,7 +488,7 @@ mod tests {
 
         let refused = compare(&head, Some(&base), false);
         assert_eq!(refused.lost, 1);
-        assert!(refused.comment.contains("### :x: 1 check lost to UNKNOWN"));
+        assert!(refused.comment.contains("### :x: 1 check lost to Unknown"));
         assert!(
             refused
                 .comment
@@ -497,7 +497,7 @@ mod tests {
         assert!(
             refused
                 .comment
-                .contains("- `one/a` a_subsumes_b: YES to UNKNOWN (budget)")
+                .contains("- `one/a` a_subsumes_b: Yes to Unknown (budget)")
         );
         assert!(
             refused
@@ -510,7 +510,7 @@ mod tests {
         assert!(
             accepted
                 .comment
-                .contains("### :warning: 1 check lost to UNKNOWN")
+                .contains("### :warning: 1 check lost to Unknown")
         );
         assert!(
             accepted
@@ -535,8 +535,8 @@ mod tests {
         let comment = comparison.comment;
         assert!(comment.contains("Compared with `abc1234` on the base branch."));
         assert!(comment.contains(":white_check_mark: 1 check newly decided"));
-        assert!(comment.contains("- `one/a` a_subsumes_b: UNKNOWN (budget) to YES"));
-        assert!(comment.contains(":warning: 1 check changed between YES and NO"));
+        assert!(comment.contains("- `one/a` a_subsumes_b: Unknown (budget) to Yes"));
+        assert!(comment.contains(":warning: 1 check changed between Yes and No"));
         assert!(comment.contains("1 check with a different number of steps"));
         assert!(comment.contains("| `one/a` a_subsumes_b | 0 | 9 | +9 |"));
         assert!(comment.contains("took 11 (+9) steps in total"));
@@ -555,11 +555,11 @@ mod tests {
         );
         let comment = compare(&[wrong, error], None, false).comment;
         assert!(comment.contains(
-            "### :x: 1 wrong verdict\n\n- `one/a` a_subsumes_b: NO, and the corpus says YES"
+            "### :x: 1 wrong verdict\n\n- `one/a` a_subsumes_b: No, and the corpus says Yes"
         ));
         assert!(
             comment
-                .contains("### :x: 1 error\n\n- `one/b` a_subsumes_b: ERROR (schema A is neither")
+                .contains("### :x: 1 error\n\n- `one/b` a_subsumes_b: Error (schema A is neither")
         );
         assert!(comment.contains("| **total** | 2 | 0 | 1 | 0 | 1 | 1 |"));
     }

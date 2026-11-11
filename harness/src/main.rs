@@ -25,7 +25,7 @@ enum Command {
     Run(RunArguments),
     /// Render the results as the benchmark comment of a pull request.
     ///
-    /// Fails when a check that the base decided is UNKNOWN now, unless --allow-lost is given.
+    /// Fails when a check that the base decided is Unknown now, unless --allow-lost is given.
     Compare(CompareArguments),
 }
 
@@ -47,7 +47,7 @@ struct CompareArguments {
     /// What the comment calls the base, such as its commit.
     #[arg(long, value_name = "NAME")]
     base_label: Option<String>,
-    /// Pass even when a check that the base decided is UNKNOWN now.
+    /// Pass even when a check that the base decided is Unknown now.
     #[arg(long)]
     allow_lost: bool,
     /// Write the comment to this file and not to the terminal.
@@ -83,7 +83,7 @@ fn run(arguments: &RunArguments) -> Result<bool, String> {
 
     let counts = Counts::of(&records);
     println!(
-        "{} checks: {} YES, {} NO, {} UNKNOWN, {} wrong, {} errors",
+        "{} checks: {} Yes, {} No, {} Unknown, {} wrong, {} errors",
         counts.checks, counts.yes, counts.no, counts.unknown, counts.wrong, counts.errors
     );
     println!(
@@ -116,7 +116,7 @@ fn compare(arguments: &CompareArguments) -> Result<bool, String> {
     }
     if comparison.lost > 0 && !arguments.allow_lost {
         eprintln!(
-            "{} checks that the base decided are UNKNOWN now; the label `{LABEL}` on the pull request accepts that",
+            "{} checks that the base decided are Unknown now; the label `{LABEL}` on the pull request accepts that",
             comparison.lost
         );
         return Ok(false);

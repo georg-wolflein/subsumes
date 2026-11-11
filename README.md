@@ -14,13 +14,13 @@ The same check is useful for APIs, where it tells you whether a schema change is
 
 Each check returns one of three verdicts:
 
-- **`YES`**: Every instance valid under B is also valid under A.
-- **`NO`**: Some instance is valid under B but invalid under A. The verdict carries such an instance as a counterexample.
-- **`UNKNOWN`**: The library cannot decide and provides a reason: either the answer depends on an [unsupported construct](#unsupported-constructs), or the check ran out of its work budget.
+- **`Yes`**: Every instance valid under B is also valid under A.
+- **`No`**: Some instance is valid under B but invalid under A. The verdict carries such an instance as a counterexample.
+- **`Unknown`**: The library cannot decide and provides a reason: either the answer depends on an [unsupported construct](#unsupported-constructs), or the check ran out of its work budget.
 
 ## Goals
 
-- **Soundness:** `YES` and `NO` are returned only when certain; whatever we cannot model exactly leads to `UNKNOWN` with a reason.
+- **Soundness:** `Yes` and `No` are returned only when certain; whatever we cannot model exactly leads to `Unknown` with a reason.
 - **Support JSON Schema draft 2020-12** (including [`format`](https://json-schema.org/understanding-json-schema/reference/type#format), which is asserted rather than treated as an annotation), with the exceptions listed under [Unsupported constructs](#unsupported-constructs).
 - **Fast and efficient.** A check should be cheap enough to run on every save/commit, which means milliseconds for typical schemas.
 - **Correctness and performance** are benchmarked on a large corpus of schema pairs with known answers.
@@ -35,7 +35,7 @@ Other dialects may be supported later. For now this is the only one.
 
 ## Unsupported constructs
 
-A few JSON schema constructs are not modelled. A check whose answer depends on one of them returns `UNKNOWN` (and a reason why):
+A few JSON schema constructs are not modelled. A check whose answer depends on one of them returns `Unknown` (and a reason why):
 
 - `uniqueItems: true`.
 - Patterns with lookaround or backreferences, which the `regex` crate does not accept either, and patterns with word boundaries (`\b`, `\B`).
