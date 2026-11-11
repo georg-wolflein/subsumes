@@ -22,12 +22,11 @@ A subsumes B exactly when no instance satisfies `all[B, not A]`. The engine norm
 - **One budget, in steps.** Everything that can blow up charges it: insertions into canonical conjunctions, automaton states, `unevaluated*` scenarios, the search for a counterexample, nesting depth. There is no other limit. Steps do not depend on the machine, so a pair gets the same verdict everywhere. The default of 500,000 comes from the Python version and is set anew once there are measurements.
 - **Invalid input is an error, not a verdict.** A root that is no schema, another dialect, a keyword of the wrong shape, a reference that resolves to nothing. Each error names the schema and the location. A pattern that the `regex` crate rejects is not an error but an `Unknown` leaf.
 - **No validator in the library.** A counterexample is returned unchecked. Tooling outside the library checks counterexamples; see [Testing](#testing).
-- **Patterns are parsed by `regex-syntax`**, so the dialect is that of the `regex` crate by construction. The automata are our own and live in a crate of their own; see [String languages](#string-languages).
+- **Patterns are parsed by `regex-syntax`**, so the dialect is that of the `regex` crate by construction. The automata are our own; see [String languages](#string-languages).
 - **`format` is asserted** for the formats that are regular languages: `date`, `time`, `date-time`, `duration`, `uuid`, `ipv4`, `ipv6`, `hostname`, `email`, `uri`, `uri-reference`, `json-pointer`, `relative-json-pointer`. One table of patterns in the Rust dialect defines them. Any other format is an `Unknown` leaf.
 - **Numbers are exact.** Every bound and `multipleOf` is a rational, taken from the shortest decimal of the number, so `0.0075` is a multiple of `0.0001`. Plain `serde_json` is enough.
 - **Nothing is fetched.** A reference resolves within A, within B, to a document given to the checker, or to a meta-schema of the draft, which `referencing` ships.
-- **Speed target:** a median under 1 ms and a 99th percentile under 100 ms per check on the benchmark corpus. To be corrected after the first measurements.
-- **Pure Rust, no solver.** Dependencies: `serde_json`, `referencing` and `num-rational`, plus `regex-syntax` in `subsumes-regex`.
+- **Pure Rust, no solver.** Dependencies: `serde_json`, `referencing`, `regex-syntax` and `num-rational`.
 
 ## API
 
@@ -101,15 +100,15 @@ The engine works on *terms*, not keywords:
 
 ## String languages
 
-Regular languages of strings are a second library in the workspace, `subsumes-regex`. It knows nothing of schemas.
+Regular languages of strings are one module of the library, `language`. It uses no schema or engine types, and the rest of the library reaches it only through a narrow `pub(crate)` interface.
 
 - **Interface.** A store of languages that the context of a check owns. It takes patterns, sets of words and the budget, and gives back languages by id. It offers intersection, complement and inclusion, and emptiness and the shortest word within length bounds.
 - **Search semantics.** A `pattern` matches when the regex matches anywhere in the string, so the language of a pattern is every string that contains a match. `^` and `$` are modelled. Any other look-around assertion, such as `\b`, is reported as unsupported and becomes an `Unknown` leaf.
 - **Representation.** A finite or cofinite language is a set of words. Anything else is a minimal DFA over ranges of Unicode scalar values.
 - **Lengths stay symbolic.** Emptiness and shortest words walk the automaton by the number of characters left, so a bound of a million costs no more than a small one.
 - **Why our own automata.** `regex-automata` works on bytes and has no intersection or complement, and `minLength` counts characters. `regexsolver` has the set operations, but we cannot use it as the engine: it does not count its iterations anywhere, so its work cannot be charged to the budget. Its only limits are a cap on the number of states and a wall-clock timeout. It also matches whole strings, where a `pattern` is a search. It serves as an oracle in the tests.
-- **Formats stay in `subsumes`.** A format is a JSON Schema concept; the table defines each as a pattern.
-- **Publishing.** If `subsumes` is published, `subsumes-regex` is published and versioned with it.
+- **Formats stay outside the module.** A format is a JSON Schema concept; the table defines each as a pattern.
+- **A module, not a crate.** As a crate, its interface would be public API while it still changes most. The module can move into a crate of its own later; a published crate cannot be taken back.
 
 ## Data layout
 
@@ -122,14 +121,14 @@ Regular languages of strings are a second library in the workspace, `subsumes-re
 
 - **Unit tests** per module.
 - **The corpus.** CI runs every pull request over the pinned [benchmark](https://github.com/georg-wolflein/subsumes-benchmark) release and comments the comparison with `main`. It fails on a wrong verdict, on an error, and on a check that `main` decided and the pull request answers `Unknown`, unless the pull request has the label `allow-lost-verdicts`. Steps and times are reported, not enforced.
-- **Languages.** In `subsumes-regex`, property tests on random patterns compare the automata with two oracles: the `regex` crate on which strings match, and `regexsolver` on intersection, complement and inclusion. Both are dependencies of its tests only.
+- **Languages.** Property tests on random patterns compare the automata with two oracles: the `regex` crate on which strings match, and `regexsolver` on intersection, complement and inclusion. Both are dependencies of the tests only.
 - **`No`.** A checker outside the library validates each counterexample against both schemas, with patterns matched by the `regex` crate. It is not built yet.
 - **`Yes`** has nothing to validate. Beyond the labels of the corpus there are metamorphic tests: `a` subsumes `a`, `a` subsumes `allOf[a, x]`, and `anyOf[a, x]` subsumes `a`.
 
 ## Layout
 
 ```
-src/                                          the library subsumes
+src/
   lib.rs, checker.rs, verdict.rs, error.rs    the API (exists)
   context.rs      the state of one check: arenas, memo tables, budget
   schema.rs       load: nodes, typed keywords, locations, resolution
@@ -137,9 +136,9 @@ src/                                          the library subsumes
   lower.rs        schema graph to terms: rewrites and scenarios
   normalize.rs    the engine
   canonical/      numbers, strings, objects, arrays
+  language/       string languages: automata over scalar ranges, word sets
   formats.rs      the format table
   generate.rs     counterexamples
-subsumes-regex/   the library subsumes-regex: string languages
 harness/          the benchmark runner (exists)
 ```
 
@@ -150,11 +149,11 @@ Each step goes through all four stages for the keywords it adds, and lands as it
 1. **Schema graph:** nodes, locations, errors, references through `referencing`.
 2. **Engine skeleton:** context, budget, terms, variables, lazy negation and fast mode; `type`, booleans, `null`, the connectives, `$ref` with recursion. First `Yes` and `No`.
 3. **Numbers.**
-4. **Strings:** the `subsumes-regex` crate, then patterns, formats and lengths in the engine.
+4. **Strings:** the `language` module, then patterns, formats and lengths in the engine.
 5. **Objects.**
 6. **Arrays.** `const` and `enum` are complete from here.
 7. **`$dynamicRef`, `unevaluatedProperties`, `unevaluatedItems`.**
-8. **Speed:** measure against the target, then set the default budget.
+8. **Speed:** measure the checks on the corpus, then set the default budget.
 
 ## Not planned
 

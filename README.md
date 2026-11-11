@@ -22,7 +22,7 @@ Each check returns one of three verdicts:
 
 - **Soundness:** `Yes` and `No` are returned only when certain; whatever we cannot model exactly leads to `Unknown` with a reason.
 - **Support JSON Schema draft 2020-12** (including [`format`](https://json-schema.org/understanding-json-schema/reference/type#format), which is asserted rather than treated as an annotation), with the exceptions listed under [Unsupported constructs](#unsupported-constructs).
-- **Fast and efficient.** A check should be cheap enough to run on every save/commit, which means milliseconds for typical schemas.
+- **Fast and efficient.** A check should be cheap enough to run on every save/commit.
 - **Correctness and performance** are benchmarked on a large corpus of schema pairs with known answers.
 
 ## Regular expressions
