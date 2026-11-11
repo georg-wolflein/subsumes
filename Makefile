@@ -4,12 +4,29 @@ BENCHMARK_VERSION := 0.1.1
 BENCHMARK_SHA256 := 2e2d57e6d8ae7650736a277250b6792c84e574449e1c7f75e68ce66d861e0c34
 BENCHMARK_URL := https://github.com/georg-wolflein/subsumes-benchmark/releases/download/v$(BENCHMARK_VERSION)/corpus.tar.zst
 
-.PHONY: benchmark
+.PHONY: ci lint format format-check test corpus benchmark
 
-benchmark:  ## download the pinned benchmark corpus and unpack it into benchmark/
+ci: format-check lint test  ## what CI runs on every change, without the benchmark
+
+lint:
+	cargo clippy --workspace --locked --all-targets -- --deny warnings
+
+format:
+	cargo fmt --all
+
+format-check:
+	cargo fmt --all --check
+
+test:
+	cargo test --workspace --locked
+
+corpus:  ## download the pinned benchmark corpus and unpack it into benchmark/
 	mkdir -p target
 	curl --fail --silent --show-error --location --output target/corpus.tar.zst $(BENCHMARK_URL)
 	echo "$(BENCHMARK_SHA256)  target/corpus.tar.zst" | shasum -a 256 --check
 	rm -rf benchmark
 	mkdir benchmark
 	zstd -dc target/corpus.tar.zst | tar -xf - -C benchmark --strip-components 1
+
+benchmark:  ## run the library over the corpus in benchmark/ and write target/results.jsonl
+	cargo run --release --locked --package harness -- run benchmark target/results.jsonl
