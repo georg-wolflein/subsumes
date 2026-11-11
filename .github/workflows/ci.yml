@@ -12,29 +12,81 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Both static checks share one job, and clippy runs even when the formatting is off, so one
-  # failure does not hide the other.
+  # clippy runs even when the formatting is off, so one failure does not hide the other.
   checks:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: cargo fmt
-        run: cargo fmt --check
+        run: cargo fmt --all --check
       - name: cargo clippy
         if: ${{ !cancelled() }}
-        run: cargo clippy --locked --all-targets -- --deny warnings
+        run: cargo clippy --workspace --locked --all-targets -- --deny warnings
 
   tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: cargo test --locked
+      - run: cargo test --workspace --locked
 
-  # The benchmark corpus that the Makefile pins. So far the job only downloads it and checks
-  # its SHA-256: nothing runs over it until the library has a harness.
+  # Runs on every pull request, so that regressions and improvements show, and posts the results
+  # as a comment on the pull request.
   benchmark:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # to download the results of the base branch
+      pull-requests: write # to post the comment
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Download the pinned corpus
+        run: make corpus
+      - name: Run the library over the corpus
         run: make benchmark
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: benchmark-results
+          path: target/results.jsonl
+      - name: Fetch the results of the base branch
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        # Every push to main uploads its results; take the newest that the base branch has.
+        run: |
+          for sha in $(gh api "repos/$GITHUB_REPOSITORY/commits?sha=$BASE_SHA&per_page=20" --jq '.[].sha'); do
+            run_id=$(gh run list --workflow ci.yml --event push --commit "$sha" --status completed \
+              --json databaseId --jq '.[0].databaseId')
+            if [ -n "$run_id" ] && gh run download "$run_id" --name benchmark-results --dir baseline; then
+              echo "baseline: $sha from run $run_id"
+              echo "BASELINE_SHA=$sha" >> "$GITHUB_ENV"
+              exit 0
+            fi
+          done
+          echo "::warning::no results found on the base branch; the comment will not compare"
+      - name: Compare and render the comment
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        # The label is read here, so adding it and running the job again is enough.
+        run: |
+          arguments=()
+          if [ -f baseline/results.jsonl ]; then
+            arguments+=(--base baseline/results.jsonl --base-label "${BASELINE_SHA::7}")
+          fi
+          if [ -n "$PR" ] && [ "$(gh pr view "$PR" --json labels \
+              --jq 'any(.labels[]; .name == "allow-lost-verdicts")')" = true ]; then
+            arguments+=(--allow-lost)
+          fi
+          cargo run --release --locked --quiet --package harness -- \
+            compare target/results.jsonl "${arguments[@]}" --output comment.md
+      - name: Add the comment to the job summary
+        if: ${{ !cancelled() }}
+        run: cat comment.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        with:
+          header: benchmark
+          path: comment.md
