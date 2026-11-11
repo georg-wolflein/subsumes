@@ -26,7 +26,6 @@ A subsumes B exactly when no instance satisfies `all[B, not A]`. The engine norm
 - **`format` is asserted** for the formats that are regular languages: `date`, `time`, `date-time`, `duration`, `uuid`, `ipv4`, `ipv6`, `hostname`, `email`, `uri`, `uri-reference`, `json-pointer`, `relative-json-pointer`. One table of patterns in the Rust dialect defines them. Any other format is an `Unknown` leaf.
 - **Numbers are exact.** Every bound and `multipleOf` is a rational, taken from the shortest decimal of the number, so `0.0075` is a multiple of `0.0001`. Plain `serde_json` is enough.
 - **Nothing is fetched.** A reference resolves within A, within B, to a document given to the checker, or to a meta-schema of the draft, which `referencing` ships.
-- **Speed target:** a median under 1 ms and a 99th percentile under 100 ms per check on the benchmark corpus. To be corrected after the first measurements.
 - **Pure Rust, no solver.** Dependencies: `serde_json`, `referencing` and `num-rational`, plus `regex-syntax` in `subsumes-regex`.
 
 ## API
@@ -154,7 +153,7 @@ Each step goes through all four stages for the keywords it adds, and lands as it
 5. **Objects.**
 6. **Arrays.** `const` and `enum` are complete from here.
 7. **`$dynamicRef`, `unevaluatedProperties`, `unevaluatedItems`.**
-8. **Speed:** measure against the target, then set the default budget.
+8. **Speed:** measure the checks on the corpus, then set the default budget.
 
 ## Not planned
 
