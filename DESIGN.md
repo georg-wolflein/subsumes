@@ -4,7 +4,7 @@
 
 The [README](README.md) states the goals, the verdicts and what is unsupported. This document is the plan for the implementation.
 
-**Status:** the API, the benchmark harness, the load stage and the lowering to terms exist. A schema that cannot be loaded is an error, and every check of two schemas that can returns `Unknown`, because nothing compares the terms yet. The rest of the [pipeline](#pipeline) is still to be built, in the [order of work](#order-of-work) below.
+**Status:** the API, the benchmark harness, the load stage and the skeleton of the engine exist. The engine models the types, `null`, the booleans, the connectives and `$ref`, and answers `Unknown` where the answer depends on another keyword. The rest of the [pipeline](#pipeline) is still to be built, in the [order of work](#order-of-work) below.
 
 ## Method
 
@@ -18,7 +18,7 @@ A subsumes B exactly when no instance satisfies `all[B, not A]`. The engine norm
 
 - **Sound before complete.** What cannot be modelled exactly becomes an `Unknown` leaf. A leaf never refutes a conjunction and never contributes to a counterexample.
 - **Equal leaves cancel.** Two leaves from the same keyword with the same value are one predicate, so `u ∧ ¬u` is refuted. A schema subsumes itself even if it contains `uniqueItems: true`.
-- **Two causes of the verdict `Unknown`.** An unsupported construct, reported with its schema and location, or the budget. A check that needs the infinite unfolding of a recursive schema counts as the first, at the reference that closes the cycle.
+- **Two causes of the verdict `Unknown`.** An unsupported construct, reported with its schema and location, or the budget. A check that needs the infinite unfolding of a recursive schema counts as the first, and names the schema in which the cycle closes.
 - **One budget, in steps.** Everything that can blow up charges it: insertions into canonical conjunctions, automaton states, `unevaluated*` scenarios, the search for a counterexample, nesting depth. There is no other limit. Steps do not depend on the machine, so a pair gets the same verdict everywhere. The default of 500,000 comes from the Python version and is set anew once there are measurements.
 - **Invalid input is an error, not a verdict.** A root that is no schema, another dialect, a keyword of the wrong shape, an `$id` or an anchor declared twice, a reference that resolves to nothing. Each error names the schema and the location. A pattern that the `regex` crate rejects is not an error but an `Unknown` leaf.
 - **No validator in the library.** A counterexample is returned unchecked. Tooling outside the library checks counterexamples; see [Testing](#testing).
@@ -102,12 +102,17 @@ The engine works on *terms*, not keywords:
   - `CStr`: one language, the intersection of every pattern and format, plus length bounds.
   - `CObj`: the *fragment map*, a partition of all names into pattern fragments, each with the c-reference that every member satisfies and those that some member must satisfy, plus bounds on the property count.
   - `CArr`: a head of positional c-references, a tail, the `Contains` and `MaxContains` constraints and length bounds.
+- **A branch is a conjunction in the making.** `all[B, not A]` is taken apart into branches. A branch holds what the engine knows how to combine: the types and booleans an instance may still have, the leaves that must hold and those that must not, and the variables taken for true or for false. The canonical conjunctions of numbers, strings, objects and arrays join it with their steps.
+- **What a term unfolds to waits its turn.** Terms are taken in the order in which they come up, so a variable meets its own negation, and a leaf its own, before either is opened.
+- **A split is made one alternative at a time.** Each alternative is followed to its end before the next is made. So an instance is found without the alternatives after it, and a long `oneOf`, which has the square of its length in alternatives, is never written out.
 - **Lazy negation.** `not(S)` is pushed one level and the result inserted. Before a refutable `AnyOf` is expanded, each branch is tried in *fast mode*, which gives up instead of splitting; a branch refuted that way is dropped unexpanded.
+- **A branch that cannot give an instance is left alone,** once some branch has stood without one. From then on the answer is `No` or `Unknown`, and leaves are never taken back, so nothing that comes out of such a branch can change it. Without this, a schema with twenty choices between leaves would be a million branches.
 - **Eager normalization of references.** When two c-references meet in a property, an item or a `contains`, their conjunction is normalized at once and memoized. A result equal to one operand is replaced by that operand, which keeps `b_i ∧ ¬b_j` equal to `b_i` for `oneOf` branches that a discriminator already separates.
-- **Recursion is a least fixed point.** A reference whose expansion is in progress contributes `false` when positive and an `Unknown` leaf when negated, so recursive schemas terminate.
+- **Recursion is a least fixed point.** A schema that refers to itself with nothing in between accepts what it can be shown to accept in finitely many steps, so no variable is taken for true on the strength of itself. A branch unfolds each variable once and keeps which unfolding asked for which, also where a reference meets a variable that was taken before. If what a variable asks for leads back to it by way of variables that are all taken for true, the branch is refuted. A way back that passes a variable taken for false is a schema that is negated inside itself, or the negation of a cycle. Neither is modelled: the branch depends on an `Unknown` leaf, which names the schema in which the cycle closes, since a term does not keep which keyword it came from. All of this concerns schemas that refer to themselves with nothing in between; through a property or an item the reference is inside a leaf for now.
 
 ### Generate
 
+- So far an instance comes from a branch that stands and has a type that no leaf is about: `null`, a boolean that is still allowed, `0`, `""`, `[]` or `{}`.
 - The normal form of B is computed first. Each of its conjunctions is conjoined with `not A` and searched for a counterexample before the next is touched, so a `No` usually comes long before the whole normal form exists.
 - Generation is bottom-up and memoized per c-reference. A reference in progress has no counterexample, which is the same least fixed point.
 - Numbers search the interval for a multiple that is none of the excluded ones. Strings take the shortest word within the length bounds. Objects choose members per fragment, arrays choose which positions satisfy which `contains`.
@@ -140,6 +145,7 @@ Regular languages of strings are one module of the library, `language`. It uses 
 - **Languages.** Property tests on random patterns compare the automata with two oracles: the `regex` crate on which strings match, and `regexsolver` on intersection, complement and inclusion. Both are dependencies of the tests only.
 - **`No`.** A checker outside the library validates each counterexample against both schemas, with patterns matched by the `regex` crate. It is not built yet.
 - **`Yes`** has nothing to validate. Beyond the labels of the corpus there are metamorphic tests: `a` subsumes `a`, `a` subsumes `allOf[a, x]`, and `anyOf[a, x]` subsumes `a`.
+- **Every kind of instance.** For schemas with no schema inside a leaf, an instance matters to the engine only by its type, by which boolean it is and by which leaves about its type it satisfies. A test lists all of these for schemas made at random and asks a small evaluator, which reads the JSON and knows nothing of terms. The engine must answer `Yes` exactly when every kind that B accepts, A accepts, and `No` only with an instance that tells the two apart whatever the leaves say. A second run makes definitions that refer to each other and to themselves. There the evaluator reads the definitions again and again until nothing changes, beginning with definitions that accept nothing. It keeps apart what a definition surely accepts and what it possibly accepts, because a negated reference turns the one into the other; where the two differ, nothing is asked of the engine.
 
 ## Looking at a check
 
@@ -164,12 +170,12 @@ src/
   term.rs         terms, variables, c-references, one-level negation (exists)
   lower.rs        schema graph to terms: classes, rewrites and scenarios (exists)
   inspect.rs      the stages of a check as pictures for the viewer (exists)
-  normalize.rs    the engine
+  normalize.rs    the engine (exists)
   canonical/      numbers, strings, objects, arrays
   language/       string languages: automata over scalar ranges, word sets
   formats.rs      the format table
   meta_schemas.rs the meta-schema of draft 2020-12 and those of its vocabularies (exists)
-  generate.rs     counterexamples
+  generate.rs     counterexamples (exists)
 harness/          the benchmark runner and the viewer of the schema graph (exists)
 ```
 
@@ -178,7 +184,7 @@ harness/          the benchmark runner and the viewer of the schema graph (exist
 Each step goes through all four stages for the keywords it adds, and lands as its own pull request. The benchmark comment shows what the step decides, and its table of reasons for `Unknown` shows what blocks the most checks.
 
 1. **Schema graph:** nodes, locations, errors, references. Done.
-2. **Engine skeleton:** context, budget, terms, variables, lazy negation and fast mode; `type`, booleans, `null`, the connectives, `$ref` with recursion. First `Yes` and `No`. The terms and the lowering are done.
+2. **Engine skeleton:** context, budget, terms, variables, lazy negation and fast mode; `type`, booleans, `null`, the connectives, `$ref` with recursion. First `Yes` and `No`. Done.
 3. **Numbers.**
 4. **Strings:** the `language` module, then patterns, formats and lengths in the engine.
 5. **Objects.**
@@ -192,6 +198,9 @@ What a step left open, with the step that takes it up:
 
 - **`$dynamicRef`, for step 7.** A check ends in `Unknown` and names the `$dynamicRef` if A or B leads to one, wherever it is. What a `$dynamicRef` accepts depends on the schemas that led to it, and a term says the same wherever it stands. With one leaf for each `$dynamicRef`, a schema that is reached in two ways cancelled against its own negation, which gave a wrong `Yes`.
 - **Deeply nested values of `const` and `enum`, for step 6.** The lowering writes such a value out to compare it with others, and that recurses, as does the viewer. A value that is nested many thousand levels deep overflows the stack and aborts the process. Only a value built in code can be that deep, because JSON text ends at 128 levels. When `const` and `enum` become structural terms, the lowering walks the values itself and counts the depth.
+- **The negation of a cycle, for no step yet.** A branch that asks for the negation of a schema while it unfolds that same negation depends on a leaf. Under the least fixed point the negation holds there, so the reference could be passed over like any other that meets a variable taken before. It waits for a check that needs it.
+- **The test against every kind of instance, for steps 3 to 6.** Its schemas hold no schema inside a leaf and no constant that is an array or an object, because the engine does not look into either yet. The step that makes such a keyword a term adds it to the schemas of the test and to the evaluator.
+- **Two searches for one cycle, for step 8.** When a reference meets a variable that the branch has taken for true before, the engine looks for a way back twice: first by way of variables that are all taken for true, which refutes the branch, then by way of any, which makes the branch depend on a leaf. One search could answer both. It costs steps and never a verdict: for two schemas that need each other, 6 of the engine's 16 steps are such looks, and 4 would do.
 
 ## Not planned
 

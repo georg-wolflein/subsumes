@@ -28,7 +28,9 @@ pub enum Reason {
         /// The schema that contains the construct.
         schema: Side,
         /// Where the construct is: a URI reference whose fragment is a JSON Pointer, such as
-        /// `#/properties/tags/uniqueItems`. `#` alone is the schema as a whole.
+        /// `#/properties/tags/uniqueItems`. `#` alone is the schema as a whole. For a schema
+        /// that refers to itself in a way that is not modelled, it is the subschema in which
+        /// the cycle closes.
         location: String,
     },
     /// The check ran out of its work budget.

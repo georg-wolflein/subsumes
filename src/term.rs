@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
-use crate::schema::NodeId;
+use crate::schema::{Graph, NodeId};
 
 /// One of the six types that an instance has. `integer` is none of them: an integer is a
 /// number that is a multiple of one.
@@ -58,9 +58,18 @@ impl TypeSet {
         self.0 & (1 << kind as u8) != 0
     }
 
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
     #[must_use]
     pub fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
+    }
+
+    #[must_use]
+    pub fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
     }
 
     /// The types that are not in the set.
@@ -131,9 +140,20 @@ pub(crate) struct Leaf {
     pub domain: TypeSet,
     /// The keyword and what it holds, which tells the predicate from every other.
     pub key: String,
-    /// The schema in which it was first found, and the keyword there.
+    /// The schema in which it was first found, and the keyword there. Without a keyword the
+    /// leaf is about the schema as a whole.
     pub node: NodeId,
-    pub keyword: &'static str,
+    pub keyword: Option<&'static str>,
+}
+
+impl Leaf {
+    /// Where the leaf was first found.
+    pub fn location(&self, graph: &Graph) -> String {
+        match self.keyword {
+            Some(keyword) => graph.keyword_location(self.node, keyword),
+            None => graph.location(self.node),
+        }
+    }
 }
 
 /// A name for the term of a schema, so that a schema that refers to itself has a term.
@@ -214,6 +234,18 @@ impl Terms {
         node: NodeId,
         keyword: &'static str,
     ) -> TermId {
+        let leaf = self.leaf_of(domain, key, node, Some(keyword));
+        self.intern(Term::Unknown(leaf))
+    }
+
+    /// The leaf with this key over these types, which is a new one if there is none yet.
+    fn leaf_of(
+        &mut self,
+        domain: TypeSet,
+        key: String,
+        node: NodeId,
+        keyword: Option<&'static str>,
+    ) -> LeafId {
         let next = LeafId(u32::try_from(self.leaves.len()).expect("fewer than 2^32 leaves"));
         let id = *self.leaf_ids.entry((domain, key.clone())).or_insert(next);
         if id == next {
@@ -224,7 +256,7 @@ impl Terms {
                 keyword,
             });
         }
-        self.intern(Term::Unknown(id))
+        id
     }
 
     /// The conjunction, without what says nothing in it.
@@ -286,6 +318,14 @@ impl Terms {
 
     pub fn reference(&mut self, variable: VarId) -> TermId {
         self.intern(Term::Ref(variable))
+    }
+
+    /// The leaf for a schema that refers to itself in a way that the engine does not model.
+    /// It is about every instance. `node` is the schema in which the cycle closes: the one
+    /// that leads back to the variable. Which of its keywords does is not kept.
+    pub fn recursion(&mut self, variable: VarId, node: NodeId) -> LeafId {
+        let key = format!("recursion x{} @{}", variable.0, node.index());
+        self.leaf_of(TypeSet::ALL, key, node, None)
     }
 
     /// A new variable for a schema. Its term is given later, because the term may refer to
@@ -381,6 +421,8 @@ mod tests {
         let both = string.union(null);
         assert!(both.contains(InstanceType::String) && both.contains(InstanceType::Null));
         assert!(!both.contains(InstanceType::Number));
+        assert_eq!(both.intersection(string), string);
+        assert!(string.intersection(null).is_empty());
         assert_eq!(both.complement().iter().count(), 4);
         assert_eq!(both.complement().union(both), TypeSet::ALL);
         assert_eq!(TypeSet::NONE.complement(), TypeSet::ALL);

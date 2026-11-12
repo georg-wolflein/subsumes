@@ -593,7 +593,7 @@ mod tests {
             .collect();
         let place = |leaf: &crate::term::Leaf| {
             let side = graph.node(leaf.node).side;
-            (side, graph.keyword_location(leaf.node, leaf.keyword))
+            (side, leaf.location(&graph))
         };
         // A dynamic reference may be about any instance, and no other is like it.
         assert_eq!(leaves[0].domain, TypeSet::ALL);

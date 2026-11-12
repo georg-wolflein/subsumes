@@ -20,17 +20,25 @@
 //! the draft, so a schema that is spread over several files is bundled into one first, as the
 //! specification describes: each file goes under `$defs` with its URI as its `$id`.
 //!
-//! The library has no engine yet. It loads both schemas, so one that is not a valid schema is
-//! an [`Error`], and every check of two valid schemas returns [`Verdict::Unknown`].
+//! The engine is being built keyword by keyword. So far it models the types, `null`, the
+//! booleans, `allOf`, `anyOf`, `oneOf`, `not`, `if`/`then`/`else` and `$ref`. A check whose
+//! answer depends on another keyword returns [`Verdict::Unknown`] and names the keyword. Two
+//! schemas that share such a keyword with the same value can still be decided, because what
+//! both say cancels. A schema that uses a `$dynamicRef` is not decided yet, whatever else
+//! it says.
 
 mod checker;
 mod context;
 mod error;
+mod generate;
 mod inspect;
 mod lower;
 mod meta_schemas;
+mod normalize;
 mod schema;
 mod term;
+#[cfg(test)]
+mod testing;
 mod verdict;
 
 use serde_json::Value;
