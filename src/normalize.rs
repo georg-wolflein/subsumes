@@ -15,7 +15,7 @@
 #[cfg(test)]
 mod exhaustive;
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde_json::Value;
 
@@ -45,11 +45,26 @@ pub(crate) fn decide(context: &mut Context, a: VarId, b: VarId) -> Result<Outcom
         unfoldings: Vec::new(),
         depends_on: None,
     };
-    let mut first = Branch::default();
-    first.todo.push_back(Item::new(b, false));
-    first.todo.push_back(Item::new(a, true));
-    let mut branches = vec![first];
-    while let Some(mut branch) = branches.pop() {
+    // A branch that was split, with the alternatives of the split that are still to come.
+    // The last split is the one at work: each of its alternatives is followed to its end
+    // before the next is made, so an instance is found without the alternatives after it,
+    // and a long `oneOf` is never written out. The check begins as a split in one.
+    let whole = vec![Item::new(b, false), Item::new(a, true)];
+    let whole: Box<dyn Iterator<Item = Alternative>> = Box::new(std::iter::once(whole));
+    let mut splits = vec![(Branch::default(), whole)];
+    while let Some((split, still_to_come)) = splits.last_mut() {
+        let alternative = if engine.is_hopeless(split) {
+            None
+        } else {
+            still_to_come.next()
+        };
+        let Some(alternative) = alternative else {
+            splits.pop();
+            continue;
+        };
+        engine.context.budget.charge(1 + split.weight() / 32)?;
+        let mut branch = split.clone();
+        branch.todo.extend(alternative);
         if !engine.settle(&mut branch)? || engine.is_hopeless(&branch) {
             continue;
         }
@@ -64,18 +79,8 @@ pub(crate) fn decide(context: &mut Context, a: VarId, b: VarId) -> Result<Outcom
             }
             continue;
         };
-        // Each alternative is taken in as far as it goes without another split. One that is
-        // refuted by then is never split at all.
-        let mut alive = Vec::new();
-        for alternative in alternatives(&engine.context.terms, &choice) {
-            engine.context.budget.charge(1 + branch.weight() / 32)?;
-            let mut next = branch.clone();
-            next.todo.extend(alternative);
-            if engine.settle(&mut next)? {
-                alive.push(next);
-            }
-        }
-        branches.extend(alive.into_iter().rev());
+        let alternatives = alternatives(&engine.context.terms, &choice);
+        splits.push((branch, alternatives));
     }
     Ok(match engine.depends_on {
         Some(leaf) => Outcome::Unknown(leaf),
@@ -92,6 +97,9 @@ struct Item {
     within: Option<usize>,
 }
 
+/// One of the alternatives of a disjunction: terms that hold together.
+type Alternative = Vec<Item>;
+
 impl Item {
     fn new(term: TermId, negated: bool) -> Self {
         Self {
@@ -107,7 +115,7 @@ impl Item {
 struct Unfolding {
     variable: VarId,
     negated: bool,
-    /// The unfolding that this one happened in.
+    /// The unfolding in which that reference stood, if it stood in one.
     within: Option<usize>,
 }
 
@@ -123,7 +131,11 @@ struct Branch {
     /// The leaves that must not hold.
     fails: BTreeSet<LeafId>,
     /// The variables taken for true, with `false`, and those taken for false, with `true`.
-    taken: BTreeSet<(VarId, bool)>,
+    /// Each is unfolded once in a branch, and this is its unfolding.
+    taken: BTreeMap<(VarId, bool), usize>,
+    /// The references to a variable that was taken before: the unfolding of the variable,
+    /// and the unfolding in which the reference stands.
+    met: BTreeSet<(usize, usize)>,
     /// What is still to be taken in, in the order in which it came up. What a term unfolds
     /// to waits behind everything that was there before, so that a variable meets its own
     /// negation before either is opened.
@@ -140,7 +152,8 @@ impl Default for Branch {
             holds: BTreeSet::new(),
             covered: TypeSet::NONE,
             fails: BTreeSet::new(),
-            taken: BTreeSet::new(),
+            taken: BTreeMap::new(),
+            met: BTreeSet::new(),
             todo: VecDeque::new(),
             choices: VecDeque::new(),
         }
@@ -152,8 +165,9 @@ const BOOLEAN: TypeSet = TypeSet::of(InstanceType::Boolean);
 impl Branch {
     /// How much there is to copy when the branch splits.
     fn weight(&self) -> u64 {
-        let parts = self.holds.len() + self.fails.len() + self.taken.len() + self.choices.len();
-        parts as u64
+        let leaves = self.holds.len() + self.fails.len();
+        let variables = self.taken.len() + self.met.len();
+        (leaves + variables + self.choices.len()) as u64
     }
 
     /// Keeps only instances of these types. Returns whether any are left.
@@ -280,92 +294,137 @@ impl Engine<'_> {
         Ok(stands)
     }
 
-    /// Puts the term of a variable in the place of a reference to it.
+    /// Puts the term of a variable in the place of a reference to it, once in a branch.
+    ///
+    /// A schema that refers to itself with nothing in between accepts what it can be shown
+    /// to accept in finitely many steps. So no variable is taken for true on the strength of
+    /// itself: if what it asks for leads back to it by way of variables that are all taken
+    /// for true, the branch accepts nothing. A way back that passes a variable taken for
+    /// false is a schema that is negated inside itself, or the negation of one that refers
+    /// to itself. Neither is modelled, and the branch depends on a leaf instead.
     fn unfold(
         &mut self,
         branch: &mut Branch,
         variable: VarId,
         negated: bool,
-        mut within: Option<usize>,
+        within: Option<usize>,
     ) -> Result<bool, Exhausted> {
-        // A schema that refers to itself without anything in between accepts what it can be
-        // shown to accept in finitely many steps. So a reference inside its own unfolding
-        // adds nothing that would be accepted. The negation of that is not modelled, and
-        // neither is a schema that is negated inside itself.
-        let inner = within;
-        while let Some(index) = within {
-            self.context.budget.charge(1)?;
-            let outer = self.unfoldings[index];
-            if outer.variable == variable {
-                if !negated && !outer.negated {
-                    return Ok(false);
+        if let Some(&open) = branch.taken.get(&(variable, !negated)) {
+            // The variable and its negation in one branch: nothing is both. Unless the one
+            // asks for the other, which is the schema that is negated inside itself.
+            return match within {
+                Some(from) if self.leads_to(branch, open, from, false)? => {
+                    self.depend_on_recursion(branch, variable, from);
+                    Ok(true)
                 }
-                // The reference stands in the schema that was unfolded last.
-                let last = inner.expect("the loop ran, so there is an unfolding");
-                let closes = self
-                    .context
-                    .terms
-                    .variable(self.unfoldings[last].variable)
-                    .node;
-                let leaf = self.context.terms.recursion(variable, closes);
-                branch.holds.insert(leaf);
-                branch.covered = TypeSet::ALL;
+                _ => Ok(false),
+            };
+        }
+        if let Some(&open) = branch.taken.get(&(variable, negated)) {
+            // Taken before, so there is nothing to take in. A reference of A or B themselves
+            // stands in no unfolding and closes no cycle.
+            let Some(from) = within else {
+                return Ok(true);
+            };
+            if !negated && self.leads_to(branch, open, from, true)? {
+                return Ok(false);
+            }
+            if self.leads_to(branch, open, from, false)? {
+                self.depend_on_recursion(branch, variable, from);
+            } else {
+                branch.met.insert((open, from));
+            }
+            return Ok(true);
+        }
+        let unfolding = self.unfoldings.len();
+        self.unfoldings.push(Unfolding {
+            variable,
+            negated,
+            within,
+        });
+        branch.taken.insert((variable, negated), unfolding);
+        branch.todo.push_back(Item {
+            term: self.context.terms.variable(variable).body,
+            negated,
+            within: Some(unfolding),
+        });
+        Ok(true)
+    }
+
+    /// Whether what the unfolding `open` asks for leads to the unfolding `from`: by the
+    /// references that were unfolded, and by those that met a variable taken before. With
+    /// `positive`, only by way of variables that are taken for true.
+    fn leads_to(
+        &mut self,
+        branch: &Branch,
+        open: usize,
+        from: usize,
+        positive: bool,
+    ) -> Result<bool, Exhausted> {
+        // The way is looked for from its end: from an unfolding to those that ask for it.
+        let (mut seen, mut pending) = (BTreeSet::new(), vec![from]);
+        while let Some(index) = pending.pop() {
+            let unfolding = self.unfoldings[index];
+            if (positive && unfolding.negated) || !seen.insert(index) {
+                continue;
+            }
+            self.context.budget.charge(1)?;
+            if index == open {
                 return Ok(true);
             }
-            within = outer.within;
+            pending.extend(unfolding.within);
+            let references = branch.met.range((index, 0)..=(index, usize::MAX));
+            pending.extend(references.map(|&(_, stands_in)| stands_in));
         }
-        // The variable and its negation in one branch: nothing is both.
-        if branch.taken.contains(&(variable, !negated)) {
-            return Ok(false);
-        }
-        if branch.taken.insert((variable, negated)) {
-            self.unfoldings.push(Unfolding {
-                variable,
-                negated,
-                within: inner,
-            });
-            branch.todo.push_back(Item {
-                term: self.context.terms.variable(variable).body,
-                negated,
-                within: Some(self.unfoldings.len() - 1),
-            });
-        }
-        Ok(true)
+        Ok(false)
+    }
+
+    /// Makes a branch depend on a leaf for a cycle that is not modelled. `from` is the
+    /// unfolding in which the reference stands that closes the cycle.
+    fn depend_on_recursion(&mut self, branch: &mut Branch, variable: VarId, from: usize) {
+        let closes = self.unfoldings[from].variable;
+        let closes = self.context.terms.variable(closes).node;
+        let leaf = self.context.terms.recursion(variable, closes);
+        branch.holds.insert(leaf);
+        branch.covered = TypeSet::ALL;
     }
 }
 
-/// The alternatives of a disjunction: each is a list of terms that hold together.
-fn alternatives(terms: &Terms, choice: &Item) -> Vec<Vec<Item>> {
-    let item = |term: &TermId, negated| Item {
-        term: *term,
+/// The alternatives of a disjunction, each made when it is asked for.
+fn alternatives(terms: &Terms, choice: &Item) -> Box<dyn Iterator<Item = Alternative>> {
+    let within = choice.within;
+    let item = move |term: TermId, negated| Item {
+        term,
         negated,
-        within: choice.within,
+        within,
     };
     match (terms.term(choice.term), choice.negated) {
         // One of them holds, or one of them does not.
-        (Term::AnyOf(parts), false) => parts.iter().map(|part| vec![item(part, false)]).collect(),
-        (Term::AllOf(parts), true) => parts.iter().map(|part| vec![item(part, true)]).collect(),
+        (Term::AnyOf(parts), negated @ false) | (Term::AllOf(parts), negated @ true) => {
+            let parts = parts.to_vec();
+            let parts = parts.into_iter();
+            Box::new(parts.map(move |part| vec![item(part, negated)]))
+        }
         // One holds and no other does.
         (Term::OneOf(parts), false) => {
-            let places = 0..parts.len();
-            places
-                .map(|holds| {
-                    let all = parts.iter().enumerate();
-                    all.map(|(place, part)| item(part, place != holds))
-                        .collect()
-                })
-                .collect()
+            let parts = parts.to_vec();
+            Box::new((0..parts.len()).map(move |holds| {
+                let all = parts.iter().enumerate();
+                all.map(|(place, part)| item(*part, place != holds))
+                    .collect()
+            }))
         }
         // None holds, or two do.
         (Term::OneOf(parts), true) => {
-            let none = parts.iter().map(|part| item(part, true)).collect();
-            let mut alternatives = vec![none];
-            for (place, first) in parts.iter().enumerate() {
-                for second in &parts[place + 1..] {
-                    alternatives.push(vec![item(first, false), item(second, false)]);
-                }
-            }
-            alternatives
+            let parts = parts.to_vec();
+            let none: Alternative = parts.iter().map(|part| item(*part, true)).collect();
+            let count = parts.len();
+            let pairs = (0..count)
+                .flat_map(move |first| (first + 1..count).map(move |second| (first, second)));
+            let two = pairs.map(move |(first, second)| {
+                vec![item(parts[first], false), item(parts[second], false)]
+            });
+            Box::new(std::iter::once(none).chain(two))
         }
         (other, _) => unreachable!("{other:?} is no disjunction"),
     }
@@ -630,12 +689,16 @@ mod tests {
             yes(&any, &all);
         }
 
-        // Two things are like no other, so a schema with one of them is not known to subsume
-        // even itself: a `$dynamicRef`, and a count that was too large to keep.
-        let dynamic = json!({"$dynamicAnchor": "x", "items": {"$dynamicRef": "#x"}});
-        assert_eq!(depends_on(&dynamic, &dynamic.clone()).1, "#/items");
+        // A count that was too large to keep is like no other, so a schema with one is not
+        // known to subsume even itself. A schema that leads to a `$dynamicRef` is not looked
+        // at yet at all.
         let huge = json!({"type": "string", "maxLength": 1e30});
         assert_eq!(depends_on(&huge, &huge.clone()).1, "#/maxLength");
+        let dynamic = json!({"$dynamicAnchor": "x", "items": {"$dynamicRef": "#x"}});
+        assert_eq!(
+            depends_on(&dynamic, &dynamic.clone()),
+            (Side::A, "#/items/$dynamicRef".to_owned())
+        );
     }
 
     #[test]
@@ -657,26 +720,134 @@ mod tests {
             &json!({"allOf": [{"$ref": "#"}, {"type": "null"}]}),
         );
 
-        // What such a schema does not accept is not modelled. The leaf stands at the
-        // reference that closes the cycle.
-        assert_eq!(
-            depends_on(&endless, &nothing),
-            (Side::A, "#/$ref".to_owned())
-        );
+        // What such a schema does not accept is not modelled. The leaf names the schema in
+        // which the cycle closes.
+        assert_eq!(depends_on(&endless, &nothing), (Side::A, "#".to_owned()));
         assert_eq!(
             depends_on(&nulls, &json!({"type": "string"})),
-            (Side::A, "#/anyOf/1/$ref".to_owned())
+            (Side::A, "#/anyOf/1".to_owned())
         );
         let negated = json!({"not": {"$ref": "#"}});
         assert_eq!(
             depends_on(&nothing, &negated),
-            (Side::B, "#/not/$ref".to_owned())
+            (Side::B, "#/not".to_owned())
         );
         // Types still refute a branch with such a leaf in it.
         yes(
             &json!({"type": "string"}),
             &json!({"type": "string", "not": {"$ref": "#"}}),
         );
+    }
+
+    #[test]
+    fn schemas_that_need_each_other_accept_nothing_however_they_are_met() {
+        // `x` needs `y` and `y` needs `x`, so neither is ever shown to accept an instance.
+        let defs = json!({
+            "x": {"$ref": "#/$defs/y", "type": "null"},
+            "y": {"$ref": "#/$defs/x"},
+        });
+        let (x, y) = (json!({"$ref": "#/$defs/x"}), json!({"$ref": "#/$defs/y"}));
+        let with = |schema: Value| {
+            let mut schema = schema;
+            schema["$defs"] = defs.clone();
+            schema
+        };
+        // From one end, the cycle closes inside the unfolding of the schema it began with.
+        yes(&json!(false), &with(x.clone()));
+        yes(&json!(false), &with(y.clone()));
+        // Side by side, each is taken before the other refers to it.
+        yes(&json!(false), &with(json!({"allOf": [x, y]})));
+        yes(&json!(false), &with(json!({"allOf": [y, x]})));
+        // The same without the definitions: the two parts are each other's reference.
+        let beside =
+            json!({"allOf": [{"$ref": "#/allOf/1", "type": "null"}, {"$ref": "#/allOf/0"}]});
+        yes(&json!(false), &beside);
+        // What accepts nothing is told apart from `true` by any instance but `null`, whose
+        // branch asks for the negation of the cycle.
+        assert_eq!(counterexample(&beside, &json!(true)), json!(true));
+        // With a way out of the cycle, each accepts what the way out accepts and what the
+        // other then accepts: a string by `y`, and so by `x`.
+        let out = json!({
+            "allOf": [{"$ref": "#/$defs/x"}, {"$ref": "#/$defs/y"}],
+            "$defs": {
+                "x": {"anyOf": [{"$ref": "#/$defs/y"}, {"type": "null"}]},
+                "y": {"anyOf": [{"$ref": "#/$defs/x"}, {"type": "string"}]},
+            },
+        });
+        let either = json!({"type": ["null", "string"]});
+        yes(&out, &either);
+        yes(&either, &out);
+        assert_eq!(counterexample(&json!({"type": "null"}), &out), json!(""));
+    }
+
+    #[test]
+    fn a_schema_that_is_used_twice_is_no_cycle() {
+        // Both parts refer to `shared`, and the second meets it taken. Nothing leads back.
+        let twice = json!({
+            "allOf": [{"$ref": "#/$defs/x"}, {"$ref": "#/$defs/y"}],
+            "$defs": {
+                "x": {"$ref": "#/$defs/shared", "type": ["null", "string"]},
+                "y": {"$ref": "#/$defs/shared", "type": ["null", "number"]},
+                "shared": {"anyOf": [{"type": "null"}, {"type": "boolean"}]},
+            },
+        });
+        let null = json!({"type": "null"});
+        yes(&twice, &null);
+        yes(&null, &twice);
+        assert_eq!(counterexample(&json!(false), &twice), json!(null));
+    }
+
+    #[test]
+    fn a_cycle_through_negation_is_not_modelled() {
+        // `x` is what `z` is not, and `z` is what `x` is not. Each could be anything as long
+        // as the other is the rest, so neither is known to accept nothing or everything. `z`
+        // names every type, which keeps the two from being one class.
+        let all = json!(["null", "boolean", "number", "string", "array", "object"]);
+        let defs = json!({
+            "x": {"not": {"$ref": "#/$defs/z"}},
+            "z": {"not": {"$ref": "#/$defs/x"}, "type": all},
+        });
+        let x = json!({"allOf": [{"$ref": "#/$defs/x"}], "$defs": defs});
+        let z = json!({"anyOf": [{"$ref": "#/$defs/z"}], "$defs": defs});
+        for schema in [&x, &z] {
+            assert_eq!(depends_on(&json!(false), schema).0, Side::B);
+            assert_eq!(depends_on(schema, &json!(true)).0, Side::A);
+        }
+        // A schema that is its own negation: the leaf names the schema that leads back, also
+        // when the reference is not a keyword of its own.
+        let paradox = json!({"$ref": "#/$defs/x", "$defs": {"x": {"not": {"$ref": "#/$defs/x"}}}});
+        assert_eq!(
+            depends_on(&paradox, &json!(true)),
+            (Side::A, "#/$defs/x".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_long_one_of_is_never_written_out() {
+        // Written out, exactly one of three thousand is nine million terms, and its negation
+        // is four and a half million alternatives. They are made one at a time.
+        let long = json!({"oneOf": vec![true; 3_000]});
+        let (nothing, anything) = (json!(false), json!(true));
+        // A budget that ends the check at the first alternative keeps the others unmade.
+        let checker = Checker::new().budget(8);
+        for (a, b) in [(&nothing, &long), (&long, &anything)] {
+            let check = checker.check(a, b).unwrap();
+            assert_eq!(
+                check.verdict,
+                Verdict::Unknown {
+                    reason: Reason::Budget
+                }
+            );
+        }
+        // The first two that hold together give an instance, long before the last two.
+        let check = Checker::new().check(&long, &anything).unwrap();
+        assert_eq!(
+            check.verdict,
+            Verdict::No {
+                counterexample: json!(null)
+            }
+        );
+        assert!(check.steps < 10_000, "{}", check.steps);
     }
 
     #[test]
@@ -737,7 +908,6 @@ mod tests {
         let parts = vec![parts[0], parts[1], null];
         let shown = |terms: &Terms, term: TermId, negated: bool| {
             let choice = Item::new(term, negated);
-            let alternatives = alternatives(terms, &choice);
             let literal = |item: &Item| {
                 let term = terms.show(item.term);
                 if item.negated {
@@ -746,8 +916,7 @@ mod tests {
                     term
                 }
             };
-            let alternatives = alternatives.iter();
-            alternatives
+            alternatives(terms, &choice)
                 .map(|all| all.iter().map(literal).collect::<Vec<_>>().join(" and "))
                 .collect::<Vec<_>>()
         };

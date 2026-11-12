@@ -14,6 +14,18 @@
 //! - `Unknown` only when some kind is accepted by B and not by A.
 //!
 //! The schemas are made at random from the keywords that hold no schema inside a leaf.
+//!
+//! # Schemas that refer to themselves
+//!
+//! A definition that refers to itself, or to one that refers back, accepts what it can be
+//! shown to accept in finitely many steps. The evaluator finds that by starting from
+//! definitions that accept nothing and reading them again until nothing changes. A reference
+//! under a negation cannot be read that way, since more accepted below is less accepted
+//! above. So there are two readings: what a definition *surely* accepts and what it *possibly*
+//! accepts, where a negated reference is read from the other of the two. Each is found from
+//! the other in turns until both stand still. Where the two differ, as for a schema that is
+//! its own negation, the definitions say nothing definite, and nothing is asked of the engine.
+//! "Accepted by B and not by A" above is then: surely accepted by B, and not possibly by A.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -64,20 +76,22 @@ impl Kind<'_> {
         self.leaf("object", format!("required {name}"))
     }
 
-    /// Whether a schema accepts the instance. Every part is looked at, also where the answer
-    /// is settled before, so that every leaf is asked for.
-    fn accepted_by(&self, root: &Value, schema: &Value) -> bool {
+    /// Whether a schema accepts the instance, given what the definitions accept. A reference
+    /// reads `plain`, and one that stands under a negation reads `negated`; `under_negation`
+    /// says which of the two the schema itself stands under. Every part is looked at, also
+    /// where the answer is settled before, so that every leaf is asked for.
+    fn accepted_by(&self, schema: &Value, under_negation: bool, read: &Readings) -> bool {
         let keywords = match schema {
             Value::Bool(accepts) => return *accepts,
             other => other
                 .as_object()
                 .expect("a schema is an object or a boolean"),
         };
-        let every = |schemas: &Value| -> Vec<bool> {
-            let schemas = schemas.as_array().unwrap().iter();
-            schemas
-                .map(|schema| self.accepted_by(root, schema))
-                .collect()
+        let accepts = |schema: &Value| self.accepted_by(schema, under_negation, read);
+        // The same schema where its negation is what counts.
+        let rejects = |schema: &Value| !self.accepted_by(schema, !under_negation, read);
+        let every = |schemas: &Value, accepts: &dyn Fn(&Value) -> bool| -> Vec<bool> {
+            schemas.as_array().unwrap().iter().map(accepts).collect()
         };
         let mut accepted = true;
         for (keyword, value) in keywords {
@@ -85,7 +99,12 @@ impl Kind<'_> {
                 "$defs" | "then" | "else" => true,
                 "$ref" => {
                     let pointer = value.as_str().unwrap().trim_start_matches('#');
-                    self.accepted_by(root, root.pointer(pointer).unwrap())
+                    let definitions = if under_negation {
+                        read.negated
+                    } else {
+                        read.plain
+                    };
+                    definitions[pointer]
                 }
                 "type" => {
                     let names = value
@@ -107,28 +126,22 @@ impl Kind<'_> {
                     let values = value.as_array().unwrap().iter();
                     values.fold(false, |any, value| any | self.is(value))
                 }
-                "allOf" => every(value).into_iter().all(|accepted| accepted),
-                "anyOf" => every(value).into_iter().any(|accepted| accepted),
+                "allOf" => every(value, &accepts).into_iter().all(|accepted| accepted),
+                "anyOf" => every(value, &accepts).into_iter().any(|accepted| accepted),
+                // One is accepted and every other is rejected.
                 "oneOf" => {
-                    every(value)
-                        .into_iter()
-                        .filter(|accepted| *accepted)
-                        .count()
-                        == 1
+                    let (accepted, rejected) = (every(value, &accepts), every(value, &rejects));
+                    (0..accepted.len()).any(|one| {
+                        let others = (0..rejected.len()).filter(|other| *other != one);
+                        accepted[one] && others.fold(true, |all, other| all & rejected[other])
+                    })
                 }
-                "not" => !self.accepted_by(root, value),
+                "not" => rejects(value),
+                // The condition is rejected or `then` holds, and it is accepted or `else` holds.
                 "if" => {
-                    let part = |name| {
-                        keywords
-                            .get(name)
-                            .is_none_or(|part| self.accepted_by(root, part))
-                    };
+                    let part = |name| keywords.get(name).is_none_or(accepts);
                     let (then, otherwise) = (part("then"), part("else"));
-                    if self.accepted_by(root, value) {
-                        then
-                    } else {
-                        otherwise
-                    }
+                    (rejects(value) | then) & (accepts(value) | otherwise)
                 }
                 "minLength" | "maxLength" => self.leaf("string", format!("{keyword} {value}")),
                 "minimum" | "maximum" | "multipleOf" => {
@@ -151,7 +164,7 @@ impl Kind<'_> {
                 "dependentSchemas" => {
                     let dependencies = value.as_object().unwrap().iter();
                     dependencies.fold(true, |all, (name, schema)| {
-                        let accepted = self.accepted_by(root, schema);
+                        let accepted = accepts(schema);
                         all & (self.of_type != "object" || !self.has(&json!(name)) || accepted)
                     })
                 }
@@ -159,6 +172,84 @@ impl Kind<'_> {
             };
         }
         accepted
+    }
+
+    /// What the definitions of a document accept when they are read until nothing changes,
+    /// beginning with definitions that accept nothing. A negated reference reads `negated`.
+    fn read_out<'d>(&self, document: &Document<'d>, negated: &Definitions) -> Definitions<'d> {
+        let mut plain = document.accepting_nothing();
+        loop {
+            let read = Readings {
+                plain: &plain,
+                negated,
+            };
+            let next: Definitions = document
+                .definitions
+                .iter()
+                .map(|(at, schema)| (*at, self.accepted_by(schema, false, &read)))
+                .collect();
+            if next == plain {
+                return plain;
+            }
+            plain = next;
+        }
+    }
+
+    /// Whether a document surely accepts the instance, and whether it possibly does.
+    fn accepted(&self, document: &Document) -> (bool, bool) {
+        let mut surely = document.accepting_nothing();
+        let possibly = loop {
+            let possibly = self.read_out(document, &surely);
+            let next = self.read_out(document, &possibly);
+            if next == surely {
+                break possibly;
+            }
+            surely = next;
+        };
+        let read = |plain, negated| {
+            let read = Readings { plain, negated };
+            self.accepted_by(document.schema, false, &read)
+        };
+        // Where the two readings are one, so is what the schema makes of them.
+        if surely == possibly {
+            let accepted = read(&surely, &surely);
+            return (accepted, accepted);
+        }
+        (read(&surely, &possibly), read(&possibly, &surely))
+    }
+}
+
+/// Whether each definition of a document accepts an instance, by the fragment that a
+/// reference to it holds.
+type Definitions<'d> = BTreeMap<&'d str, bool>;
+
+/// What the definitions accept: for a reference as it stands, and for a negated one.
+struct Readings<'r> {
+    plain: &'r Definitions<'r>,
+    negated: &'r Definitions<'r>,
+}
+
+/// A schema with its definitions, by the fragment that a reference to each holds.
+struct Document<'d> {
+    schema: &'d Value,
+    definitions: Vec<(&'d str, &'d Value)>,
+}
+
+impl<'d> Document<'d> {
+    /// `fragments` holds the fragment of every definition that a schema here may have.
+    fn new(schema: &'d Value, fragments: &'d BTreeMap<String, String>) -> Self {
+        let definitions = schema.get("$defs").and_then(Value::as_object);
+        let definitions = definitions.into_iter().flatten();
+        let definitions = definitions.map(|(name, schema)| (fragments[name].as_str(), schema));
+        Self {
+            schema,
+            definitions: definitions.collect(),
+        }
+    }
+
+    fn accepting_nothing(&self) -> Definitions<'d> {
+        let fragments = self.definitions.iter();
+        fragments.map(|(fragment, _)| (*fragment, false)).collect()
     }
 }
 
@@ -178,7 +269,7 @@ fn kinds() -> [(&'static str, bool, Value); 7] {
 /// What holds for the instances of one type that are one boolean.
 struct Found {
     instance: Value,
-    /// Some kind is accepted by B and not by A.
+    /// Some kind is surely accepted by B and not possibly by A.
     some_tells_apart: bool,
     /// Every kind is.
     all_tell_apart: bool,
@@ -186,6 +277,10 @@ struct Found {
 
 /// Lists every kind of instance and asks the evaluator about A and B.
 fn evaluated(a: &Value, b: &Value) -> Vec<Found> {
+    let names = ["d", "e", "f"].into_iter();
+    let fragments = names.map(|name| (name.to_owned(), format!("/$defs/{name}")));
+    let fragments = fragments.collect();
+    let (a, b) = (&Document::new(a, &fragments), &Document::new(b, &fragments));
     let ask = |of_type, boolean, satisfies: &BTreeMap<String, bool>| {
         let asked = RefCell::new(Vec::new());
         let kind = Kind {
@@ -194,8 +289,8 @@ fn evaluated(a: &Value, b: &Value) -> Vec<Found> {
             satisfies,
             asked: &asked,
         };
-        let tells_apart = kind.accepted_by(b, b) & !kind.accepted_by(a, a);
-        (tells_apart, asked.into_inner())
+        let ((_, a_possibly), (b_surely, _)) = (kind.accepted(a), kind.accepted(b));
+        (b_surely & !a_possibly, asked.into_inner())
     };
     let found = kinds().into_iter().map(|(of_type, boolean, instance)| {
         // The first look finds the leaves that there are to answer.
@@ -228,8 +323,29 @@ fn evaluated(a: &Value, b: &Value) -> Vec<Found> {
     found.collect()
 }
 
-/// A schema without a schema below it.
-fn plain(random: &mut Random) -> Value {
+/// What the schemas of a pair are made of.
+#[derive(Clone, Copy)]
+struct Shape {
+    /// The definitions that the schemas refer to, and that refer to each other. Every
+    /// document has the definition `d` besides, which refers to nothing.
+    definitions: &'static [&'static str],
+    /// Whether only `allOf` and `anyOf` hold schemas, so that no reference is negated.
+    never_negated: bool,
+}
+
+/// Schemas that refer to `d` only, so that none refers to itself.
+const WITHOUT_CYCLES: Shape = Shape {
+    definitions: &[],
+    never_negated: false,
+};
+
+/// A schema without a schema below it. More often than not it is a reference to one of
+/// the definitions of the shape, so that cycles are common.
+fn plain(random: &mut Random, shape: Shape) -> Value {
+    if !shape.definitions.is_empty() && random.chance(60) {
+        let name = shape.definitions[random.below(shape.definitions.len())];
+        return json!({"$ref": format!("#/$defs/{name}")});
+    }
     let plain = [
         json!(true),
         json!(false),
@@ -263,16 +379,17 @@ fn plain(random: &mut Random) -> Value {
     plain[random.below(plain.len())].clone()
 }
 
-fn schema(random: &mut Random, depth: usize) -> Value {
+fn schema(random: &mut Random, depth: usize, shape: Shape) -> Value {
     if depth == 0 || random.chance(30) {
-        return plain(random);
+        return plain(random, shape);
     }
-    let mut below = |random: &mut Random| schema(random, depth - 1);
+    let mut below = |random: &mut Random| schema(random, depth - 1, shape);
     let several = |random: &mut Random, below: &mut dyn FnMut(&mut Random) -> Value| {
         let count = 1 + random.below(3);
         Value::Array((0..count).map(|_| below(random)).collect())
     };
-    let mut schema = match random.below(8) {
+    let connectives = if shape.never_negated { 4 } else { 8 };
+    let mut schema = match random.below(connectives) {
         0 | 1 => json!({"allOf": several(random, &mut below)}),
         2 | 3 => json!({"anyOf": several(random, &mut below)}),
         4 => json!({"oneOf": several(random, &mut below)}),
@@ -301,31 +418,97 @@ fn schema(random: &mut Random, depth: usize) -> Value {
     schema
 }
 
-/// A schema without a reference, for the references of the others to lead to.
-fn definition(random: &mut Random) -> Value {
-    loop {
-        let definition = plain(random);
+/// The definitions of a document: `d`, which refers to nothing, and those of the shape,
+/// which may refer to each other and to themselves. They are small, so that a reference is
+/// a large part of what one says.
+fn definitions(random: &mut Random, shape: Shape) -> Value {
+    let without_reference = loop {
+        let definition = plain(random, WITHOUT_CYCLES);
         if definition.get("$ref").is_none() {
-            return definition;
+            break definition;
+        }
+    };
+    let mut definitions = json!({ "d": without_reference });
+    for name in shape.definitions {
+        definitions[name] = schema(random, 1, shape);
+    }
+    definitions
+}
+
+/// The schema as a document with these definitions.
+fn document(mut schema: Value, definitions: &Value) -> Value {
+    if schema.is_object() {
+        schema["$defs"] = definitions.clone();
+    }
+    schema
+}
+
+/// What the engine made of a pair that the evaluator agrees with.
+#[derive(Default)]
+struct Tally {
+    yes: usize,
+    no: usize,
+    unknown: usize,
+    /// The checks that ended in `Unknown` although there was an instance to give.
+    missed: usize,
+}
+
+impl Tally {
+    /// Holds the verdict of the engine against the evaluator. `complete` says that the
+    /// engine has to see everything that the evaluator sees, which it does where no schema
+    /// refers to itself.
+    fn compare(&mut self, a: &Value, b: &Value, complete: bool) {
+        let found = evaluated(a, b);
+        let subsumed = found.iter().all(|found| !found.some_tells_apart);
+        let verdict = Checker::new().subsumes(a, b).unwrap();
+        let context = format!("does {a} subsume {b}? {verdict:?}");
+        match &verdict {
+            Verdict::Yes => {
+                assert!(subsumed, "{context}");
+                self.yes += 1;
+            }
+            Verdict::No { counterexample } => {
+                let found = found.iter().find(|found| found.instance == *counterexample);
+                let found = found.unwrap_or_else(|| panic!("{context}"));
+                assert!(found.all_tell_apart, "{context}");
+                self.no += 1;
+            }
+            Verdict::Unknown {
+                reason: Reason::Unsupported { .. },
+            } => {
+                assert!(!complete || !subsumed, "{context}");
+                self.unknown += 1;
+                // There was an instance to give, and the engine did not find a branch for it.
+                self.missed += usize::from(found.iter().any(|found| found.all_tell_apart));
+            }
+            Verdict::Unknown { .. } => panic!("{context}"),
         }
     }
 }
 
-/// The schema as a document in which `#/$defs/d` is the definition.
-fn document(mut schema: Value, definition: &Value) -> Value {
-    if schema.is_object() {
-        schema["$defs"] = json!({ "d": definition });
+impl std::fmt::Display for Tally {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            yes,
+            no,
+            unknown,
+            missed,
+        } = self;
+        write!(
+            f,
+            "{yes} Yes, {no} No, {unknown} Unknown, {missed} of them with an instance to give"
+        )
     }
-    schema
 }
 
 #[test]
 fn the_engine_agrees_with_every_instance_there_could_be() {
     let random = &mut Random(0);
-    let (mut yes, mut no, mut unknown, mut missed) = (0, 0, 0, 0);
+    let shape = WITHOUT_CYCLES;
+    let mut tally = Tally::default();
     for pair in 0..4_000 {
-        let (a, b) = (schema(random, 3), schema(random, 3));
-        let (of_a, of_b) = (definition(random), definition(random));
+        let (a, b) = (schema(random, 3, shape), schema(random, 3, shape));
+        let (of_a, of_b) = (definitions(random, shape), definitions(random, shape));
         // Half of the time B is made out of A, so that the two share what they say. The
         // references in both parts then lead to the definition of A.
         let b = match pair % 4 {
@@ -334,35 +517,50 @@ fn the_engine_agrees_with_every_instance_there_could_be() {
             _ => document(b, &of_b),
         };
         let a = document(a, &of_a);
-        let found = evaluated(&a, &b);
-        let subsumed = found.iter().all(|found| !found.some_tells_apart);
-        let verdict = Checker::new().subsumes(&a, &b).unwrap();
-        let context = format!("does {a} subsume {b}? {verdict:?}");
-        match &verdict {
-            Verdict::Yes => {
-                assert!(subsumed, "{context}");
-                yes += 1;
-            }
-            Verdict::No { counterexample } => {
-                let found = found.iter().find(|found| found.instance == *counterexample);
-                let found = found.unwrap_or_else(|| panic!("{context}"));
-                assert!(found.all_tell_apart, "{context}");
-                no += 1;
-            }
-            Verdict::Unknown {
-                reason: Reason::Unsupported { .. },
-            } => {
-                assert!(!subsumed, "{context}");
-                unknown += 1;
-                // There was an instance to give, and the engine did not find a branch for it.
-                missed += usize::from(found.iter().any(|found| found.all_tell_apart));
-            }
-            Verdict::Unknown { .. } => panic!("{context}"),
-        }
+        tally.compare(&a, &b, true);
     }
-    println!("{yes} Yes, {no} No, {unknown} Unknown, {missed} of them with an instance to give");
+    println!("{tally}");
+    let Tally {
+        yes, no, unknown, ..
+    } = tally;
     assert!(
         yes > 500 && no > 500 && unknown > 200,
+        "{yes} {no} {unknown}"
+    );
+}
+
+#[test]
+fn the_engine_agrees_on_schemas_that_refer_to_themselves() {
+    let random = &mut Random(1);
+    let mut tally = Tally::default();
+    for pair in 0..3_000 {
+        // In half of the pairs no reference is negated, so every definition says something
+        // definite and a cycle accepts nothing by itself.
+        let shape = Shape {
+            definitions: &["e", "f"],
+            never_negated: pair % 2 == 0,
+        };
+        let (a, b) = (schema(random, 2, shape), schema(random, 2, shape));
+        let of_a = definitions(random, shape);
+        // B has the definitions of A, and in a third of the pairs its own under the same
+        // names, which say something else. In another third it takes the two definitions
+        // side by side, so that each is met before the other refers to it.
+        let (e, f) = (json!({"$ref": "#/$defs/e"}), json!({"$ref": "#/$defs/f"}));
+        let b = match pair % 3 {
+            0 => document(json!({"allOf": [a, b]}), &of_a),
+            1 => document(json!({"allOf": [e, f, b]}), &of_a),
+            _ => document(b, &definitions(random, shape)),
+        };
+        let a = document(a, &of_a);
+        // The negation of a cycle is a leaf to the engine, and the evaluator knows it.
+        tally.compare(&a, &b, false);
+    }
+    println!("{tally}");
+    let Tally {
+        yes, no, unknown, ..
+    } = tally;
+    assert!(
+        yes > 300 && no > 150 && unknown > 100,
         "{yes} {no} {unknown}"
     );
 }

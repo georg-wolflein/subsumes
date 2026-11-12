@@ -24,7 +24,8 @@
 //! booleans, `allOf`, `anyOf`, `oneOf`, `not`, `if`/`then`/`else` and `$ref`. A check whose
 //! answer depends on another keyword returns [`Verdict::Unknown`] and names the keyword. Two
 //! schemas that share such a keyword with the same value can still be decided, because what
-//! both say cancels.
+//! both say cancels. A schema that uses a `$dynamicRef` is not decided yet, whatever else
+//! it says.
 
 mod checker;
 mod context;

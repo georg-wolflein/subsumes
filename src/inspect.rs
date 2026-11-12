@@ -77,7 +77,7 @@ fn row(graph: &Graph, terms: &Terms, part: TermId) -> Value {
             let leaf = terms.leaf(*leaf);
             let about: Vec<&str> = leaf.domain.iter().map(|kind| kind.name()).collect();
             let side = graph.node(leaf.node).side;
-            let place = graph.keyword_location(leaf.node, leaf.keyword);
+            let place = leaf.location(graph);
             let (key, about) = (&leaf.key, about.join(", "));
             json!([
                 "unknown",

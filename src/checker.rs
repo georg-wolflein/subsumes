@@ -82,7 +82,7 @@ impl Checker {
                 let leaf = context.terms.leaf(leaf);
                 let reason = Reason::Unsupported {
                     schema: graph.node(leaf.node).side,
-                    location: graph.keyword_location(leaf.node, leaf.keyword),
+                    location: leaf.location(&graph),
                 };
                 Verdict::Unknown { reason }
             }
