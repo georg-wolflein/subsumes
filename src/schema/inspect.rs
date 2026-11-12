@@ -135,7 +135,7 @@ fn assertions(keywords: &Keywords) -> Vec<(&'static str, Value)> {
     let count = |count: Option<Count>| {
         count.map(|count| match count {
             Count::Of(count) => json!(count),
-            Count::Beyond => json!("more than a u64 holds"),
+            Count::Beyond => json!("too large to keep exactly"),
         })
     };
     let types = keywords.types.map(|types| {
@@ -231,7 +231,7 @@ mod tests {
                     "keywords": [
                         ["type", ["null", "string"]],
                         ["minLength", 1],
-                        ["maxLength", "more than a u64 holds"],
+                        ["maxLength", "too large to keep exactly"],
                         ["pattern", "^a"],
                         ["required", ["x"]],
                     ],
