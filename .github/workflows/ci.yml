@@ -43,6 +43,9 @@ jobs:
         run: make corpus
       - name: Run the library over the corpus
         run: make benchmark
+      - name: Run the tests that read the corpus
+        if: ${{ !cancelled() }}
+        run: make test-corpus
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ !cancelled() }}
         with:

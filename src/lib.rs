@@ -16,13 +16,17 @@
 //! # Ok::<(), subsumes::Error>(())
 //! ```
 //!
-//! The library has no engine yet: every check of two schemas returns [`Verdict::Unknown`].
+//! A schema has to stand on its own. A `$ref` resolves inside the schema or to a meta-schema of
+//! the draft, so a schema that is spread over several files is bundled into one first, as the
+//! specification describes: each file goes under `$defs` with its URI as its `$id`.
+//!
+//! The library has no engine yet. It loads both schemas, so one that is not a valid schema is
+//! an [`Error`], and every check of two valid schemas returns [`Verdict::Unknown`].
 
 mod checker;
 mod error;
-// Nothing uses the meta-schemas until the library resolves references.
-#[cfg_attr(not(test), expect(dead_code))]
 mod meta_schemas;
+mod schema;
 mod verdict;
 
 use serde_json::Value;
@@ -33,8 +37,7 @@ pub use verdict::{Reason, Side, Verdict};
 
 /// Does `a` accept every instance that is valid under `b`?
 ///
-/// This is [`Checker::subsumes`] with the default settings: the default work budget, and no
-/// documents for references to point to.
+/// This is [`Checker::subsumes`] with the default work budget.
 ///
 /// # Errors
 ///

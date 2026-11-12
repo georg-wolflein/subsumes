@@ -1,15 +1,11 @@
-use std::collections::BTreeMap;
-
 use serde_json::Value;
 
-use crate::{Error, Reason, Side, Verdict};
-
-const DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
+use crate::{Error, Reason, Side, Verdict, schema};
 
 /// The work budget of the Python version; to be set anew once there is an engine to measure.
 const DEFAULT_BUDGET: u64 = 500_000;
 
-/// The settings of a check: its work budget and the documents that references may point to.
+/// The settings of a check. So far that is its work budget.
 ///
 /// A checker does not change while it checks, so one can be shared between threads.
 ///
@@ -17,11 +13,9 @@ const DEFAULT_BUDGET: u64 = 500_000;
 /// use serde_json::json;
 /// use subsumes::Checker;
 ///
-/// let checker = Checker::new()
-///     .budget(100_000)
-///     .resource("https://example.com/name.json", json!({"type": "string"}));
+/// let checker = Checker::new().budget(100_000);
 ///
-/// let a = json!({"$ref": "https://example.com/name.json"});
+/// let a = json!({"type": "string"});
 /// let b = json!({"type": "string", "minLength": 1});
 /// let verdict = checker.subsumes(&a, &b)?;
 /// # Ok::<(), subsumes::Error>(())
@@ -29,16 +23,14 @@ const DEFAULT_BUDGET: u64 = 500_000;
 #[derive(Debug, Clone)]
 pub struct Checker {
     budget: u64,
-    resources: BTreeMap<String, Value>,
 }
 
 impl Checker {
-    /// A checker with the default work budget and no documents.
+    /// A checker with the default work budget.
     #[must_use]
     pub fn new() -> Self {
         Self {
             budget: DEFAULT_BUDGET,
-            resources: BTreeMap::new(),
         }
     }
 
@@ -47,14 +39,6 @@ impl Checker {
     #[must_use]
     pub fn budget(mut self, steps: u64) -> Self {
         self.budget = steps;
-        self
-    }
-
-    /// Adds a document that a `$ref` in either schema may point to, under its URI. Nothing is
-    /// ever fetched: a reference resolves to a document added here or to the schema itself.
-    #[must_use]
-    pub fn resource(mut self, uri: &str, document: Value) -> Self {
-        self.resources.insert(uri.to_owned(), document);
         self
     }
 
@@ -73,8 +57,7 @@ impl Checker {
     ///
     /// When `a` or `b` cannot be checked at all; see [`Error`].
     pub fn check(&self, a: &Value, b: &Value) -> Result<Check, Error> {
-        validate(a, Side::A)?;
-        validate(b, Side::B)?;
+        let _graph = schema::parse(a, b)?.link()?;
         // Without an engine nothing is supported, so the whole of A is the construct in the way.
         Ok(Check {
             verdict: Verdict::Unknown {
@@ -103,23 +86,6 @@ pub struct Check {
     /// The steps of the work budget that the check spent. The count depends only on the two
     /// schemas and the settings, never on the machine, so two runs can be compared exactly.
     pub steps: u64,
-}
-
-/// The checks on the root of a schema that need no engine.
-fn validate(schema: &Value, side: Side) -> Result<(), Error> {
-    match schema {
-        Value::Bool(_) => Ok(()),
-        Value::Object(keywords) => match keywords.get("$schema") {
-            Some(Value::String(dialect)) if dialect.trim_end_matches('#') != DRAFT_2020_12 => {
-                Err(Error::UnsupportedDialect {
-                    schema: side,
-                    dialect: dialect.clone(),
-                })
-            }
-            _ => Ok(()),
-        },
-        _ => Err(Error::NotASchema { schema: side }),
-    }
 }
 
 #[cfg(test)]
@@ -157,7 +123,8 @@ mod tests {
 
     #[test]
     fn draft_2020_12_is_accepted_with_and_without_the_empty_fragment() {
-        for dialect in [DRAFT_2020_12.to_owned(), format!("{DRAFT_2020_12}#")] {
+        let draft_2020_12 = "https://json-schema.org/draft/2020-12/schema";
+        for dialect in [draft_2020_12.to_owned(), format!("{draft_2020_12}#")] {
             let schema = json!({"$schema": dialect});
             assert!(Checker::new().check(&schema, &schema).is_ok());
         }
@@ -171,6 +138,7 @@ mod tests {
             error,
             Error::UnsupportedDialect {
                 schema: Side::B,
+                location: "#/$schema".to_owned(),
                 dialect: "http://json-schema.org/draft-07/schema#".to_owned(),
             }
         );
@@ -182,5 +150,41 @@ mod tests {
             let error = Checker::new().check(&value, &json!(true)).unwrap_err();
             assert_eq!(error, Error::NotASchema { schema: Side::A });
         }
+    }
+
+    #[test]
+    fn both_schemas_are_loaded_before_anything_is_answered() {
+        let checker = Checker::new();
+        let invalid = json!({"properties": {"age": {"minimum": "0"}}});
+        assert_eq!(
+            checker.check(&json!({}), &invalid).unwrap_err(),
+            Error::InvalidKeyword {
+                schema: Side::B,
+                location: "#/properties/age/minimum".to_owned(),
+                message: "must be a number".to_owned(),
+            }
+        );
+        let dangling = json!({"items": {"$ref": "#/$defs/item"}});
+        assert_eq!(
+            checker.check(&dangling, &json!({})).unwrap_err(),
+            Error::UnresolvedReference {
+                schema: Side::A,
+                location: "#/items/$ref".to_owned(),
+                reference: "#/$defs/item".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_schema_has_to_carry_what_it_references() {
+        let uri = "https://example.com/name.json";
+        let alone = json!({"$ref": uri});
+        assert!(matches!(
+            Checker::new().check(&alone, &json!(true)),
+            Err(Error::UnresolvedReference { .. })
+        ));
+        let bundled = json!({"$ref": uri, "$defs": {"name": {"$id": uri, "type": "string"}}});
+        assert!(Checker::new().check(&bundled, &alone).is_err());
+        assert!(Checker::new().check(&bundled, &bundled).is_ok());
     }
 }

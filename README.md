@@ -33,6 +33,12 @@ The dialect changes answers. In ECMA-262, `\d` matches only `0` to `9`; in the `
 
 Other dialects may be supported later. For now this is the only one.
 
+## References
+
+A schema has to stand on its own. A `$ref` resolves inside the schema or to a meta-schema of draft 2020-12; nothing is fetched, and a reference that resolves to nothing is an error.
+
+A schema that is spread over several files is bundled into one first, as [the specification describes](https://json-schema.org/draft/2020-12/json-schema-core#section-9.3): each file goes under `$defs` with its URI as its `$id`, and no reference has to change.
+
 ## Unsupported constructs
 
 A few JSON schema constructs are not modelled. A check whose answer depends on one of them returns `Unknown` (and a reason why):
