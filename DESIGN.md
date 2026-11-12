@@ -138,7 +138,7 @@ src/
   canonical/      numbers, strings, objects, arrays
   language/       string languages: automata over scalar ranges, word sets
   formats.rs      the format table
-  meta_schemas.rs the meta-schemas of draft 2020-12 (exists)
+  meta_schemas.rs the meta-schema of draft 2020-12 and those of its vocabularies (exists)
   generate.rs     counterexamples
 harness/          the benchmark runner (exists)
 ```
