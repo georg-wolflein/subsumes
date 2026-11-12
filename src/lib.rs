@@ -25,8 +25,6 @@
 
 mod checker;
 mod error;
-// Nothing uses the meta-schemas until the library resolves references.
-#[cfg_attr(not(test), expect(dead_code))]
 mod meta_schemas;
 mod schema;
 mod verdict;

@@ -13,8 +13,8 @@ use std::borrow::Cow;
 use serde_json::Value;
 
 use super::parse::{Builder, Reference, ReferenceKeyword, Unlinked, index, resolve};
-use super::{DynamicReference, Graph, NodeId, Origin, Schema, meta, push_token};
-use crate::{Error, Side};
+use super::{DynamicReference, Graph, NodeId, Origin, Schema, push_token};
+use crate::{Error, Side, meta_schemas};
 
 impl<'a> Unlinked<'a> {
     /// Resolves every reference, and parses every meta-schema that a reference leads to.
@@ -107,7 +107,7 @@ impl<'a> Builder<'a> {
         if let Some(&resource) = self.resources[index(side)].get(uri.as_str()) {
             return Ok(Some(resource));
         }
-        let Some(document) = meta::document(uri.as_str()) else {
+        let Some(document) = meta_schemas::document(uri.as_str()) else {
             return Ok(None);
         };
         let origin = Origin::Reference(uri.as_str().to_owned());

@@ -140,7 +140,7 @@ src/
   lib.rs, checker.rs, verdict.rs, error.rs    the API (exists)
   context.rs      the state of one check: arenas, memo tables, budget
   schema.rs       load: nodes, typed keywords, locations (exists)
-  schema/         its two steps, parse and link, and the meta-schemas of the draft (exists)
+  schema/         its two steps: parse, and link for the references (exists)
   term.rs         terms, variables, c-references, one-level negation
   lower.rs        schema graph to terms: rewrites and scenarios
   normalize.rs    the engine

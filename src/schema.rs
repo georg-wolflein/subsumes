@@ -15,7 +15,6 @@
 #![cfg_attr(test, allow(dead_code))]
 
 mod link;
-mod meta;
 #[cfg(test)]
 mod oracle;
 mod parse;
