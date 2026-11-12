@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use subsumes::{Check, Error, Reason, Verdict};
 
+use crate::counterexample::Confirmation;
+
 /// Which way round the two schemas of a case were checked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -27,6 +29,15 @@ impl Direction {
             Self::BSubsumesA => "b_subsumes_a",
         }
     }
+
+    /// The file of the wide schema, which was to accept everything, and the file of the
+    /// narrow schema, whose instances it was to accept.
+    pub fn files(self) -> (&'static str, &'static str) {
+        match self {
+            Self::ASubsumesB => ("a.json", "b.json"),
+            Self::BSubsumesA => ("b.json", "a.json"),
+        }
+    }
 }
 
 /// What the library did with one check.
@@ -36,6 +47,10 @@ pub enum Outcome {
     Yes,
     No {
         counterexample: Value,
+        /// What a validator makes of the counterexample. A file that was written before
+        /// counterexamples were checked does not say.
+        #[serde(default)]
+        confirmation: Confirmation,
     },
     Unknown {
         /// What the reasons are counted by: `budget`, or the keyword that is not supported.
@@ -50,11 +65,16 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    pub fn of(result: &Result<Check, Error>) -> Self {
+    /// `confirmation` is asked about the counterexample of a `No`.
+    pub fn of(
+        result: &Result<Check, Error>,
+        confirmation: impl FnOnce(&Value) -> Confirmation,
+    ) -> Self {
         match result {
             Ok(check) => match &check.verdict {
                 Verdict::Yes => Self::Yes,
                 Verdict::No { counterexample } => Self::No {
+                    confirmation: confirmation(counterexample),
                     counterexample: counterexample.clone(),
                 },
                 Verdict::Unknown { reason } => Self::Unknown {
@@ -128,12 +148,44 @@ impl Record {
         self.case.split('/').next().unwrap_or(&self.case)
     }
 
-    /// A `Yes` or `No` that contradicts the label. An `Unknown` is never wrong.
+    /// A `Yes` or `No` that contradicts the label, or a `No` whose counterexample is none.
+    /// An `Unknown` is never wrong.
     pub fn is_wrong(&self) -> bool {
-        matches!(
-            (self.expected, &self.outcome),
-            (Some(true), Outcome::No { .. }) | (Some(false), Outcome::Yes)
-        )
+        match (self.expected, &self.outcome) {
+            (Some(true), Outcome::No { .. }) | (Some(false), Outcome::Yes) => true,
+            (_, Outcome::No { confirmation, .. }) => confirmation.is_refuted(),
+            _ => false,
+        }
+    }
+
+    /// What is wrong with the verdict, if anything is.
+    fn fault(&self) -> Option<String> {
+        let mut faults = Vec::new();
+        match (self.expected, &self.outcome) {
+            (Some(true), Outcome::No { .. }) => faults.push("the corpus says Yes".to_owned()),
+            (Some(false), Outcome::Yes) => faults.push("the corpus says No".to_owned()),
+            _ => {}
+        }
+        if let Outcome::No {
+            counterexample,
+            confirmation,
+        } = &self.outcome
+        {
+            let (wide, narrow) = self.direction.files();
+            let instance = shortened(&counterexample.to_string());
+            match confirmation {
+                Confirmation::RejectedByNarrow => {
+                    faults.push(format!(
+                        "`{narrow}` rejects the counterexample `{instance}`"
+                    ));
+                }
+                Confirmation::AcceptedByWide => {
+                    faults.push(format!("`{wide}` accepts the counterexample `{instance}`"));
+                }
+                Confirmation::Confirmed | Confirmation::NotChecked(_) => {}
+            }
+        }
+        (!faults.is_empty()).then(|| faults.join(", and "))
     }
 
     pub fn is_error(&self) -> bool {
@@ -143,6 +195,25 @@ impl Record {
     /// The check as a pull request comment names it.
     pub fn name(&self) -> String {
         format!("`{}` {}", self.case, self.direction.name())
+    }
+
+    /// The check with its outcome, and with what is wrong with the outcome if anything is.
+    pub fn described(&self) -> String {
+        let (name, outcome) = (self.name(), self.outcome.label());
+        match self.fault() {
+            Some(fault) => format!("{name}: {outcome}, and {fault}"),
+            None => format!("{name}: {outcome}"),
+        }
+    }
+}
+
+/// At most this many characters of a counterexample are shown.
+const SHOWN: usize = 60;
+
+fn shortened(text: &str) -> String {
+    match text.char_indices().nth(SHOWN) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_owned(),
     }
 }
 
@@ -155,6 +226,9 @@ pub struct Counts {
     pub unknown: u64,
     pub wrong: u64,
     pub errors: u64,
+    /// The counterexamples that a validator confirmed, and those that it did not look at.
+    pub confirmed: u64,
+    pub unchecked: u64,
     pub steps: u64,
     pub nanos: u64,
 }
@@ -170,9 +244,13 @@ impl Counts {
 
     pub fn add(&mut self, record: &Record) {
         self.checks += 1;
-        match record.outcome {
+        match &record.outcome {
             Outcome::Yes => self.yes += 1,
-            Outcome::No { .. } => self.no += 1,
+            Outcome::No { confirmation, .. } => {
+                self.no += 1;
+                self.confirmed += u64::from(*confirmation == Confirmation::Confirmed);
+                self.unchecked += u64::from(matches!(confirmation, Confirmation::NotChecked(_)));
+            }
             Outcome::Unknown { .. } => self.unknown += 1,
             Outcome::Error { .. } => self.errors += 1,
         }
@@ -227,11 +305,16 @@ mod tests {
         }
     }
 
+    fn no(counterexample: Value, confirmation: Confirmation) -> Outcome {
+        Outcome::No {
+            counterexample,
+            confirmation,
+        }
+    }
+
     #[test]
     fn a_line_is_a_flat_object() {
-        let no = Outcome::No {
-            counterexample: json!({"a": 1}),
-        };
+        let no = no(json!({"a": 1}), Confirmation::Confirmed);
         let line = serde_json::to_value(record(Some(false), no)).unwrap();
         assert_eq!(
             line,
@@ -241,6 +324,7 @@ mod tests {
                 "expected": false,
                 "verdict": "no",
                 "counterexample": {"a": 1},
+                "confirmation": "confirmed",
                 "steps": 7,
                 "nanos": 1200,
             })
@@ -248,12 +332,50 @@ mod tests {
     }
 
     #[test]
+    fn a_line_from_before_counterexamples_were_checked_is_read() {
+        let line = json!({
+            "case": "collection/group/case",
+            "direction": "a_subsumes_b",
+            "expected": false,
+            "verdict": "no",
+            "counterexample": 0,
+            "steps": 7,
+            "nanos": 1200,
+        });
+        let read: Record = serde_json::from_value(line).unwrap();
+        let Outcome::No { confirmation, .. } = &read.outcome else {
+            panic!("the line holds a No");
+        };
+        assert!(matches!(confirmation, Confirmation::NotChecked(_)));
+        // Such a counterexample is not known to be none.
+        assert!(!read.is_wrong());
+        let counts = Counts::of([&read]);
+        assert_eq!((counts.no, counts.confirmed, counts.unchecked), (1, 0, 1));
+    }
+
+    #[test]
+    fn the_outcome_of_a_no_holds_what_the_validator_says() {
+        let checker = subsumes::Checker::new();
+        // `null` is no string.
+        let check = checker.check(&json!({"type": "string"}), &json!(true));
+        let outcome = Outcome::of(&check, |counterexample| {
+            assert_eq!(counterexample, &json!(null));
+            Confirmation::AcceptedByWide
+        });
+        assert_eq!(outcome, no(json!(null), Confirmation::AcceptedByWide));
+        // Nothing is asked about any other verdict.
+        let check = checker.check(&json!(true), &json!({"type": "string"}));
+        let unasked = |_: &Value| panic!("a Yes has no counterexample");
+        assert_eq!(Outcome::of(&check, unasked), Outcome::Yes);
+    }
+
+    #[test]
     fn every_outcome_survives_the_file() {
         let outcomes = [
             Outcome::Yes,
-            Outcome::No {
-                counterexample: json!(null),
-            },
+            no(json!(null), Confirmation::Confirmed),
+            no(json!(1), Confirmation::RejectedByNarrow),
+            no(json!(""), Confirmation::NotChecked("why".to_owned())),
             unknown(),
             Outcome::Error {
                 message: "schema A is neither an object nor a boolean".to_owned(),
@@ -267,16 +389,73 @@ mod tests {
     }
 
     #[test]
-    fn only_a_verdict_against_the_label_is_wrong() {
-        let no = || Outcome::No {
-            counterexample: json!(0),
-        };
+    fn a_verdict_against_the_label_is_wrong() {
+        let no = || no(json!(0), Confirmation::Confirmed);
         assert!(record(Some(true), no()).is_wrong());
         assert!(record(Some(false), Outcome::Yes).is_wrong());
         assert!(!record(Some(true), Outcome::Yes).is_wrong());
         assert!(!record(Some(false), no()).is_wrong());
         assert!(!record(None, Outcome::Yes).is_wrong());
         assert!(!record(Some(true), unknown()).is_wrong());
+        assert_eq!(
+            record(Some(true), no()).described(),
+            "`collection/group/case` a_subsumes_b: No, and the corpus says Yes"
+        );
+        assert_eq!(
+            record(Some(false), Outcome::Yes).described(),
+            "`collection/group/case` a_subsumes_b: Yes, and the corpus says No"
+        );
+        assert_eq!(
+            record(Some(false), no()).described(),
+            "`collection/group/case` a_subsumes_b: No"
+        );
+    }
+
+    #[test]
+    fn a_no_with_a_counterexample_that_is_none_is_wrong() {
+        // Whatever the label says, also where the corpus claims nothing.
+        for expected in [None, Some(false)] {
+            let rejected = record(expected, no(json!(0), Confirmation::RejectedByNarrow));
+            assert!(rejected.is_wrong());
+            assert_eq!(
+                rejected.described(),
+                "`collection/group/case` a_subsumes_b: No, and `b.json` rejects the counterexample `0`"
+            );
+            let accepted = record(expected, no(json!("x"), Confirmation::AcceptedByWide));
+            assert!(accepted.is_wrong());
+            assert_eq!(
+                accepted.described(),
+                "`collection/group/case` a_subsumes_b: No, and `a.json` accepts the counterexample `\"x\"`"
+            );
+        }
+        // The other way round, the two files change places.
+        let mut other = record(None, no(json!(0), Confirmation::RejectedByNarrow));
+        other.direction = Direction::BSubsumesA;
+        assert!(
+            other
+                .described()
+                .ends_with("`a.json` rejects the counterexample `0`")
+        );
+        // Both faults are named.
+        let both = record(Some(true), no(json!(0), Confirmation::AcceptedByWide));
+        assert!(
+            both.described().ends_with(
+                "No, and the corpus says Yes, and `a.json` accepts the counterexample `0`"
+            )
+        );
+        let counts = Counts::of([&both, &other]);
+        assert_eq!((counts.no, counts.wrong), (2, 2));
+        assert_eq!((counts.confirmed, counts.unchecked), (0, 0));
+    }
+
+    #[test]
+    fn a_long_counterexample_is_cut() {
+        let long = record(
+            None,
+            no(json!("é".repeat(100)), Confirmation::AcceptedByWide),
+        );
+        let shown = format!("`\"{}…`", "é".repeat(SHOWN - 1));
+        assert!(long.described().ends_with(&shown), "{}", long.described());
     }
 
     #[test]

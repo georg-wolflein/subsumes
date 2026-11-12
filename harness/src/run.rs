@@ -9,6 +9,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use subsumes::Checker;
 
+use crate::counterexample;
 use crate::results::{Direction, Outcome, Record};
 
 /// The labels of a case, from its `case.json`.
@@ -18,7 +19,8 @@ struct Labels {
     b_subsumes_a: Option<bool>,
 }
 
-/// Checks every case of the corpus in both directions, in the order of the case paths.
+/// Checks every case of the corpus in both directions, in the order of the case paths, and
+/// asks a validator about every counterexample.
 pub fn run(corpus: &Path) -> Result<Vec<Record>, String> {
     if !corpus.is_dir() {
         return Err(format!(
@@ -41,11 +43,15 @@ pub fn run(corpus: &Path) -> Result<Vec<Record>, String> {
             let start = Instant::now();
             let result = checker.check(wide, narrow);
             let nanos = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            // The validator is asked after the clock has stopped.
+            let outcome = Outcome::of(&result, |counterexample| {
+                counterexample::confirmation(wide, narrow, counterexample)
+            });
             records.push(Record {
                 case: case.clone(),
                 direction,
                 expected,
-                outcome: Outcome::of(&result),
+                outcome,
                 steps: result.map_or(0, |check| check.steps),
                 nanos,
             });
