@@ -86,7 +86,7 @@ The engine works on *terms*, not keywords:
 - **A leaf is about the instances its keyword is about.** `minLength` says something about strings only, so a number satisfies its leaf and no number satisfies the negation. `const` and `enum` with another value than `null` or a boolean are the type of the value and a leaf about that type.
 - **Two leaves are one when they must hold for the same instances:** the same keyword with the same value, or with subschemas of the same class. Keywords that depend on each other are one leaf: `items` with `prefixItems`, `additionalProperties` with `properties` and `patternProperties`, `contains` with its bounds. `unevaluatedProperties` and `unevaluatedItems` depend on the whole schema around them, so their leaf is one of that schema's class. A `$dynamicRef`, and a count that was too large to keep, are like no other.
 - **Negation moves one level at a time.** `not(PProp(p, x))` is `PReq(p, ¬x)` and `not(Min(q))` is `ExMax(q)`. A negated c-reference `¬x` is a fresh variable whose body is `not(x)`.
-- **`$ref` and `$dynamicRef`** targets are variables. A `$dynamicRef` variable is keyed by its target and the dynamic scope it was reached in, which models the dynamic scope without unfolding.
+- **`$ref` and `$dynamicRef`** targets are variables. A `$dynamicRef` variable is keyed by its target and the dynamic scope it was reached in, which models the dynamic scope without unfolding. That is step 7; until then a check does not get as far as the terms if A or B leads to a `$dynamicRef`, see [left for later](#left-for-later).
 - **Rewrites.**
   - `prefixItems` and `items` become `Item` and `AddIts`; `contains`, `minContains` and `maxContains` become `Contains` and `MaxContains`.
   - `integer` is `number` with `multipleOf: 1`.
@@ -185,6 +185,13 @@ Each step goes through all four stages for the keywords it adds, and lands as it
 6. **Arrays.** `const` and `enum` are complete from here.
 7. **`$dynamicRef`, `unevaluatedProperties`, `unevaluatedItems`.**
 8. **Speed:** measure the checks on the corpus, then set the default budget.
+
+### Left for later
+
+What a step left open, with the step that takes it up:
+
+- **`$dynamicRef`, for step 7.** A check ends in `Unknown` and names the `$dynamicRef` if A or B leads to one, wherever it is. What a `$dynamicRef` accepts depends on the schemas that led to it, and a term says the same wherever it stands. With one leaf for each `$dynamicRef`, a schema that is reached in two ways cancelled against its own negation, which gave a wrong `Yes`.
+- **Deeply nested values of `const` and `enum`, for step 6.** The lowering writes such a value out to compare it with others, and that recurses, as does the viewer. A value that is nested many thousand levels deep overflows the stack and aborts the process. Only a value built in code can be that deep, because JSON text ends at 128 levels. When `const` and `enum` become structural terms, the lowering walks the values itself and counts the depth.
 
 ## Not planned
 

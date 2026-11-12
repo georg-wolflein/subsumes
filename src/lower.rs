@@ -52,6 +52,31 @@ pub(crate) fn lower(graph: &Graph, context: &mut Context) -> Result<(VarId, VarI
     Ok((a, b))
 }
 
+/// The first `$dynamicRef` that A or B leads to, if either leads to one.
+///
+/// What a `$dynamicRef` accepts depends on the schemas that led to it, and a term says the
+/// same wherever it stands. So the terms of a schema that leads to one are not to be trusted:
+/// the same schema, reached in two ways, would cancel against its own negation. That holds
+/// wherever in the schema the reference is, because a leaf holds schemas too.
+pub(crate) fn dynamic_reference(graph: &Graph) -> Option<NodeId> {
+    let mut seen = vec![false; graph.len()];
+    let mut pending = VecDeque::from([graph.a, graph.b]);
+    while let Some(id) = pending.pop_front() {
+        if std::mem::replace(&mut seen[id.index()], true) {
+            continue;
+        }
+        let Schema::Object(keywords) = &graph.node(id).schema else {
+            continue;
+        };
+        if keywords.dynamic_reference.is_some() {
+            return Some(id);
+        }
+        let applied = keywords.subschemas().into_iter().map(|(_, _, to)| to);
+        pending.extend(applied.chain(keywords.reference));
+    }
+    None
+}
+
 struct Lowering<'g, 'c> {
     graph: &'g Graph<'g>,
     classes: &'c [u32],
@@ -146,6 +171,8 @@ impl Lowering<'_, '_> {
         if let Some(target) = keywords.reference {
             parts.push(self.refer(target));
         }
+        // No check gets this far with one; see `dynamic_reference`. The leaf is what a
+        // picture of the terms shows in its place.
         if keywords.dynamic_reference.is_some() {
             parts.push(self.leaf_of_its_own(TypeSet::ALL, id, "$dynamicRef"));
         }
@@ -675,6 +702,42 @@ mod tests {
         // What a leaf holds is not opened, so the cycle through `items` ends in the leaf.
         let tree = json!({"items": {"$ref": "#"}});
         assert_eq!(terms(&tree, &json!(true)).len(), 2);
+    }
+
+    #[test]
+    fn a_dynamic_reference_is_found_wherever_a_schema_leads_to_it() {
+        let found = |a: &Value, b: &Value| {
+            let graph = parse(a, b).unwrap().link().unwrap();
+            let node = dynamic_reference(&graph)?;
+            let location = graph.keyword_location(node, "$dynamicRef");
+            Some((graph.node(node).side, location))
+        };
+        let at = |side, location: &str| Some((side, location.to_owned()));
+        let plain = json!({"type": "null"});
+        assert_eq!(found(&plain, &plain), None);
+
+        // Under a keyword that is a leaf, and behind a reference.
+        let inside = json!({
+            "$dynamicAnchor": "node",
+            "properties": {"child": {"items": {"$dynamicRef": "#node"}}},
+        });
+        let place = "#/properties/child/items/$dynamicRef";
+        assert_eq!(found(&plain, &inside), at(Side::B, place));
+        let behind = json!({
+            "$ref": "#/$defs/tree",
+            "$defs": {"tree": {"$dynamicAnchor": "node", "not": {"$dynamicRef": "#node"}}},
+        });
+        let place = "#/$defs/tree/not/$dynamicRef";
+        assert_eq!(found(&behind, &plain), at(Side::A, place));
+        // The one of A comes first.
+        assert_eq!(found(&behind, &inside), at(Side::A, place));
+
+        // A definition that nothing leads to is not in the way, and neither is an anchor.
+        let unused = json!({
+            "$dynamicAnchor": "node",
+            "$defs": {"tree": {"$dynamicRef": "#node"}},
+        });
+        assert_eq!(found(&unused, &plain), None);
     }
 
     #[test]
