@@ -16,6 +16,8 @@
 
 mod link;
 mod meta;
+#[cfg(test)]
+mod oracle;
 mod parse;
 
 use std::fmt::Write;

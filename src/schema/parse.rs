@@ -101,6 +101,9 @@ struct Entry<'a> {
     origin: Origin<'a>,
     /// The resource of the parent; `None` for the root of a document.
     resource: Option<NodeId>,
+    /// Whether a reference can name the value by its `$id` or by an anchor: whether it is in a
+    /// place where the draft puts a schema.
+    named: bool,
 }
 
 /// What a schema object says about how a reference can name it.
@@ -183,9 +186,11 @@ impl<'a> Builder<'a> {
             value: root,
             origin,
             resource,
+            named,
         }]);
         while let Some(entry) = queue.pop_front() {
             let id = NodeId::new(self.nodes.len());
+            let named = entry.named;
             // The resource that the node is in if it does not begin one itself.
             let around = entry.resource.unwrap_or(id);
             let mut resource = around;
@@ -216,6 +221,9 @@ impl<'a> Builder<'a> {
                                 part,
                             },
                             resource: Some(resource),
+                            // `dependencies` belongs to older drafts. This one gives it a
+                            // shape and puts no schema there.
+                            named: named && keyword != "dependencies",
                         });
                         child
                     };
@@ -400,7 +408,7 @@ fn keyword<'a>(
         }
 
         // Keywords of older drafts. They assert nothing in this one, but its meta-schema still
-        // says what they may hold.
+        // says what they may hold. A schema under `dependencies` is parsed to check it.
         "dependencies" => {
             const MESSAGE: &str = "must be an object whose values are schemas or arrays of strings without repetition";
             for (name, dependency) in value.as_object().ok_or(MESSAGE)? {
@@ -910,6 +918,15 @@ mod tests {
             .map(|index| location_of(&unlinked, NodeId::new(index)))
             .collect();
         assert_eq!(locations, ["#/dependencies/d", "#/dependencies/e"]);
+
+        // The draft puts no schema there, so what they declare names nothing.
+        let schema = json!({
+            "$anchor": "x",
+            "dependencies": {"a": {"$id": "a.json", "$anchor": "x", "not": {"$anchor": "x"}}},
+        });
+        let unlinked = parsed(&schema).unwrap();
+        assert_eq!(unlinked.builder.anchors.len(), 1);
+        assert_eq!(unlinked.builder.resources[index(Side::A)].len(), 1);
 
         let cases = [
             (json!({"dependencies": {"a": 1}}), "#/dependencies/a"),

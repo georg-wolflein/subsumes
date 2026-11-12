@@ -60,7 +60,7 @@ impl<'a> Unlinked<'a> {
 
 impl<'a> Builder<'a> {
     /// The node that a reference points to, or `None` if it points to nothing.
-    fn target(&mut self, reference: Reference<'a>) -> Result<Option<NodeId>, Error> {
+    pub(super) fn target(&mut self, reference: Reference<'a>) -> Result<Option<NodeId>, Error> {
         let node = &self.nodes[reference.node.index()];
         let (side, own) = (node.side, node.resource);
         let (resource, fragment) = reference
@@ -216,13 +216,10 @@ fn percent_decoded(fragment: &str) -> Option<Cow<'_, str>> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-    use std::path::{Path, PathBuf};
-
-    use referencing::{Draft, Registry, Resolver, ResourceRef};
     use serde_json::{Map, json};
 
-    use super::super::parse::{ROOT, parse};
+    use super::super::oracle::compared;
+    use super::super::parse::parse;
     use super::super::{Keywords, Type};
     use super::*;
 
@@ -564,6 +561,40 @@ mod tests {
     }
 
     #[test]
+    fn an_id_on_such_a_target_is_the_base_of_what_is_inside() {
+        let schema = json!({
+            "$ref": "#/x/pet",
+            "x": {
+                "pet": {
+                    "$id": "https://example.com/pet",
+                    "properties": {
+                        "pointer": {"$ref": "#/properties/name"},
+                        "by_uri": {"$ref": "pet#/properties/name"},
+                        "name": {},
+                    },
+                },
+            },
+            "properties": {"name": {}},
+        });
+        load(&schema, &json!(true), |graph| {
+            let pet = object(graph, graph.a).reference.unwrap();
+            assert_eq!(graph.node(pet).resource, pet);
+            for (name, property) in &object(graph, pet).properties {
+                if *name != "name" {
+                    assert_eq!(target(graph, *property), "#/x/pet/properties/name");
+                }
+            }
+        })
+        .unwrap();
+        // No other reference can name it by that URI.
+        let outside = json!({
+            "allOf": [{"$ref": "#/x/pet"}, {"$ref": "https://example.com/pet"}],
+            "x": {"pet": {"$id": "https://example.com/pet"}},
+        });
+        assert_eq!(unresolved(&outside).1, "#/allOf/1/$ref");
+    }
+
+    #[test]
     fn a_fragment_is_decoded_before_it_is_read() {
         let anchor = json!({"$ref": "#%78", "$defs": {"a": {"$anchor": "x"}}});
         assert_eq!(root_target(&anchor).unwrap(), "#/$defs/a");
@@ -647,115 +678,6 @@ mod tests {
         assert_eq!(percent_decoded("%FF"), None);
     }
 
-    // The tests below hold this module against the `referencing` crate, which resolves
-    // references for the validator `jsonschema`.
-
-    /// The resolver of `referencing` for the references of a resource.
-    fn resolver<'r>(
-        builder: &Builder<'r>,
-        registry: &'r Registry<'r>,
-        resource: NodeId,
-    ) -> Option<Resolver<'r>> {
-        let root = |uri: &str| registry.resolver(referencing::uri::from_str(uri).unwrap());
-        let outer = match &builder.nodes[resource.index()].origin {
-            Origin::Root => root(ROOT),
-            Origin::Child { parent, .. } => {
-                resolver(builder, registry, builder.nodes[parent.index()].resource)?
-            }
-            Origin::Reference(uri) if !uri.contains('#') => root(uri),
-            // A resource in a place where the draft puts no schema, which the crate never
-            // enters.
-            Origin::Reference(_) => return None,
-        };
-        let value = builder.values[resource.index()];
-        outer
-            .in_subresource(ResourceRef::new(value, Draft::Draft202012))
-            .ok()
-    }
-
-    /// What `referencing` finds for a reference. Its lookup follows the dynamic scope, which
-    /// a static resolution must not, so the fragment is looked up from the resource that the
-    /// reference names: there the scope holds nothing else.
-    fn found_by_referencing<'r>(
-        registry: &'r Registry<'r>,
-        resolver: &Resolver<'r>,
-        reference: &str,
-    ) -> Option<&'r Value> {
-        let (resource, fragment) = reference.split_once('#').unwrap_or((reference, ""));
-        let base = resolver.base_uri();
-        let uri = if resource.is_empty() {
-            (*base).clone()
-        } else {
-            (*resolver.resolve_uri(&base.borrow(), resource).ok()?).clone()
-        };
-        let resolved = registry.resolver(uri).lookup(&format!("#{fragment}"));
-        resolved.ok().map(|resolved| resolved.contents())
-    }
-
-    /// The crate's copies of the meta-schemas declare a `$vocabulary` where the ones that
-    /// json-schema.org serves declare none. Nothing else differs.
-    fn without_vocabulary(meta_schema: &Value) -> Value {
-        let mut meta_schema = meta_schema.clone();
-        if let Value::Object(keywords) = &mut meta_schema {
-            keywords.remove("$vocabulary");
-        }
-        meta_schema
-    }
-
-    /// Resolves every reference of a schema with this module and with `referencing`. Returns
-    /// how many references both resolved to the same value, and every difference.
-    fn compared(schema: &Value) -> (usize, Vec<String>) {
-        let truth = Value::Bool(true);
-        let mut builder = match parse(schema, &truth) {
-            Ok(unlinked) => unlinked.builder,
-            Err(error) => return (0, vec![format!("is not parsed: {error}")]),
-        };
-        let registry = referencing::SPECIFICATIONS
-            .add(ROOT, schema)
-            .and_then(|registry| registry.draft(Draft::Draft202012).prepare());
-        let registry = match registry {
-            Ok(registry) => registry,
-            Err(error) => return (0, vec![format!("is not indexed by referencing: {error}")]),
-        };
-        let (mut same, mut differences) = (0, Vec::new());
-        let mut next = 0;
-        while let Some(&reference) = builder.references.get(next) {
-            next += 1;
-            let node = &builder.nodes[reference.node.index()];
-            let Some(resolver) = resolver(&builder, &registry, node.resource) else {
-                continue;
-            };
-            let theirs = found_by_referencing(&registry, &resolver, reference.reference);
-            let place = format!(
-                "{} to {}",
-                builder.location(reference.node),
-                reference.reference
-            );
-            match (builder.target(reference), theirs) {
-                (Ok(Some(ours)), Some(theirs)) => {
-                    let ours = builder.values[ours.index()];
-                    // Each of the two has its own copy of a meta-schema.
-                    let equal = std::ptr::eq(ours, theirs)
-                        || (builder.known(Side::A, theirs).is_none()
-                            && without_vocabulary(ours) == without_vocabulary(theirs));
-                    if equal {
-                        same += 1;
-                    } else {
-                        differences.push(format!("{place}: another value"));
-                    }
-                }
-                (Ok(None), None) => {}
-                (Ok(Some(ours)), None) => {
-                    let ours = builder.location(ours);
-                    differences.push(format!("{place}: only this library, {ours}"));
-                }
-                (Ok(None), Some(_)) => differences.push(format!("{place}: only referencing")),
-                (Err(error), _) => differences.push(format!("{place}: {error}")),
-            }
-        }
-        (same, differences)
-    }
-
     #[test]
     fn referencing_finds_the_same_targets() {
         let schemas = [
@@ -766,54 +688,18 @@ mod tests {
             (targets_that_are_no_subschemas(), 4),
         ];
         for (schema, references) in schemas {
-            assert_eq!(compared(&schema), (references, Vec::new()), "{schema}");
+            let comparison = compared(&schema).unwrap();
+            assert_eq!(comparison.differences, Vec::<String>::new(), "{schema}");
+            assert_eq!(
+                (comparison.same, comparison.unresolved),
+                (references, 0),
+                "{schema}"
+            );
         }
         // The meta-schema of the draft and the eight that it draws in.
         let meta = json!({"$ref": "https://json-schema.org/draft/2020-12/schema"});
-        let (same, differences) = compared(&meta);
-        assert_eq!(differences, Vec::<String>::new());
-        assert!(same > 40, "{same}");
-    }
-
-    /// Every `a.json` and `b.json` of the corpus.
-    fn corpus_schemas(corpus: &Path) -> Vec<PathBuf> {
-        let (mut schemas, mut pending) = (Vec::new(), vec![corpus.to_owned()]);
-        while let Some(folder) = pending.pop() {
-            for entry in std::fs::read_dir(&folder).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    pending.push(path);
-                } else if path.ends_with("a.json") || path.ends_with("b.json") {
-                    schemas.push(path);
-                }
-            }
-        }
-        schemas.sort();
-        schemas
-    }
-
-    #[test]
-    #[ignore = "needs the corpus in benchmark/, which `make corpus` downloads"]
-    fn referencing_finds_the_same_targets_in_the_corpus() {
-        let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("benchmark");
-        let schemas = corpus_schemas(&corpus);
-        assert!(schemas.len() > 20_000, "{} schemas", schemas.len());
-        let mut references = 0;
-        let mut differences = BTreeMap::new();
-        for path in &schemas {
-            let text = std::fs::read_to_string(path).unwrap();
-            let schema: Value = serde_json::from_str(&text).unwrap();
-            let (same, found) = compared(&schema);
-            references += same;
-            if !found.is_empty() {
-                differences.insert(path.strip_prefix(&corpus).unwrap().to_owned(), found);
-            }
-        }
-        println!(
-            "{} schemas, {references} references with the same target",
-            schemas.len()
-        );
-        assert_eq!(differences, BTreeMap::new());
-        assert!(references > 100_000, "{references} references");
+        let comparison = compared(&meta).unwrap();
+        assert_eq!(comparison.differences, Vec::<String>::new());
+        assert!(comparison.same > 40, "{}", comparison.same);
     }
 }
