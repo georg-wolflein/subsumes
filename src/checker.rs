@@ -1,6 +1,7 @@
 use serde_json::Value;
 
-use crate::{Error, Reason, Side, Verdict, schema};
+use crate::context::Context;
+use crate::{Error, Reason, Side, Verdict, inspect, lower, schema};
 
 /// The work budget of the Python version; to be set anew once there is an engine to measure.
 const DEFAULT_BUDGET: u64 = 500_000;
@@ -57,22 +58,26 @@ impl Checker {
     ///
     /// When `a` or `b` cannot be checked at all; see [`Error`].
     pub fn check(&self, a: &Value, b: &Value) -> Result<Check, Error> {
-        let _graph = schema::parse(a, b)?.link()?;
-        // Without an engine nothing is supported, so the whole of A is the construct in the way.
-        Ok(Check {
-            verdict: Verdict::Unknown {
-                reason: Reason::Unsupported {
-                    schema: Side::A,
-                    location: "#".to_owned(),
-                },
+        let graph = schema::parse(a, b)?.link()?;
+        let mut context = Context::new(self.budget);
+        let reason = match lower::lower(&graph, &mut context) {
+            // Nothing compares the terms yet, so the whole of A is the construct in the way.
+            Ok(_) => Reason::Unsupported {
+                schema: Side::A,
+                location: "#".to_owned(),
             },
-            steps: 0,
+            Err(_) => Reason::Budget,
+        };
+        Ok(Check {
+            verdict: Verdict::Unknown { reason },
+            steps: context.budget.spent(),
         })
     }
 
     /// What the library makes of the two schemas before it compares them, as JSON for a tool
-    /// that shows it: the nodes of the schema graph, each with its location and what it
-    /// asserts, and the edges between them.
+    /// that shows it. There is one picture for each stage: the schema graph, with a node for
+    /// every subschema, and the terms, with a node for every variable. A node has rows of what
+    /// it says, and edges lead to the nodes it uses.
     ///
     /// The shape of the value follows the needs of such a tool and may change in any version.
     ///
@@ -80,7 +85,11 @@ impl Checker {
     ///
     /// When `a` or `b` cannot be checked at all; see [`Error`].
     pub fn inspect(&self, a: &Value, b: &Value) -> Result<Value, Error> {
-        Ok(schema::parse(a, b)?.link()?.to_json())
+        let graph = schema::parse(a, b)?.link()?;
+        let mut context = Context::new(self.budget);
+        // Without the budget for them there are no terms to show.
+        let roots = lower::lower(&graph, &mut context).ok();
+        Ok(inspect::stages(&graph, &context.terms, roots))
     }
 }
 

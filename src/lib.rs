@@ -24,9 +24,13 @@
 //! an [`Error`], and every check of two valid schemas returns [`Verdict::Unknown`].
 
 mod checker;
+mod context;
 mod error;
+mod inspect;
+mod lower;
 mod meta_schemas;
 mod schema;
+mod term;
 mod verdict;
 
 use serde_json::Value;

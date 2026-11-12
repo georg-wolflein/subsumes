@@ -4,7 +4,7 @@
 
 The [README](README.md) states the goals, the verdicts and what is unsupported. This document is the plan for the implementation.
 
-**Status:** the API, the benchmark harness and the load stage exist. A schema that cannot be loaded is an error, and every check of two schemas that can returns `Unknown`. The rest of the [pipeline](#pipeline) is still to be built, in the [order of work](#order-of-work) below.
+**Status:** the API, the benchmark harness, the load stage and the lowering to terms exist. A schema that cannot be loaded is an error, and every check of two schemas that can returns `Unknown`, because nothing compares the terms yet. The rest of the [pipeline](#pipeline) is still to be built, in the [order of work](#order-of-work) below.
 
 ## Method
 
@@ -73,7 +73,7 @@ The engine works on *terms*, not keywords:
 
 | Type | Terms |
 | --- | --- |
-| any | `True`, `False`, `TypeIs`, `AllOf`, `AnyOf`, `Not`, `Ref`, `Unknown` |
+| any | `True`, `False`, `TypeIs`, `AllOf`, `AnyOf`, `OneOf`, `Not`, `Ref`, `Unknown` |
 | boolean | `BoolConst` |
 | number | `Min`, `Max`, `ExMin`, `ExMax`, `Mof`, `NotMof` |
 | string | `Patt` over a regular language, `MinLen`, `MaxLen` |
@@ -81,13 +81,17 @@ The engine works on *terms*, not keywords:
 | array | `Item`, `AddIts`, `Contains`, `MaxContains`, `MinIts`, `MaxIts` |
 
 - **Variables.** Every nested subschema (a property, an item, a `contains`) is a *c-reference*: a set of variables that denotes their conjunction, never an inline term. This keeps canonical forms flat and lets results be shared.
+- **Every schema that is reached in place has a variable:** the two roots, and what a connective or a `$ref` leads to. The term of the variable is the conjunction of what its keywords say. Schemas of one [class](#data-layout) share a variable.
+- **What is modelled so far** is the types, `null`, the booleans, the connectives and `$ref`. Every other keyword is an `Unknown` leaf, which keeps the place where it stands, until its step of the order of work makes it a term.
+- **A leaf is about the instances its keyword is about.** `minLength` says something about strings only, so a number satisfies its leaf and no number satisfies the negation. `const` and `enum` with another value than `null` or a boolean are the type of the value and a leaf about that type.
+- **Two leaves are one when they must hold for the same instances:** the same keyword with the same value, or with subschemas of the same class. Keywords that depend on each other are one leaf: `items` with `prefixItems`, `additionalProperties` with `properties` and `patternProperties`, `contains` with its bounds. `unevaluatedProperties` and `unevaluatedItems` depend on the whole schema around them, so their leaf is one of that schema's class. A `$dynamicRef`, and a count that was too large to keep, are like no other.
 - **Negation moves one level at a time.** `not(PProp(p, x))` is `PReq(p, ¬x)` and `not(Min(q))` is `ExMax(q)`. A negated c-reference `¬x` is a fresh variable whose body is `not(x)`.
 - **`$ref` and `$dynamicRef`** targets are variables. A `$dynamicRef` variable is keyed by its target and the dynamic scope it was reached in, which models the dynamic scope without unfolding.
 - **Rewrites.**
   - `prefixItems` and `items` become `Item` and `AddIts`; `contains`, `minContains` and `maxContains` become `Contains` and `MaxContains`.
   - `integer` is `number` with `multipleOf: 1`.
   - `const` and `enum` become the structural terms that denote exactly those values.
-  - `oneOf`, `if`/`then`/`else`, `dependentRequired` and `dependentSchemas` become combinations of `AnyOf`, `AllOf` and `Not`.
+  - `if`/`then`/`else`, `dependentRequired` and `dependentSchemas` become combinations of `AnyOf`, `AllOf` and `Not`. `oneOf` stays one term, `OneOf`, because written out it takes the square of its length; the engine writes out only what it gets to.
   - `propertyNames` becomes `PNames(x)`, whose language is the string language of `x`.
 - **`unevaluatedProperties` and `unevaluatedItems`** are expanded by *scenarios*: every combination of branches of the in-place applicators (`allOf`, `anyOf`, `oneOf`, `if`/`then`/`else`, `$ref`, `dependentSchemas`) that can hold, with the names or positions it evaluates. A scenario is the conjunction of the branches it takes, the negation of those it does not, and `additionalProperties` or `items` over what it leaves unevaluated. Scenarios that evaluate the same set are merged.
 
@@ -124,7 +128,8 @@ Regular languages of strings are one module of the library, `language`. It uses 
 
 - One context per check owns everything: the arenas of nodes, terms, variables and c-references, the store of languages, the memo tables and the budget. Nothing mutable outlives a check or is shared between checks.
 - Everything is interned and addressed by a `u32` id. Equality is equality of ids, and memo keys are small.
-- Equal subschemas of A and B intern to one node when their references resolve alike. `x ∧ ¬x` is then refuted by identity, without normalizing what is inside. Two versions of one schema share most of their subschemas, so most of them are never opened.
+- Schemas that say the same are of one *class*, and a class has one variable, also between A and B. `x ∧ ¬x` is then refuted by identity, without normalizing what is inside. Two versions of one schema share most of their subschemas, so most of them are never opened.
+- Two schemas are of one class when they have the same keywords with the same values and their subschemas and reference targets are of one class in turn. For schemas on no cycle that is one pass from the leaves up. Schemas on cycles are told apart in rounds, each round by one step further in, until a round separates nothing; every round but the first charges the budget a step for each node.
 - Fast mode and the budget are ordinary return values. Recursion depth is counted, because a stack overflow would abort the process.
 
 ## Testing
@@ -138,9 +143,14 @@ Regular languages of strings are one module of the library, `language`. It uses 
 
 ## Looking at a check
 
-`harness inspect a.json [b.json]` draws what the load stage makes of two schemas and opens the picture in the browser: every subschema with the keywords it asserts, the edges that apply a subschema, and where each reference leads. A, B and each meta-schema they reach get a frame.
+`harness inspect a.json [b.json]` draws what the stages of a check make of two schemas and opens the picture in the browser. There is one picture for each stage, and a button for each in the page.
 
-- The library hands the graph over as one JSON value, a list of nodes and a list of edges, through `Checker::inspect`. The harness cannot see the graph itself, and the value promises no stability. Terms and the normal form can take the same shape when those stages exist.
+- **The schema graph:** every subschema with the keywords it asserts, the edges that apply a subschema, and where each reference leads. A, B and each meta-schema they reach get a frame.
+- **The terms:** every variable with the parts of its term, and an edge to each variable that the term refers to. What A and B share stands in a frame of its own.
+
+The pictures are made in two places:
+
+- The library hands each stage over as a list of nodes and a list of edges, in one JSON value, through `Checker::inspect`. The harness cannot see the graph or the terms themselves, and the value promises no stability. The normal form can take the same shape when that stage exists.
 - The picture is the only output: one HTML page with the graph in it, laid out by Graphviz, which the page loads from a CDN. A click on a node shows what it asserts and its edges, and a search finds nodes by location.
 
 ## Layout
@@ -148,11 +158,12 @@ Regular languages of strings are one module of the library, `language`. It uses 
 ```
 src/
   lib.rs, checker.rs, verdict.rs, error.rs    the API (exists)
-  context.rs      the state of one check: arenas, memo tables, budget
+  context.rs      the state of one check: arenas, memo tables, budget (exists)
   schema.rs       load: nodes, typed keywords, locations (exists)
   schema/         its two steps: parse, and link for the references (exists)
-  term.rs         terms, variables, c-references, one-level negation
-  lower.rs        schema graph to terms: rewrites and scenarios
+  term.rs         terms, variables, c-references, one-level negation (exists)
+  lower.rs        schema graph to terms: classes, rewrites and scenarios (exists)
+  inspect.rs      the stages of a check as pictures for the viewer (exists)
   normalize.rs    the engine
   canonical/      numbers, strings, objects, arrays
   language/       string languages: automata over scalar ranges, word sets
@@ -167,7 +178,7 @@ harness/          the benchmark runner and the viewer of the schema graph (exist
 Each step goes through all four stages for the keywords it adds, and lands as its own pull request. The benchmark comment shows what the step decides, and its table of reasons for `Unknown` shows what blocks the most checks.
 
 1. **Schema graph:** nodes, locations, errors, references. Done.
-2. **Engine skeleton:** context, budget, terms, variables, lazy negation and fast mode; `type`, booleans, `null`, the connectives, `$ref` with recursion. First `Yes` and `No`.
+2. **Engine skeleton:** context, budget, terms, variables, lazy negation and fast mode; `type`, booleans, `null`, the connectives, `$ref` with recursion. First `Yes` and `No`. The terms and the lowering are done.
 3. **Numbers.**
 4. **Strings:** the `language` module, then patterns, formats and lengths in the engine.
 5. **Objects.**
