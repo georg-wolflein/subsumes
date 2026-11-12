@@ -38,6 +38,7 @@ subsumes(&a, &b) -> Result<Verdict, Error>
 Checker::new().budget(steps)
     .subsumes(&a, &b) -> Result<Verdict, Error>
     .check(&a, &b)    -> Result<Check, Error>    // the verdict and the steps spent
+    .inspect(&a, &b)  -> Result<Value, Error>    // the schema graph as JSON, for the viewer; not stable
 ```
 
 Schemas are `serde_json::Value`. A `Checker` does not change while it checks, so one can be shared between threads.
@@ -135,6 +136,13 @@ Regular languages of strings are one module of the library, `language`. It uses 
 - **`No`.** A checker outside the library validates each counterexample against both schemas, with patterns matched by the `regex` crate. It is not built yet.
 - **`Yes`** has nothing to validate. Beyond the labels of the corpus there are metamorphic tests: `a` subsumes `a`, `a` subsumes `allOf[a, x]`, and `anyOf[a, x]` subsumes `a`.
 
+## Looking at a check
+
+`harness inspect a.json [b.json]` draws what the load stage makes of two schemas and opens the picture in the browser: every subschema with the keywords it asserts, the edges that apply a subschema, and where each reference leads. A, B and each meta-schema they reach get a frame.
+
+- The library hands the graph over as one JSON value, a list of nodes and a list of edges, through `Checker::inspect`. The harness cannot see the graph itself, and the value promises no stability. Terms and the normal form can take the same shape when those stages exist.
+- The picture is the only output: one HTML page with the graph in it, laid out by Graphviz, which the page loads from a CDN. A click on a node shows what it asserts and its edges, and a search finds nodes by location.
+
 ## Layout
 
 ```
@@ -151,7 +159,7 @@ src/
   formats.rs      the format table
   meta_schemas.rs the meta-schema of draft 2020-12 and those of its vocabularies (exists)
   generate.rs     counterexamples
-harness/          the benchmark runner (exists)
+harness/          the benchmark runner and the viewer of the schema graph (exists)
 ```
 
 ## Order of work

@@ -10,10 +10,12 @@
 //!
 //! [`Unlinked::link`]: parse::Unlinked::link
 
-// Nothing reads the graph until the lowering stage exists.
+// Only the inspection reads the graph until the lowering stage exists, and it does not need
+// everything.
 #![cfg_attr(not(test), expect(dead_code))]
 #![cfg_attr(test, allow(dead_code))]
 
+mod inspect;
 mod link;
 #[cfg(test)]
 mod oracle;
@@ -204,17 +206,30 @@ pub(crate) enum Type {
 }
 
 impl Type {
+    const ALL: [Self; 7] = [
+        Self::Null,
+        Self::Boolean,
+        Self::Object,
+        Self::Array,
+        Self::Number,
+        Self::String,
+        Self::Integer,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::Boolean => "boolean",
+            Self::Object => "object",
+            Self::Array => "array",
+            Self::Number => "number",
+            Self::String => "string",
+            Self::Integer => "integer",
+        }
+    }
+
     fn named(name: &str) -> Option<Self> {
-        Some(match name {
-            "null" => Self::Null,
-            "boolean" => Self::Boolean,
-            "object" => Self::Object,
-            "array" => Self::Array,
-            "number" => Self::Number,
-            "string" => Self::String,
-            "integer" => Self::Integer,
-            _ => return None,
-        })
+        Self::ALL.into_iter().find(|kind| kind.name() == name)
     }
 }
 

@@ -69,6 +69,19 @@ impl Checker {
             steps: 0,
         })
     }
+
+    /// What the library makes of the two schemas before it compares them, as JSON for a tool
+    /// that shows it: the nodes of the schema graph, each with its location and what it
+    /// asserts, and the edges between them.
+    ///
+    /// The shape of the value follows the needs of such a tool and may change in any version.
+    ///
+    /// # Errors
+    ///
+    /// When `a` or `b` cannot be checked at all; see [`Error`].
+    pub fn inspect(&self, a: &Value, b: &Value) -> Result<Value, Error> {
+        Ok(schema::parse(a, b)?.link()?.to_json())
+    }
 }
 
 impl Default for Checker {

@@ -84,7 +84,7 @@ fn cases(corpus: &Path) -> Result<Vec<String>, String> {
     Ok(cases)
 }
 
-fn json<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
+pub fn json<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
     let failed = |error: &dyn std::fmt::Display| format!("cannot read {}: {error}", path.display());
     let text = fs::read_to_string(path).map_err(|error| failed(&error))?;
     serde_json::from_str(&text).map_err(|error| failed(&error))
