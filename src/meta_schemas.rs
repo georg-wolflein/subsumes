@@ -13,7 +13,7 @@ use serde_json::Value;
 
 /// The meta-schema of the draft and the eight of its vocabularies, each by the URI it is served
 /// at, which is also its `$id`.
-const SOURCES: [(&str, &str); 9] = [
+pub(crate) const SOURCES: [(&str, &str); 9] = [
     (
         "https://json-schema.org/draft/2020-12/schema",
         include_str!("meta_schemas/draft2020-12/schema.json"),

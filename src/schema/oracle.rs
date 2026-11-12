@@ -11,17 +11,23 @@
 //!   fragment holds a character that a URI does not allow.
 //! - The crate does not find a pointer inside a resource whose `$id` stands where the draft
 //!   puts no schema. This library does.
+//!
+//! The comparison does not ask this library where the references of a schema are, or which
+//! resource each stands in. It walks the JSON itself and lets `referencing` work out the base
+//! of every schema on the way, so a mistake of the parser shows as a difference and is not
+//! shared. Only for what the draft does not take for a schema, such as the target of a
+//! pointer into an unknown keyword, does it take the place from this library.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use referencing::{Draft, Registry, Resolver, ResourceRef, Retrieve, Uri};
 use serde_json::{Map, Value, json};
 
-use super::parse::{Builder, ROOT, parse};
+use super::parse::{Builder, ROOT, Reference, parse};
 use super::{NodeId, Origin, push_token};
-use crate::{Error, Side};
+use crate::{Error, Side, meta_schemas};
 
 /// How this library and `referencing` resolved the references of one schema.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -35,6 +41,8 @@ pub(super) struct Comparison {
     pub same_by_anchor: usize,
     /// The references that neither resolved.
     pub unresolved: usize,
+    /// The references, of both kinds above, whose place the comparison took from this library.
+    pub placed_by_the_library: usize,
     /// Each reference on which the two differ.
     pub differences: Vec<String>,
 }
@@ -45,6 +53,7 @@ impl Comparison {
         self.same_by_uri += other.same_by_uri;
         self.same_by_anchor += other.same_by_anchor;
         self.unresolved += other.unresolved;
+        self.placed_by_the_library += other.placed_by_the_library;
         self.differences.extend(other.differences);
     }
 }
@@ -64,7 +73,80 @@ impl Retrieve for Asked {
     }
 }
 
-/// The resolver of `referencing` for the references of a resource.
+/// The keywords of the draft that hold one schema, a list of schemas, and schemas under names.
+/// The parser knows the same, and the two are written apart so that one checks the other.
+const ONE: [&str; 11] = [
+    "additionalProperties",
+    "contains",
+    "contentSchema",
+    "else",
+    "if",
+    "items",
+    "not",
+    "propertyNames",
+    "then",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+];
+const LISTED: [&str; 4] = ["allOf", "anyOf", "oneOf", "prefixItems"];
+const NAMED: [&str; 5] = [
+    "$defs",
+    "definitions",
+    "dependentSchemas",
+    "patternProperties",
+    "properties",
+];
+
+/// A reference as the comparison finds it in the JSON.
+struct Found<'r> {
+    /// The schema that has the keyword.
+    holder: &'r Value,
+    keyword: &'static str,
+    text: &'r str,
+    /// The resolver of `referencing` for that schema.
+    resolver: Resolver<'r>,
+}
+
+/// Every reference of a document that stands where the draft puts a schema. `at` is the
+/// resolver for the root of the document.
+fn references_in<'r>(document: &'r Value, at: Resolver<'r>) -> Vec<Found<'r>> {
+    let mut found = Vec::new();
+    let mut pending = vec![(document, at)];
+    while let Some((schema, resolver)) = pending.pop() {
+        let Value::Object(keywords) = schema else {
+            continue;
+        };
+        // The crate takes the `$id` of the schema, if it has one, as the base of what follows.
+        let subresource = ResourceRef::new(schema, Draft::Draft202012);
+        let Ok(resolver) = resolver.in_subresource(subresource) else {
+            continue;
+        };
+        for keyword in ["$ref", "$dynamicRef"] {
+            if let Some(Value::String(text)) = keywords.get(keyword) {
+                found.push(Found {
+                    holder: schema,
+                    keyword,
+                    text,
+                    resolver: resolver.clone(),
+                });
+            }
+        }
+        for (keyword, held) in keywords {
+            let keyword = keyword.as_str();
+            let schemas: Vec<&Value> = match held {
+                _ if ONE.contains(&keyword) => vec![held],
+                Value::Array(schemas) if LISTED.contains(&keyword) => schemas.iter().collect(),
+                Value::Object(schemas) if NAMED.contains(&keyword) => schemas.values().collect(),
+                _ => Vec::new(),
+            };
+            pending.extend(schemas.into_iter().map(|schema| (schema, resolver.clone())));
+        }
+    }
+    found
+}
+
+/// The resolver of `referencing` for the references of a resource, placed as this library
+/// places the resource. It serves only where the crate sees no schema.
 fn resolver<'r>(
     builder: &Builder<'r>,
     registry: &'r Registry<'r>,
@@ -117,6 +199,58 @@ fn without_vocabulary(meta_schema: &Value) -> Value {
     meta_schema
 }
 
+impl Comparison {
+    /// Resolves one reference with this library and holds the result against what
+    /// `referencing` found. Returns `false` once the library began to parse a value that is
+    /// no schema, after which what it built is not fit for another reference.
+    fn settle<'r>(
+        &mut self,
+        builder: &mut Builder<'r>,
+        reference: Reference<'r>,
+        theirs: Option<&Value>,
+    ) -> bool {
+        let text = reference.reference;
+        let place = format!("{} to {text}", builder.location(reference.node));
+        match (builder.target(reference), theirs) {
+            (Ok(Some(ours)), Some(theirs)) => {
+                let ours = builder.values[ours.index()];
+                // Each of the two has its own copy of a meta-schema.
+                let equal = std::ptr::eq(ours, theirs)
+                    || (builder.known(Side::A, theirs).is_none()
+                        && without_vocabulary(ours) == without_vocabulary(theirs));
+                if equal {
+                    let (resource, fragment) = text.split_once('#').unwrap_or((text, ""));
+                    let own = place.starts_with('#');
+                    let anchor = !fragment.is_empty() && !fragment.starts_with(['/', '%']);
+                    self.same += 1;
+                    self.same_by_uri += usize::from(own && !resource.is_empty());
+                    self.same_by_anchor += usize::from(own && anchor);
+                } else {
+                    self.differences.push(format!("{place}: another value"));
+                }
+            }
+            (Ok(None), None) => self.unresolved += 1,
+            (Ok(Some(ours)), None) => {
+                let ours = builder.location(ours);
+                self.differences
+                    .push(format!("{place}: only this library, {ours}"));
+            }
+            (Ok(None), Some(_)) => self.differences.push(format!("{place}: only referencing")),
+            // The crate hands out any value, and this library wants a schema.
+            (Err(Error::InvalidKeyword { .. }), Some(theirs))
+                if !theirs.is_object() && !theirs.is_boolean() =>
+            {
+                return false;
+            }
+            (Err(error), _) => {
+                self.differences.push(format!("{place}: {error}"));
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// Resolves every reference of a schema with this library and with `referencing`.
 ///
 /// # Errors
@@ -139,59 +273,60 @@ pub(super) fn compared(schema: &Value) -> Result<Comparison, String> {
         })
         .map_err(|error| format!("is not indexed by referencing: {error}"))?;
     let missing = std::mem::take(&mut *asked.0.lock().unwrap());
-
     let mut comparison = Comparison::default();
+
+    // First the references that the comparison finds by itself: those of the schema, then
+    // those of every meta-schema that a reference has led to by then.
+    let mut documents = vec![(schema, ROOT)];
+    // What this library noted, by the schema that holds it and the keyword.
+    let mut noted: HashMap<(NodeId, &str), Reference> = HashMap::new();
+    let mut settled = HashSet::new();
+    let mut walked = 0;
+    while let Some(&(document, uri)) = documents.get(walked) {
+        walked += 1;
+        let at = registry.resolver(referencing::uri::from_str(uri).unwrap());
+        for found in references_in(document, at) {
+            let theirs = found_by_referencing(&registry, &found.resolver, &missing, found.text);
+            for reference in &builder.references[noted.len()..] {
+                noted.insert((reference.node, reference.keyword.name()), *reference);
+            }
+            let node = builder.known(Side::A, found.holder);
+            let noted = node.and_then(|node| noted.get(&(node, found.keyword)));
+            let Some(&reference) = noted else {
+                let Found { keyword, text, .. } = found;
+                let difference = format!("{keyword} to {text} in {uri}: not seen by this library");
+                comparison.differences.push(difference);
+                continue;
+            };
+            settled.insert((reference.node, found.keyword));
+            if !comparison.settle(&mut builder, reference, theirs) {
+                return Ok(comparison);
+            }
+        }
+        for (uri, _) in meta_schemas::SOURCES {
+            let document = meta_schemas::document(uri).expect("the table has the URI");
+            let reached = builder.known(Side::A, document).is_some();
+            if reached && documents.iter().all(|(_, known)| *known != uri) {
+                documents.push((document, uri));
+            }
+        }
+    }
+
+    // Then the references that only this library has, in what the draft takes for no schema.
     let mut next = 0;
     while let Some(&reference) = builder.references.get(next) {
         next += 1;
+        if settled.contains(&(reference.node, reference.keyword.name())) {
+            continue;
+        }
         let node = &builder.nodes[reference.node.index()];
         let Some(resolver) = resolver(&builder, &registry, node.resource) else {
             continue;
         };
-        let text = reference.reference;
-        let theirs = found_by_referencing(&registry, &resolver, &missing, text);
-        let place = format!("{} to {text}", builder.location(reference.node));
-        match (builder.target(reference), theirs) {
-            (Ok(Some(ours)), Some(theirs)) => {
-                let ours = builder.values[ours.index()];
-                // Each of the two has its own copy of a meta-schema.
-                let equal = std::ptr::eq(ours, theirs)
-                    || (builder.known(Side::A, theirs).is_none()
-                        && without_vocabulary(ours) == without_vocabulary(theirs));
-                if equal {
-                    let (resource, fragment) = text.split_once('#').unwrap_or((text, ""));
-                    let own = place.starts_with('#');
-                    let anchor = !fragment.is_empty() && !fragment.starts_with(['/', '%']);
-                    comparison.same += 1;
-                    comparison.same_by_uri += usize::from(own && !resource.is_empty());
-                    comparison.same_by_anchor += usize::from(own && anchor);
-                } else {
-                    comparison
-                        .differences
-                        .push(format!("{place}: another value"));
-                }
-            }
-            (Ok(None), None) => comparison.unresolved += 1,
-            (Ok(Some(ours)), None) => {
-                let ours = builder.location(ours);
-                comparison
-                    .differences
-                    .push(format!("{place}: only this library, {ours}"));
-            }
-            (Ok(None), Some(_)) => comparison
-                .differences
-                .push(format!("{place}: only referencing")),
-            // The crate hands out any value. This library wants a schema, and what it began
-            // to parse is no longer fit for another reference.
-            (Err(Error::InvalidKeyword { .. }), Some(theirs))
-                if !theirs.is_object() && !theirs.is_boolean() =>
-            {
-                break;
-            }
-            (Err(error), _) => {
-                comparison.differences.push(format!("{place}: {error}"));
-                break;
-            }
+        let theirs = found_by_referencing(&registry, &resolver, &missing, reference.reference);
+        comparison.placed_by_the_library += 1;
+        if !comparison.settle(&mut builder, reference, theirs) {
+            break;
         }
     }
     Ok(comparison)
@@ -239,9 +374,10 @@ fn referencing_finds_the_same_targets_in_the_corpus() {
         }
     }
     println!(
-        "{} schemas, {} references with the same target",
+        "{} schemas, {} references with the same target, {} of them placed by this library",
         schemas.len(),
-        total.same
+        total.same,
+        total.placed_by_the_library
     );
     assert_eq!(refused, BTreeMap::new());
     assert_eq!(total.differences, Vec::<String>::new());
@@ -298,25 +434,6 @@ const IDS: [&str; 12] = [
 ];
 const ROOT_ID: &str = "https://example.com/schemas/root.json";
 const META_SCHEMA: &str = "https://json-schema.org/draft/2020-12/schema";
-/// Keywords that hold one schema, an array of schemas, and schemas under names.
-const ONE: [&str; 8] = [
-    "items",
-    "not",
-    "additionalProperties",
-    "contains",
-    "if",
-    "propertyNames",
-    "contentSchema",
-    "unevaluatedItems",
-];
-const LISTED: [&str; 3] = ["allOf", "anyOf", "prefixItems"];
-const NAMED: [&str; 5] = [
-    "properties",
-    "$defs",
-    "definitions",
-    "dependentSchemas",
-    "patternProperties",
-];
 /// Places where the draft puts no schema. A reference may still point into them.
 const ELSEWHERE: [&str; 2] = ["x-data", "dependencies"];
 
@@ -611,12 +728,13 @@ fn referencing_finds_the_same_targets_in_random_schemas() {
     }
     assert_eq!(total.differences.len(), 0);
     println!(
-        "{SCHEMAS} schemas, {} refused, and references: {} the same ({} by a URI, {} by an anchor), {} unresolved",
+        "{SCHEMAS} schemas, {} refused, and references: {} the same ({} by a URI, {} by an anchor), {} unresolved, {} of them placed by this library",
         refused.len(),
         total.same,
         total.same_by_uri,
         total.same_by_anchor,
         total.unresolved,
+        total.placed_by_the_library,
     );
     assert_eq!(refused, Vec::<String>::new());
     // Enough of every kind, so that the agreement means something.

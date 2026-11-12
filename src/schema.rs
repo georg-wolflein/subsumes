@@ -176,8 +176,9 @@ pub(crate) struct Keywords<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Count {
     Of(u64),
-    /// More than a `u64` holds, as `1e30` is. Two such counts are not known to be equal, so
-    /// nothing may be concluded from one.
+    /// Too large to be kept as the number that was written: more than a `u64` holds, as
+    /// `1e30` is, or a float from 2^53 on, which does not hold every integer. Two such counts
+    /// are not known to be equal, so nothing may be concluded from one.
     Beyond,
 }
 

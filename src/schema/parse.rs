@@ -61,6 +61,9 @@ pub(super) struct Builder<'a> {
     pub resources: [HashMap<String, NodeId>; 2],
     /// The nodes that a reference can name by an anchor, by their resource and the name.
     pub anchors: HashMap<(NodeId, &'a str), NodeId>,
+    /// Whether each node is in a place where the draft puts a schema, by node id. Only there
+    /// does an `$id` or an anchor name anything.
+    pub named: Vec<bool>,
 }
 
 /// A `$ref` or `$dynamicRef` as written.
@@ -285,17 +288,17 @@ impl<'a> Builder<'a> {
                 ];
                 for (keyword, name) in anchors {
                     let Some(name) = name else { continue };
-                    match self.anchors.get(&(resource, name)) {
-                        Some(&other) if other != id => {
-                            let message =
-                                format!("is the anchor of {} already", self.location(other));
-                            return Err(self.invalid(side, &entry.origin, keyword, message));
-                        }
-                        Some(_) => {}
-                        None => {
-                            self.anchors.insert((resource, name), id);
-                        }
+                    if let Some(&other) = self.anchors.get(&(resource, name)) {
+                        // The other anchor may be the other keyword of this very schema.
+                        let other = if other == id {
+                            location(&self.nodes, &entry.origin)
+                        } else {
+                            self.location(other)
+                        };
+                        let message = format!("is the anchor of {other} already");
+                        return Err(self.invalid(side, &entry.origin, keyword, message));
                     }
+                    self.anchors.insert((resource, name), id);
                 }
             }
 
@@ -306,6 +309,7 @@ impl<'a> Builder<'a> {
                 schema,
             });
             self.values.push(entry.value);
+            self.named.push(named);
         }
         Ok(first)
     }
@@ -507,14 +511,15 @@ fn number(value: &Value) -> Result<&Number, &'static str> {
 /// A non-negative integer. The draft counts `2.0` as an integer.
 fn count(value: &Value) -> Result<Count, &'static str> {
     const MESSAGE: &str = "must be a non-negative integer";
-    // 2^64, the first float that a `u64` does not hold.
-    const BEYOND: f64 = 18_446_744_073_709_551_616.0;
+    // 2^53. From here on a float holds only some of the integers, so the one it holds need
+    // not be the one that was written: `1000000000000000100.0` is read as 28 more.
+    const INEXACT: f64 = 9_007_199_254_740_992.0;
     let number = value.as_number().ok_or(MESSAGE)?;
     if let Some(count) = number.as_u64() {
         return Ok(Count::Of(count));
     }
     match number.as_f64() {
-        Some(count) if count >= BEYOND => Ok(Count::Beyond),
+        Some(count) if count >= INEXACT => Ok(Count::Beyond),
         Some(count) if count >= 0.0 && count.fract() == 0.0 => Ok(Count::Of(count as u64)),
         _ => Err(MESSAGE),
     }
@@ -869,25 +874,32 @@ mod tests {
     fn a_count_may_be_written_as_a_float() {
         let schema = json!({
             "minLength": 2.0,
-            "maxLength": 1e19,
+            // The largest float below 2^53, where every integer still has its own float.
+            "maxLength": 9_007_199_254_740_991.0,
             "minItems": u64::MAX,
+            // A float this large stands for many integers. This one is written as ...100 and
+            // held as ...128, so it is not kept as a number at all.
+            "maxItems": 1_000_000_000_000_000_100.0,
             // Larger than a `u64` holds. That one is larger than the other is not kept, so
             // the two must not come out as the same number.
-            "maxItems": 18_446_744_073_709_551_616.0,
             "minProperties": 1e30,
             "maxProperties": 1e20,
+            "minContains": 9_007_199_254_740_992.0,
+            "maxContains": 1_000_000_000_000_000_100_u64,
         });
         let unlinked = parsed(&schema).unwrap();
         let keywords = object(&unlinked, unlinked.a);
         assert_eq!(keywords.min_length, Some(Count::Of(2)));
-        assert_eq!(
-            keywords.max_length,
-            Some(Count::Of(10_000_000_000_000_000_000))
-        );
+        assert_eq!(keywords.max_length, Some(Count::Of(9_007_199_254_740_991)));
         assert_eq!(keywords.min_items, Some(Count::Of(u64::MAX)));
         assert_eq!(keywords.max_items, Some(Count::Beyond));
         assert_eq!(keywords.min_properties, Some(Count::Beyond));
         assert_eq!(keywords.max_properties, Some(Count::Beyond));
+        assert_eq!(keywords.min_contains, Some(Count::Beyond));
+        assert_eq!(
+            keywords.max_contains,
+            Some(Count::Of(1_000_000_000_000_000_100))
+        );
     }
 
     #[test]
@@ -1089,11 +1101,20 @@ mod tests {
             )
         );
 
-        // One place may have both kinds of anchor, and two resources may use one name.
+        // Not even the two kinds of anchor of one schema may share a name.
+        let both = json!({"items": {"$anchor": "x", "$dynamicAnchor": "x"}});
+        assert_eq!(
+            invalid(both),
+            (
+                "#/items/$dynamicAnchor".to_owned(),
+                "is the anchor of #/items already".to_owned()
+            )
+        );
+
+        // Two resources may use one name.
         let schema = json!({
             "$anchor": "x",
-            "$dynamicAnchor": "x",
-            "$defs": {"a": {"$id": "a.json", "$anchor": "x"}},
+            "$defs": {"a": {"$id": "a.json", "$dynamicAnchor": "x"}},
         });
         let unlinked = parsed(&schema).unwrap();
         let anchors = &unlinked.builder.anchors;

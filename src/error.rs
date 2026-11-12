@@ -27,8 +27,9 @@ pub enum Error {
         /// The value of the `$schema`.
         dialect: String,
     },
-    /// A keyword has a value that the draft does not allow, such as `"minLength": "3"`, or
-    /// two parts of a schema declare the same `$id` or the same anchor.
+    /// A keyword has a value that the draft does not allow, such as `"minLength": "3"`, two
+    /// parts of a schema declare the same `$id` or the same anchor, or a reference points
+    /// below an `$id` in a place where the draft puts no schema.
     ///
     /// This is an error wherever the keyword stands, even in a definition that nothing uses.
     InvalidKeyword {

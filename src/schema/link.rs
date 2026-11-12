@@ -29,11 +29,9 @@ impl<'a> Unlinked<'a> {
         while let Some(&reference) = builder.references.get(next) {
             next += 1;
             let Some(target) = builder.target(reference)? else {
-                let mut location = builder.location(reference.node);
-                push_token(&mut location, reference.keyword.name());
                 return Err(Error::UnresolvedReference {
                     schema: builder.nodes[reference.node.index()].side,
-                    location,
+                    location: builder.place(reference),
                     reference: reference.reference.to_owned(),
                 });
             };
@@ -81,7 +79,7 @@ impl<'a> Builder<'a> {
         if fragment.is_empty() {
             Ok(Some(resource))
         } else if fragment.starts_with('/') {
-            self.at_pointer(side, resource, &fragment)
+            self.at_pointer(reference, resource, &fragment)
         } else {
             Ok(self.anchors.get(&(resource, &*fragment)).copied())
         }
@@ -114,31 +112,54 @@ impl<'a> Builder<'a> {
         self.document(side, document, origin, uri).map(Some)
     }
 
-    /// The node at a JSON Pointer inside a resource, or `None` if the pointer leads nowhere.
+    /// The node at the JSON Pointer of a reference inside a resource, or `None` if the pointer
+    /// leads nowhere.
+    ///
+    /// # Errors
+    ///
+    /// When the pointer passes an `$id` in a place where the draft puts no schema. What is
+    /// below such an `$id` belongs to its resource if the object with the `$id` is read as a
+    /// schema, and to the resource around it if it is not, and which of the two a validator
+    /// does depends on the way by which it gets there.
     fn at_pointer(
         &mut self,
-        side: Side,
+        reference: Reference<'a>,
         resource: NodeId,
         pointer: &str,
     ) -> Result<Option<NodeId>, Error> {
+        let side = self.nodes[reference.node.index()].side;
         let tokens = || pointer[1..].split('/');
         let mut value = self.values[resource.index()];
-        // The nearest node on the way, and whether the way ends at it.
-        let (mut above, mut ends_there) = (resource, false);
-        for token in tokens() {
+        // The nearest node on the way, and whether the way has just reached it.
+        let (mut above, mut is_node) = (resource, true);
+        for (passed, token) in tokens().enumerate() {
+            // After the first step, `value` is on the way to the target and is not the target.
+            let seen = is_node && self.named[above.index()];
+            if passed > 0 && !seen && value.get("$id").is_some_and(Value::is_string) {
+                let mut unseen = self.location(resource);
+                for token in tokens().take(passed) {
+                    push_token(&mut unseen, &unescaped(token).unwrap_or_default());
+                }
+                return Err(Error::InvalidKeyword {
+                    schema: side,
+                    location: self.place(reference),
+                    message: format!(
+                        "points below the `$id` at {unseen}, which stands where the draft puts no schema"
+                    ),
+                });
+            }
             let Some(next) = step(value, token) else {
                 return Ok(None);
             };
             value = next;
             let node = self.known(side, value);
-            (above, ends_there) = (node.unwrap_or(above), node.is_some());
+            (above, is_node) = (node.unwrap_or(above), node.is_some());
         }
-        if ends_there {
+        if is_node {
             return Ok(Some(above));
         }
 
         // The target is in a place where the draft puts no schema, so it is parsed only now.
-        // An `$id` between the nearest node and the target does not count either.
         let mut location = self.location(resource);
         for token in tokens() {
             // Every token was taken a moment ago, so it has no escape that is none.
@@ -147,6 +168,13 @@ impl<'a> Builder<'a> {
         let around = self.nodes[above.index()].resource;
         self.subtree(side, value, Origin::Reference(location), around)
             .map(Some)
+    }
+
+    /// Where a reference stands: the location of its keyword.
+    fn place(&self, reference: Reference) -> String {
+        let mut location = self.location(reference.node);
+        push_token(&mut location, reference.keyword.name());
+        location
     }
 }
 
@@ -558,6 +586,62 @@ mod tests {
         // What such a value declares is not looked for, so no reference can name it.
         let unseen = json!({"$ref": "#/x/0", "x": [{"$ref": "#unseen"}, {"$anchor": "unseen"}]});
         assert_eq!(unresolved(&unseen).1, "#/x/0/$ref");
+    }
+
+    #[test]
+    fn a_pointer_does_not_pass_an_id_that_the_draft_does_not_see() {
+        // Read through `#/x`, `p` belongs to `x` and its reference leads to `true`. Read through
+        // the pointer to `p`, nobody takes `x` for a schema and it leads to `false`.
+        let schema = |first: &str, second: &str| {
+            json!({
+                "allOf": [{"$ref": first}, {"$ref": second}],
+                "$defs": {"t": false},
+                "x": {
+                    "$id": "https://example.com/child",
+                    "$defs": {"t": true},
+                    "properties": {"p": {"$ref": "#/$defs/t"}},
+                },
+            })
+        };
+        let refused = |schema: &Value, location: &str, unseen: &str| {
+            assert_eq!(
+                load(schema, &json!(true), |_| ()).unwrap_err(),
+                Error::InvalidKeyword {
+                    schema: Side::A,
+                    location: location.to_owned(),
+                    message: format!(
+                        "points below the `$id` at {unseen}, which stands where the draft puts no schema"
+                    ),
+                },
+                "{schema}"
+            );
+        };
+        // Whichever of the two references comes first.
+        refused(&schema("#/x/properties/p", "#/x"), "#/allOf/0/$ref", "#/x");
+        refused(&schema("#/x", "#/x/properties/p"), "#/allOf/1/$ref", "#/x");
+        // A schema under `dependencies` is in such a place too.
+        let old = json!({
+            "$ref": "#/dependencies/a/items",
+            "dependencies": {"a": {"$id": "a.json", "items": {}}},
+        });
+        refused(&old, "#/$ref", "#/dependencies/a");
+
+        // The object with the `$id` itself can be the target, and what is inside it refers
+        // to its parts as it likes.
+        load(&schema("#/x", "#/x"), &json!(true), |graph| {
+            let x = object(graph, object(graph, graph.a).all_of[0])
+                .reference
+                .unwrap();
+            let p = object(graph, x).properties[0].1;
+            assert_eq!(target(graph, p), "#/x/$defs/t");
+        })
+        .unwrap();
+        // And a pointer passes an `$id` that stands where the draft puts a schema.
+        let named = json!({
+            "$ref": "#/$defs/inner/properties/y",
+            "$defs": {"inner": {"$id": "inner.json", "properties": {"y": {}}}},
+        });
+        assert_eq!(root_target(&named).unwrap(), "#/$defs/inner/properties/y");
     }
 
     #[test]
