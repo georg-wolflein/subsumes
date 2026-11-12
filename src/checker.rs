@@ -1,6 +1,7 @@
 use serde_json::Value;
 
-use crate::{Error, Reason, Side, Verdict, schema};
+use crate::context::Context;
+use crate::{Error, Reason, Side, Verdict, inspect, lower, schema};
 
 /// The work budget of the Python version; to be set anew once there is an engine to measure.
 const DEFAULT_BUDGET: u64 = 500_000;
@@ -57,22 +58,38 @@ impl Checker {
     ///
     /// When `a` or `b` cannot be checked at all; see [`Error`].
     pub fn check(&self, a: &Value, b: &Value) -> Result<Check, Error> {
-        let _graph = schema::parse(a, b)?.link()?;
-        // Without an engine nothing is supported, so the whole of A is the construct in the way.
-        Ok(Check {
-            verdict: Verdict::Unknown {
-                reason: Reason::Unsupported {
-                    schema: Side::A,
-                    location: "#".to_owned(),
-                },
+        let graph = schema::parse(a, b)?.link()?;
+        // What a `$dynamicRef` accepts depends on the schemas that led to it, which the terms
+        // do not say yet.
+        if let Some(node) = lower::dynamic_reference(&graph) {
+            let reason = Reason::Unsupported {
+                schema: graph.node(node).side,
+                location: graph.keyword_location(node, "$dynamicRef"),
+            };
+            return Ok(Check {
+                verdict: Verdict::Unknown { reason },
+                steps: 0,
+            });
+        }
+        let mut context = Context::new(self.budget);
+        let reason = match lower::lower(&graph, &mut context) {
+            // Nothing compares the terms yet, so the whole of A is the construct in the way.
+            Ok(_) => Reason::Unsupported {
+                schema: Side::A,
+                location: "#".to_owned(),
             },
-            steps: 0,
+            Err(_) => Reason::Budget,
+        };
+        Ok(Check {
+            verdict: Verdict::Unknown { reason },
+            steps: context.budget.spent(),
         })
     }
 
     /// What the library makes of the two schemas before it compares them, as JSON for a tool
-    /// that shows it: the nodes of the schema graph, each with its location and what it
-    /// asserts, and the edges between them.
+    /// that shows it. There is one picture for each stage: the schema graph, with a node for
+    /// every subschema, and the terms, with a node for every variable. A node has rows of what
+    /// it says, and edges lead to the nodes it uses.
     ///
     /// The shape of the value follows the needs of such a tool and may change in any version.
     ///
@@ -80,7 +97,11 @@ impl Checker {
     ///
     /// When `a` or `b` cannot be checked at all; see [`Error`].
     pub fn inspect(&self, a: &Value, b: &Value) -> Result<Value, Error> {
-        Ok(schema::parse(a, b)?.link()?.to_json())
+        let graph = schema::parse(a, b)?.link()?;
+        let mut context = Context::new(self.budget);
+        // Without the budget for them there are no terms to show.
+        let roots = lower::lower(&graph, &mut context).ok();
+        Ok(inspect::stages(&graph, &context.terms, roots))
     }
 }
 
@@ -118,6 +139,41 @@ mod tests {
                 reason: Reason::Unsupported {
                     schema: Side::A,
                     location: "#".to_owned(),
+                },
+            }
+        );
+        assert_eq!(check.steps, 0);
+    }
+
+    #[test]
+    fn a_check_that_reaches_a_dynamic_reference_is_unknown_and_names_it() {
+        // Through `a` the dynamic reference leads to a schema that accepts everything, and
+        // through `d` alone to one that accepts nothing. So B accepts everything, and terms
+        // that give the reference one meaning would make B a schema and its own negation.
+        let b = json!({
+            "$id": "https://example.com/root",
+            "$ref": "a",
+            "not": {"$ref": "d"},
+            "$defs": {
+                "d": {
+                    "$id": "d",
+                    "$dynamicRef": "#x",
+                    "$defs": {"x": {"$dynamicAnchor": "x", "not": {}}},
+                },
+                "a": {
+                    "$id": "a",
+                    "$ref": "d",
+                    "$defs": {"x": {"$dynamicAnchor": "x"}},
+                },
+            },
+        });
+        let check = Checker::new().check(&json!(false), &b).unwrap();
+        assert_eq!(
+            check.verdict,
+            Verdict::Unknown {
+                reason: Reason::Unsupported {
+                    schema: Side::B,
+                    location: "#/$defs/d/$dynamicRef".to_owned(),
                 },
             }
         );

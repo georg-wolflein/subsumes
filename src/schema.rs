@@ -53,6 +53,13 @@ impl<'a> Graph<'a> {
     pub fn location(&self, id: NodeId) -> String {
         location(&self.nodes, &self.node(id).origin)
     }
+
+    /// Where a keyword of a node is.
+    pub fn keyword_location(&self, id: NodeId, keyword: &str) -> String {
+        let mut location = self.location(id);
+        push_token(&mut location, keyword);
+        location
+    }
 }
 
 /// The id of a node of the graph.
@@ -60,11 +67,11 @@ impl<'a> Graph<'a> {
 pub(crate) struct NodeId(u32);
 
 impl NodeId {
-    fn new(index: usize) -> Self {
+    pub fn new(index: usize) -> Self {
         Self(u32::try_from(index).expect("a graph has fewer than 2^32 nodes"))
     }
 
-    fn index(self) -> usize {
+    pub fn index(self) -> usize {
         self.0 as usize
     }
 }
@@ -182,6 +189,49 @@ pub(crate) enum Count {
     /// `1e30` is, or a float from 2^53 on, which does not hold every integer. Two such counts
     /// are not known to be equal, so nothing may be concluded from one.
     Beyond,
+}
+
+impl<'a> Keywords<'a> {
+    /// Every subschema that a keyword applies, with the keyword and its place in it, in an
+    /// order that depends on nothing but the keywords. The targets of `$ref` and `$dynamicRef`
+    /// are not among them.
+    pub fn subschemas(&self) -> Vec<(&'static str, Part<'a>, NodeId)> {
+        let one = [
+            ("not", self.not),
+            ("if", self.if_),
+            ("then", self.then),
+            ("else", self.else_),
+            ("items", self.items),
+            ("contains", self.contains),
+            ("unevaluatedItems", self.unevaluated_items),
+            ("additionalProperties", self.additional_properties),
+            ("propertyNames", self.property_names),
+            ("unevaluatedProperties", self.unevaluated_properties),
+        ];
+        let listed = [
+            ("allOf", &self.all_of),
+            ("anyOf", &self.any_of),
+            ("oneOf", &self.one_of),
+            ("prefixItems", &self.prefix_items),
+        ];
+        let named = [
+            ("properties", &self.properties),
+            ("patternProperties", &self.pattern_properties),
+            ("dependentSchemas", &self.dependent_schemas),
+        ];
+        let one = one
+            .into_iter()
+            .filter_map(|(keyword, schema)| Some((keyword, Part::Whole, schema?)));
+        let listed = listed.into_iter().flat_map(|(keyword, schemas)| {
+            let places = schemas.iter().enumerate();
+            places.map(move |(position, schema)| (keyword, Part::Index(position), *schema))
+        });
+        let named = named.into_iter().flat_map(|(keyword, schemas)| {
+            let places = schemas.iter();
+            places.map(move |(name, schema)| (keyword, Part::Name(name), *schema))
+        });
+        one.chain(listed).chain(named).collect()
+    }
 }
 
 /// A `$dynamicRef`.

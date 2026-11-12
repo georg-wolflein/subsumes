@@ -64,44 +64,8 @@ impl Graph<'_> {
         let Schema::Object(keywords) = &node.schema else {
             return;
         };
-        let mut applies = |keyword, part, to| edges.push(edge("applies", id, to, keyword, part));
-        let one = [
-            ("not", keywords.not),
-            ("if", keywords.if_),
-            ("then", keywords.then),
-            ("else", keywords.else_),
-            ("items", keywords.items),
-            ("contains", keywords.contains),
-            ("unevaluatedItems", keywords.unevaluated_items),
-            ("additionalProperties", keywords.additional_properties),
-            ("propertyNames", keywords.property_names),
-            ("unevaluatedProperties", keywords.unevaluated_properties),
-        ];
-        for (keyword, to) in one {
-            if let Some(to) = to {
-                applies(keyword, Part::Whole, to);
-            }
-        }
-        let listed = [
-            ("allOf", &keywords.all_of),
-            ("anyOf", &keywords.any_of),
-            ("oneOf", &keywords.one_of),
-            ("prefixItems", &keywords.prefix_items),
-        ];
-        for (keyword, schemas) in listed {
-            for (position, to) in schemas.iter().enumerate() {
-                applies(keyword, Part::Index(position), *to);
-            }
-        }
-        let named = [
-            ("properties", &keywords.properties),
-            ("patternProperties", &keywords.pattern_properties),
-            ("dependentSchemas", &keywords.dependent_schemas),
-        ];
-        for (keyword, schemas) in named {
-            for (name, to) in schemas {
-                applies(keyword, Part::Name(name), *to);
-            }
+        for (keyword, part, to) in keywords.subschemas() {
+            edges.push(edge("applies", id, to, keyword, part));
         }
         if let Some(to) = keywords.reference {
             edges.push(edge("reference", id, to, "$ref", Part::Whole));
