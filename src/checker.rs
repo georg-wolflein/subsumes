@@ -1,7 +1,8 @@
 use serde_json::Value;
 
 use crate::context::Context;
-use crate::{Error, Reason, Side, Verdict, inspect, lower, schema};
+use crate::normalize::{self, Outcome};
+use crate::{Error, Reason, Verdict, inspect, lower, schema};
 
 /// The work budget of the Python version; to be set anew once there is an engine to measure.
 const DEFAULT_BUDGET: u64 = 500_000;
@@ -72,16 +73,25 @@ impl Checker {
             });
         }
         let mut context = Context::new(self.budget);
-        let reason = match lower::lower(&graph, &mut context) {
-            // Nothing compares the terms yet, so the whole of A is the construct in the way.
-            Ok(_) => Reason::Unsupported {
-                schema: Side::A,
-                location: "#".to_owned(),
+        let outcome = lower::lower(&graph, &mut context)
+            .and_then(|(a, b)| normalize::decide(&mut context, a, b));
+        let verdict = match outcome {
+            Ok(Outcome::Yes) => Verdict::Yes,
+            Ok(Outcome::No(counterexample)) => Verdict::No { counterexample },
+            Ok(Outcome::Unknown(leaf)) => {
+                let leaf = context.terms.leaf(leaf);
+                let reason = Reason::Unsupported {
+                    schema: graph.node(leaf.node).side,
+                    location: graph.keyword_location(leaf.node, leaf.keyword),
+                };
+                Verdict::Unknown { reason }
+            }
+            Err(_) => Verdict::Unknown {
+                reason: Reason::Budget,
             },
-            Err(_) => Reason::Budget,
         };
         Ok(Check {
-            verdict: Verdict::Unknown { reason },
+            verdict,
             steps: context.budget.spent(),
         })
     }
@@ -127,22 +137,35 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::Side;
 
     #[test]
-    fn every_check_is_unknown_for_now() {
-        let check = Checker::new()
-            .check(&json!({"type": "integer"}), &json!(true))
-            .unwrap();
+    fn a_check_gives_one_of_three_verdicts_and_its_steps() {
+        let checker = Checker::new();
+        let (text, optional) = (
+            json!({"type": "string"}),
+            json!({"type": ["string", "null"]}),
+        );
+        let check = checker.check(&optional, &text).unwrap();
+        assert_eq!(check.verdict, Verdict::Yes);
+        assert!(check.steps > 0);
+
+        let check = checker.check(&text, &optional).unwrap();
+        let counterexample = json!(null);
+        assert_eq!(check.verdict, Verdict::No { counterexample });
+
+        // The engine does not model numbers yet, and says which keyword stands in the way.
+        let (integer, number) = (json!({"type": "integer"}), json!({"type": "number"}));
+        let check = checker.check(&integer, &number).unwrap();
         assert_eq!(
             check.verdict,
             Verdict::Unknown {
                 reason: Reason::Unsupported {
                     schema: Side::A,
-                    location: "#".to_owned(),
+                    location: "#/type".to_owned(),
                 },
             }
         );
-        assert_eq!(check.steps, 0);
     }
 
     #[test]

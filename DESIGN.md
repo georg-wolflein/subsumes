@@ -4,7 +4,7 @@
 
 The [README](README.md) states the goals, the verdicts and what is unsupported. This document is the plan for the implementation.
 
-**Status:** the API, the benchmark harness, the load stage and the lowering to terms exist. A schema that cannot be loaded is an error, and every check of two schemas that can returns `Unknown`, because nothing compares the terms yet. The rest of the [pipeline](#pipeline) is still to be built, in the [order of work](#order-of-work) below.
+**Status:** the API, the benchmark harness, the load stage and the skeleton of the engine exist. The engine models the types, `null`, the booleans, the connectives and `$ref`, and answers `Unknown` where the answer depends on another keyword. The rest of the [pipeline](#pipeline) is still to be built, in the [order of work](#order-of-work) below.
 
 ## Method
 
@@ -102,12 +102,16 @@ The engine works on *terms*, not keywords:
   - `CStr`: one language, the intersection of every pattern and format, plus length bounds.
   - `CObj`: the *fragment map*, a partition of all names into pattern fragments, each with the c-reference that every member satisfies and those that some member must satisfy, plus bounds on the property count.
   - `CArr`: a head of positional c-references, a tail, the `Contains` and `MaxContains` constraints and length bounds.
+- **A branch is a conjunction in the making.** `all[B, not A]` is taken apart into branches. A branch holds what the engine knows how to combine: the types and booleans an instance may still have, the leaves that must hold and those that must not, and the variables taken for true or for false. The canonical conjunctions of numbers, strings, objects and arrays join it with their steps.
+- **What a term unfolds to waits its turn.** Terms are taken in the order in which they come up, so a variable meets its own negation, and a leaf its own, before either is opened.
 - **Lazy negation.** `not(S)` is pushed one level and the result inserted. Before a refutable `AnyOf` is expanded, each branch is tried in *fast mode*, which gives up instead of splitting; a branch refuted that way is dropped unexpanded.
+- **A branch that cannot give an instance is left alone,** once some branch has stood without one. From then on the answer is `No` or `Unknown`, and leaves are never taken back, so nothing that comes out of such a branch can change it. Without this, a schema with twenty choices between leaves would be a million branches.
 - **Eager normalization of references.** When two c-references meet in a property, an item or a `contains`, their conjunction is normalized at once and memoized. A result equal to one operand is replaced by that operand, which keeps `b_i ∧ ¬b_j` equal to `b_i` for `oneOf` branches that a discriminator already separates.
-- **Recursion is a least fixed point.** A reference whose expansion is in progress contributes `false` when positive and an `Unknown` leaf when negated, so recursive schemas terminate.
+- **Recursion is a least fixed point.** A reference whose expansion is in progress contributes `false` when positive and an `Unknown` leaf when negated, so recursive schemas terminate. The leaf stands at the reference that closes the cycle. This concerns schemas that refer to themselves with nothing in between; through a property or an item the reference is inside a leaf for now.
 
 ### Generate
 
+- So far an instance comes from a branch that stands and has a type that no leaf is about: `null`, a boolean that is still allowed, `0`, `""`, `[]` or `{}`.
 - The normal form of B is computed first. Each of its conjunctions is conjoined with `not A` and searched for a counterexample before the next is touched, so a `No` usually comes long before the whole normal form exists.
 - Generation is bottom-up and memoized per c-reference. A reference in progress has no counterexample, which is the same least fixed point.
 - Numbers search the interval for a multiple that is none of the excluded ones. Strings take the shortest word within the length bounds. Objects choose members per fragment, arrays choose which positions satisfy which `contains`.
@@ -140,6 +144,7 @@ Regular languages of strings are one module of the library, `language`. It uses 
 - **Languages.** Property tests on random patterns compare the automata with two oracles: the `regex` crate on which strings match, and `regexsolver` on intersection, complement and inclusion. Both are dependencies of the tests only.
 - **`No`.** A checker outside the library validates each counterexample against both schemas, with patterns matched by the `regex` crate. It is not built yet.
 - **`Yes`** has nothing to validate. Beyond the labels of the corpus there are metamorphic tests: `a` subsumes `a`, `a` subsumes `allOf[a, x]`, and `anyOf[a, x]` subsumes `a`.
+- **Every kind of instance.** For schemas with no schema inside a leaf, an instance matters to the engine only by its type, by which boolean it is and by which leaves about its type it satisfies. A test lists all of these for schemas made at random and asks a small evaluator, which reads the JSON and knows nothing of terms. The engine must answer `Yes` exactly when every kind that B accepts, A accepts, and `No` only with an instance that tells the two apart whatever the leaves say.
 
 ## Looking at a check
 
@@ -164,12 +169,12 @@ src/
   term.rs         terms, variables, c-references, one-level negation (exists)
   lower.rs        schema graph to terms: classes, rewrites and scenarios (exists)
   inspect.rs      the stages of a check as pictures for the viewer (exists)
-  normalize.rs    the engine
+  normalize.rs    the engine (exists)
   canonical/      numbers, strings, objects, arrays
   language/       string languages: automata over scalar ranges, word sets
   formats.rs      the format table
   meta_schemas.rs the meta-schema of draft 2020-12 and those of its vocabularies (exists)
-  generate.rs     counterexamples
+  generate.rs     counterexamples (exists)
 harness/          the benchmark runner and the viewer of the schema graph (exists)
 ```
 
@@ -178,7 +183,7 @@ harness/          the benchmark runner and the viewer of the schema graph (exist
 Each step goes through all four stages for the keywords it adds, and lands as its own pull request. The benchmark comment shows what the step decides, and its table of reasons for `Unknown` shows what blocks the most checks.
 
 1. **Schema graph:** nodes, locations, errors, references. Done.
-2. **Engine skeleton:** context, budget, terms, variables, lazy negation and fast mode; `type`, booleans, `null`, the connectives, `$ref` with recursion. First `Yes` and `No`. The terms and the lowering are done.
+2. **Engine skeleton:** context, budget, terms, variables, lazy negation and fast mode; `type`, booleans, `null`, the connectives, `$ref` with recursion. First `Yes` and `No`. Done.
 3. **Numbers.**
 4. **Strings:** the `language` module, then patterns, formats and lengths in the engine.
 5. **Objects.**
