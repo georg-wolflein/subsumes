@@ -1,0 +1,421 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Schema graph</title>
+<style>
+  :root {
+    --line: #d0d5dd;
+    --muted: #667085;
+    --a: #dbeafe;
+    --b: #dcfce7;
+    --other: #f2f4f7;
+    --reference: #1a66cc;
+    --mark: #f59e0b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    height: 100vh;
+    display: grid;
+    grid-template-rows: auto 1fr;
+    font: 14px/1.4 system-ui, sans-serif;
+    color: #101828;
+    background: #fff;
+  }
+  header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 16px;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--line);
+  }
+  h1 { margin: 0; font-size: 15px; }
+  #names { color: var(--muted); }
+  #names b { color: #101828; font-weight: 600; }
+  #search { flex: 1 1 220px; max-width: 420px; padding: 5px 8px; font: inherit; }
+  #status { color: var(--muted); min-width: 9ch; }
+  button { font: inherit; padding: 4px 10px; cursor: pointer; }
+  .legend { display: flex; gap: 12px; color: var(--muted); font-size: 12px; }
+  .legend svg { vertical-align: middle; margin-right: 4px; }
+  main { position: relative; overflow: hidden; }
+  #canvas { position: absolute; inset: 0; overflow: hidden; cursor: grab; touch-action: none; }
+  #canvas.dragging { cursor: grabbing; }
+  #canvas svg { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+  #message { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); padding: 24px; text-align: center; }
+  .node { cursor: pointer; }
+  .focused .node, .focused .edge { opacity: 0.18; }
+  .focused .node.selected, .focused .node.neighbour, .focused .edge.linked { opacity: 1; }
+  .node.selected polygon:first-of-type { stroke: #101828; stroke-width: 2.5; }
+  .node.match polygon:first-of-type { stroke: var(--mark); stroke-width: 3; }
+  #detail {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    bottom: 12px;
+    width: min(380px, calc(100% - 24px));
+    overflow: auto;
+    padding: 12px 14px;
+    background: #fff;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    box-shadow: 0 4px 16px rgb(16 24 40 / 12%);
+  }
+  #detail h2 { margin: 0 28px 2px 0; font-size: 14px; overflow-wrap: anywhere; }
+  #detail h3 { margin: 14px 0 4px; font-size: 12px; color: var(--muted); font-weight: 600; }
+  #detail .where { color: var(--muted); font-size: 12px; }
+  #detail pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.45 ui-monospace, monospace; }
+  #detail dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 4px 10px; }
+  #detail dt { font: 12px/1.45 ui-monospace, monospace; }
+  #detail dd { margin: 0; min-width: 0; }
+  #detail ul { margin: 0; padding: 0; list-style: none; }
+  #detail li { padding: 2px 0; overflow-wrap: anywhere; }
+  #detail a { color: var(--reference); cursor: pointer; text-decoration: none; }
+  #detail a:hover { text-decoration: underline; }
+  #close { position: absolute; top: 8px; right: 8px; border: 0; background: none; font-size: 18px; line-height: 1; padding: 4px 8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Schema graph</h1>
+  <span id="names"></span>
+  <input id="search" type="search" placeholder="Find a location, such as /properties/name" aria-label="Find a location">
+  <span id="status"></span>
+  <button id="fit" type="button">Fit</button>
+  <span class="legend">
+    <span><svg width="26" height="8"><line x1="0" y1="4" x2="26" y2="4" stroke="#344054" stroke-width="1.5"/></svg>applies</span>
+    <span><svg width="26" height="8"><line x1="0" y1="4" x2="26" y2="4" stroke="#1a66cc" stroke-width="1.5" stroke-dasharray="5 3"/></svg>refers to</span>
+    <span><svg width="26" height="8"><line x1="0" y1="4" x2="26" y2="4" stroke="#98a2b3" stroke-width="1.5" stroke-dasharray="1 3"/></svg>holds</span>
+  </span>
+</header>
+<main>
+  <div id="canvas"></div>
+  <div id="message">Laying out the graph…</div>
+  <aside id="detail" hidden></aside>
+</main>
+<script type="application/json" id="graph">{{graph}}</script>
+<script src="https://cdn.jsdelivr.net/npm/@viz-js/viz@3.31.0/dist/viz-global.js" integrity="sha384-iX6VK6ib27dxYB4T470zbHOsDDoLewuYvrIgv2B3XXe8kgfKsGMf8QIleFy6VPi4" crossorigin="anonymous"></script>
+<script>
+"use strict";
+
+// The graph as Graphviz reads it. Nothing in this part touches the page.
+
+const COLORS = { A: "#dbeafe", B: "#dcfce7", other: "#f2f4f7" };
+const LONGEST = 56;
+
+function escapeHtml(text) {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function shortened(text) {
+  const characters = Array.from(text);
+  return characters.length > LONGEST ? characters.slice(0, LONGEST - 1).join("") + "…" : text;
+}
+
+function quoted(text) {
+  return '"' + text.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
+}
+
+// The file or the meta-schema that a node is part of: its location up to the fragment.
+function documentOf(node) {
+  return node.location.slice(0, node.location.indexOf("#"));
+}
+
+// The place of a node inside its document.
+function placeOf(node) {
+  return node.location.slice(node.location.indexOf("#"));
+}
+
+// The value of a keyword as text. The names of `type` need no quotes to be told apart.
+function valueText(keyword, value) {
+  return keyword === "type" ? value.join(", ") : JSON.stringify(value);
+}
+
+function edgeLabel(edge) {
+  if (edge.name !== undefined) return `${edge.keyword}: ${edge.name}`;
+  if (edge.index !== undefined) return `${edge.keyword}[${edge.index}]`;
+  return edge.keyword;
+}
+
+// A node as a small table: its place, then one row for each keyword that it asserts.
+function nodeLabel(graph, node) {
+  const root = node.id === graph.a || node.id === graph.b;
+  const color = documentOf(node) ? COLORS.other : COLORS[node.side];
+  const place = escapeHtml(shortened(placeOf(node)));
+  const title = root ? `<b>${node.side}</b>  ${place}` : place;
+  const rows = [`<tr><td colspan="2" align="left" bgcolor="${color}">${title}</td></tr>`];
+  if (node.boolean !== undefined) {
+    const paint = node.boolean ? "#067647" : "#b42318";
+    rows.push(`<tr><td colspan="2" align="left"><font color="${paint}"><b>${node.boolean}</b></font></td></tr>`);
+  }
+  for (const [keyword, value] of node.keywords ?? []) {
+    const shown = escapeHtml(shortened(valueText(keyword, value)));
+    rows.push(`<tr><td align="left">${escapeHtml(keyword)}</td><td align="left">${shown}</td></tr>`);
+  }
+  const border = root ? 2 : 1;
+  return `<<table border="${border}" cellborder="0" cellspacing="0" cellpadding="4" bgcolor="white" color="#667085">${rows.join("")}</table>>`;
+}
+
+function toDot(graph) {
+  const lines = [
+    "digraph {",
+    "  rankdir=LR;",
+    '  graph [fontname="Helvetica", fontsize=12, ranksep=0.7, nodesep=0.3, labeljust=l];',
+    '  node [shape=plain, fontname="Helvetica", fontsize=10];',
+    '  edge [fontname="Helvetica", fontsize=9, arrowsize=0.7];',
+  ];
+  // A, B and every meta-schema that one of them reaches get a frame each.
+  const groups = new Map();
+  for (const node of graph.nodes) {
+    const key = `${node.side} ${documentOf(node)}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(node);
+  }
+  let number = 0;
+  // Graphviz stacks the frames from the bottom up, and A belongs at the top.
+  for (const nodes of [...groups.values()].reverse()) {
+    const { side } = nodes[0];
+    const document = documentOf(nodes[0]);
+    const name = graph.names?.[side.toLowerCase()];
+    const label = document ? `${document} (referenced by ${side})` : name ? `${side}: ${name}` : side;
+    lines.push(`  subgraph cluster_${number++} {`);
+    lines.push(`    label=${quoted(label)}; style=rounded; color="#98a2b3"; fontcolor="#475467";`);
+    for (const node of nodes) {
+      lines.push(`    n${node.id} [id="n${node.id}", label=${nodeLabel(graph, node)}];`);
+    }
+    lines.push("  }");
+  }
+  graph.edges.forEach((edge, position) => {
+    const look = {
+      applies: 'color="#344054"',
+      holds: 'color="#98a2b3", fontcolor="#667085", style=dotted',
+      // A reference may lead anywhere, so it does not pull its target into the next rank.
+      reference: 'color="#1a66cc", fontcolor="#1a66cc", style=dashed, constraint=false',
+    }[edge.kind];
+    const label = quoted(shortened(edgeLabel(edge)));
+    lines.push(`  n${edge.from} -> n${edge.to} [id="e${position}", label=${label}, ${look}];`);
+  });
+  lines.push("}");
+  return lines.join("\n");
+}
+
+// The page.
+
+if (typeof document !== "undefined") {
+  const graph = JSON.parse(document.getElementById("graph").textContent);
+  const canvas = document.getElementById("canvas");
+  const message = document.getElementById("message");
+  const detail = document.getElementById("detail");
+  const status = document.getElementById("status");
+  const search = document.getElementById("search");
+  const byId = new Map(graph.nodes.map((node) => [node.id, node]));
+  let svg = null;
+  let view = { x: 0, y: 0, scale: 1 };
+  let matches = [];
+  let current = -1;
+
+  const names = document.getElementById("names");
+  for (const side of ["a", "b"]) {
+    const label = document.createElement("b");
+    label.textContent = side.toUpperCase();
+    names.append(label, ` ${graph.names?.[side] ?? ""}  `);
+  }
+  const shape = (id) => svg.querySelector(`#n${id}`);
+
+  function place() {
+    svg.style.transform = `translate(${view.x}px, ${view.y}px) scale(${view.scale})`;
+  }
+
+  function fit() {
+    const width = svg.width.baseVal.value;
+    const height = svg.height.baseVal.value;
+    const scale = Math.min(1, (canvas.clientWidth - 32) / width, (canvas.clientHeight - 32) / height);
+    view = {
+      scale,
+      x: (canvas.clientWidth - width * scale) / 2,
+      y: (canvas.clientHeight - height * scale) / 2,
+    };
+    place();
+  }
+
+  // Moves the view so that a node is in the middle, large enough to read.
+  function show(id) {
+    view.scale = Math.max(view.scale, 0.8);
+    place();
+    const box = shape(id).getBoundingClientRect();
+    const frame = canvas.getBoundingClientRect();
+    view.x += frame.left + frame.width / 2 - (box.left + box.width / 2);
+    view.y += frame.top + frame.height / 2 - (box.top + box.height / 2);
+    place();
+  }
+
+  function link(id) {
+    const node = byId.get(id);
+    const anchor = document.createElement("a");
+    anchor.textContent = `${node.side} ${node.location}`;
+    anchor.addEventListener("click", () => {
+      select(id);
+      show(id);
+    });
+    return anchor;
+  }
+
+  function heading(text) {
+    const element = document.createElement("h3");
+    element.textContent = text;
+    return element;
+  }
+
+  function edgeList(title, edges, other) {
+    if (edges.length === 0) return [];
+    const list = document.createElement("ul");
+    for (const edge of edges) {
+      const item = document.createElement("li");
+      item.append(`${edgeLabel(edge)} → `, link(edge[other]));
+      list.append(item);
+    }
+    return [heading(title), list];
+  }
+
+  function select(id) {
+    svg.classList.toggle("focused", id !== null);
+    for (const element of svg.querySelectorAll(".selected, .neighbour, .linked")) {
+      element.classList.remove("selected", "neighbour", "linked");
+    }
+    detail.hidden = id === null;
+    if (id === null) return;
+
+    const node = byId.get(id);
+    shape(id).classList.add("selected");
+    graph.edges.forEach((edge, position) => {
+      if (edge.from !== id && edge.to !== id) return;
+      svg.querySelector(`#e${position}`).classList.add("linked");
+      shape(edge.from === id ? edge.to : edge.from).classList.add("neighbour");
+    });
+
+    const close = document.createElement("button");
+    close.id = "close";
+    close.type = "button";
+    close.textContent = "×";
+    close.setAttribute("aria-label", "Close");
+    close.addEventListener("click", () => select(null));
+    const title = document.createElement("h2");
+    title.textContent = node.location;
+    const where = document.createElement("div");
+    where.className = "where";
+    const resource = byId.get(node.resource);
+    where.textContent = `node ${node.id} of ${node.side}, in the resource ${resource.location}`;
+    detail.replaceChildren(close, title, where);
+
+    if (node.boolean !== undefined) {
+      const value = document.createElement("pre");
+      value.textContent = String(node.boolean);
+      detail.append(heading("Schema"), value);
+    } else if (node.keywords.length > 0) {
+      const list = document.createElement("dl");
+      for (const [keyword, value] of node.keywords) {
+        const term = document.createElement("dt");
+        term.textContent = keyword;
+        const description = document.createElement("dd");
+        const text = document.createElement("pre");
+        // A long value is easier to read over several lines.
+        const short = valueText(keyword, value);
+        text.textContent = short.length > LONGEST ? JSON.stringify(value, null, 1) : short;
+        description.append(text);
+        list.append(term, description);
+      }
+      detail.append(heading("Asserts"), list);
+    }
+    detail.append(
+      ...edgeList("Leads to", graph.edges.filter((edge) => edge.from === id), "to"),
+      ...edgeList("Reached from", graph.edges.filter((edge) => edge.to === id), "from"),
+    );
+  }
+
+  function find() {
+    for (const element of svg.querySelectorAll(".match")) element.classList.remove("match");
+    const wanted = search.value.trim().toLowerCase();
+    matches = wanted ? graph.nodes.filter((node) => node.location.toLowerCase().includes(wanted)) : [];
+    for (const node of matches) shape(node.id).classList.add("match");
+    current = -1;
+    status.textContent = wanted ? `${matches.length} found` : `${graph.nodes.length} nodes`;
+  }
+
+  function drawn(element) {
+    svg = element;
+    message.remove();
+    canvas.append(svg);
+    for (const title of svg.querySelectorAll("title")) title.remove();
+    fit();
+    // A large graph is unreadable as a whole, so it opens on the root of A.
+    if (view.scale < 0.35) show(graph.a);
+    find();
+
+    for (const node of graph.nodes) {
+      shape(node.id).addEventListener("click", (event) => {
+        event.stopPropagation();
+        select(node.id);
+      });
+    }
+    svg.addEventListener("click", () => select(null));
+    document.getElementById("fit").addEventListener("click", fit);
+    search.addEventListener("input", find);
+    search.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" || matches.length === 0) return;
+      current = (current + 1) % matches.length;
+      select(matches[current].id);
+      show(matches[current].id);
+    });
+
+    canvas.addEventListener(
+      "wheel",
+      (event) => {
+        event.preventDefault();
+        const frame = canvas.getBoundingClientRect();
+        const [x, y] = [event.clientX - frame.left, event.clientY - frame.top];
+        const scale = Math.min(4, Math.max(0.02, view.scale * Math.exp(-event.deltaY * 0.0015)));
+        // The point under the pointer stays where it is.
+        view.x = x - ((x - view.x) * scale) / view.scale;
+        view.y = y - ((y - view.y) * scale) / view.scale;
+        view.scale = scale;
+        place();
+      },
+      { passive: false },
+    );
+    let grabbed = null;
+    canvas.addEventListener("pointerdown", (event) => {
+      grabbed = { x: event.clientX - view.x, y: event.clientY - view.y, moved: false };
+    });
+    canvas.addEventListener("pointermove", (event) => {
+      if (!grabbed) return;
+      const [x, y] = [event.clientX - grabbed.x, event.clientY - grabbed.y];
+      if (!grabbed.moved && Math.hypot(x - view.x, y - view.y) < 4) return;
+      if (!grabbed.moved) canvas.setPointerCapture(event.pointerId);
+      grabbed.moved = true;
+      canvas.classList.add("dragging");
+      [view.x, view.y] = [x, y];
+      place();
+    });
+    const release = () => {
+      grabbed = null;
+      canvas.classList.remove("dragging");
+    };
+    canvas.addEventListener("pointerup", release);
+    canvas.addEventListener("pointercancel", release);
+  }
+
+  if (typeof Viz === "undefined") {
+    message.textContent = "Graphviz could not be loaded from cdn.jsdelivr.net. The page needs a network connection.";
+  } else {
+    Viz.instance()
+      .then((viz) => drawn(viz.renderSVGElement(toDot(graph))))
+      .catch((error) => {
+        message.textContent = `The graph could not be laid out: ${error.message}`;
+      });
+  }
+}
+</script>
+</body>
+</html>

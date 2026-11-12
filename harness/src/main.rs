@@ -1,16 +1,18 @@
 mod compare;
+mod inspect;
 mod results;
 mod run;
 
-use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::{env, fs};
 
 use clap::{Args, Parser, Subcommand};
 use compare::{Base, LABEL};
 use results::Counts;
 
-/// Runs the library over the benchmark corpus and reports on the results.
+/// Runs the library over the benchmark corpus and reports on the results, and draws what the
+/// library makes of two schemas.
 #[derive(Parser)]
 struct Cli {
     #[command(subcommand)]
@@ -27,6 +29,13 @@ enum Command {
     ///
     /// Fails when a check that the base decided is Unknown now, unless --allow-lost is given.
     Compare(CompareArguments),
+    /// Draw the schema graph of two schemas and open the picture in the browser.
+    ///
+    /// The graph is what the library makes of the schemas before it compares them: every
+    /// subschema with the keywords it asserts, and where each reference leads. The picture is
+    /// one HTML page in the temporary folder, which loads Graphviz from a CDN. It opens in the
+    /// program that BROWSER names, or else in the default browser.
+    Inspect(InspectArguments),
 }
 
 #[derive(Args)]
@@ -55,6 +64,14 @@ struct CompareArguments {
     output: Option<PathBuf>,
 }
 
+#[derive(Args)]
+struct InspectArguments {
+    /// The file of schema A.
+    a: PathBuf,
+    /// The file of schema B. Without it, B is the schema `true`.
+    b: Option<PathBuf>,
+}
+
 /// At most this many failed checks are named on the terminal; the comment has its own limit.
 const NAMED: usize = 20;
 
@@ -62,6 +79,7 @@ fn main() -> ExitCode {
     let passed = match Cli::parse().command {
         Command::Run(arguments) => run(&arguments),
         Command::Compare(arguments) => compare(&arguments),
+        Command::Inspect(arguments) => inspect(&arguments),
     };
     match passed {
         Ok(true) => ExitCode::SUCCESS,
@@ -121,6 +139,15 @@ fn compare(arguments: &CompareArguments) -> Result<bool, String> {
         );
         return Ok(false);
     }
+    Ok(true)
+}
+
+fn inspect(arguments: &InspectArguments) -> Result<bool, String> {
+    let page = inspect::page(&arguments.a, arguments.b.as_deref())?;
+    let path = env::temp_dir().join("subsumes-inspect.html");
+    fs::write(&path, page).map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+    println!("{}", path.display());
+    inspect::open(&path)?;
     Ok(true)
 }
 
