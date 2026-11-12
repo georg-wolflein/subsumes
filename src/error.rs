@@ -6,6 +6,10 @@ use crate::Side;
 ///
 /// This is not [`Verdict::Unknown`](crate::Verdict::Unknown), which is the answer for two valid
 /// schemas that the library cannot decide.
+///
+/// A location is a URI reference whose fragment is a JSON Pointer, such as
+/// `#/properties/age/minimum`. Inside a document other than the schema itself it starts with
+/// the URI of that document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
@@ -14,12 +18,40 @@ pub enum Error {
         /// Which of the two arguments it is.
         schema: Side,
     },
-    /// The schema declares a dialect other than draft 2020-12.
+    /// A schema declares a dialect other than draft 2020-12.
     UnsupportedDialect {
-        /// Which of the two arguments it is.
+        /// The argument whose check ran into it.
         schema: Side,
-        /// The value of its `$schema`.
+        /// Where the `$schema` is.
+        location: String,
+        /// The value of the `$schema`.
         dialect: String,
+    },
+    /// A keyword has a value that the draft does not allow, such as `"minLength": "3"`.
+    ///
+    /// This is an error wherever the keyword stands, even in a definition that nothing uses.
+    InvalidKeyword {
+        /// The argument whose check ran into it.
+        schema: Side,
+        /// Where the keyword is.
+        location: String,
+        /// What the value must be.
+        message: String,
+    },
+    /// A reference resolves to nothing: its document was not given to the checker, or its
+    /// fragment names nothing in the document.
+    UnresolvedReference {
+        /// The argument whose check ran into it.
+        schema: Side,
+        /// Where the `$ref` or `$dynamicRef` is.
+        location: String,
+        /// The reference as written.
+        reference: String,
+    },
+    /// The documents given to the checker cannot be used.
+    InvalidDocuments {
+        /// What is wrong with them.
+        message: String,
     },
 }
 
@@ -29,11 +61,33 @@ impl fmt::Display for Error {
             Self::NotASchema { schema } => {
                 write!(f, "schema {schema} is neither an object nor a boolean")
             }
-            Self::UnsupportedDialect { schema, dialect } => {
+            Self::UnsupportedDialect {
+                schema,
+                location,
+                dialect,
+            } => {
                 write!(
                     f,
-                    "schema {schema} declares the dialect {dialect}, and only draft 2020-12 is supported"
+                    "{location} in schema {schema} declares the dialect {dialect}, and only draft 2020-12 is supported"
                 )
+            }
+            Self::InvalidKeyword {
+                schema,
+                location,
+                message,
+            } => write!(f, "{location} in schema {schema} {message}"),
+            Self::UnresolvedReference {
+                schema,
+                location,
+                reference,
+            } => {
+                write!(
+                    f,
+                    "{location} in schema {schema} refers to {reference}, which resolves to nothing"
+                )
+            }
+            Self::InvalidDocuments { message } => {
+                write!(f, "the documents of the checker cannot be used: {message}")
             }
         }
     }

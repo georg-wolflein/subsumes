@@ -16,13 +16,15 @@
 //! # Ok::<(), subsumes::Error>(())
 //! ```
 //!
-//! The library has no engine yet: every check of two schemas returns [`Verdict::Unknown`].
+//! The library has no engine yet. It loads both schemas, so one that is not a valid schema is
+//! an [`Error`], and every check of two valid schemas returns [`Verdict::Unknown`].
 
 mod checker;
 mod error;
 // Nothing uses the meta-schemas until the library resolves references.
 #[cfg_attr(not(test), expect(dead_code))]
 mod meta_schemas;
+mod schema;
 mod verdict;
 
 use serde_json::Value;

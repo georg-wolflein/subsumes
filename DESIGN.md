@@ -4,7 +4,7 @@
 
 The [README](README.md) states the goals, the verdicts and what is unsupported. This document is the plan for the implementation.
 
-**Status:** the API and the benchmark harness exist, and every check returns `Unknown`. The [pipeline](#pipeline) is still to be built, in the [order of work](#order-of-work) below.
+**Status:** the API, the benchmark harness and the load stage exist. A schema that cannot be loaded is an error, and every check of two schemas that can returns `Unknown`. The rest of the [pipeline](#pipeline) is still to be built, in the [order of work](#order-of-work) below.
 
 ## Method
 
@@ -51,11 +51,13 @@ generate   conjunction    ->  counterexample
 
 ### Load
 
-- A subschema is a *node*: a boolean, or a struct with one typed field per keyword of the draft and its children as node ids. Nodes are parsed by hand from the `Value`, not derived with serde.
+- A subschema is a *node*: a boolean, or a struct with one typed field per keyword that says what a schema accepts, and its children as node ids. Nodes are parsed by hand from the `Value`, not derived with serde.
+- Loading has two steps. The first parses A and B from top to bottom and needs nothing else. The second resolves every reference to a node, and parses the documents that the references lead to.
 - Load parses every subschema of A, of B and of each document they reference, before the engine starts. A keyword of the wrong shape is an error wherever it stands, even in a definition that nothing uses. Input errors come from this stage only: lowering and the engine cannot fail on input.
 - Every node keeps its location, a URI reference with a JSON Pointer fragment. Leaves and errors report it.
-- Keywords that the draft does not define are ignored, as the specification says.
-- References go through the `referencing` crate. The documents of the checker form one registry, built once. A check extends it twice, once with A and once with B, because two versions of a schema usually share an `$id`.
+- Keywords that the draft does not define are ignored, as the specification says. Keywords that only annotate, such as `title`, are not read either.
+- References go through the `referencing` crate. The documents of the checker form one registry, built once. A check extends it with A and, separately, with B, because two versions of a schema usually share an `$id`. A schema without references needs no registry.
+- A document of the checker is read only when a reference leads to it. Then all of it is parsed, once for each of the two schemas that reach it, because its references resolve within that schema.
 
 ### Lower
 
@@ -131,7 +133,8 @@ Regular languages of strings are one module of the library, `language`. It uses 
 src/
   lib.rs, checker.rs, verdict.rs, error.rs    the API (exists)
   context.rs      the state of one check: arenas, memo tables, budget
-  schema.rs       load: nodes, typed keywords, locations, resolution
+  schema.rs       load: nodes, typed keywords, locations (exists)
+  schema/         its two steps: parse, and link for the references (exists)
   term.rs         terms, variables, c-references, one-level negation
   lower.rs        schema graph to terms: rewrites and scenarios
   normalize.rs    the engine
@@ -147,7 +150,7 @@ harness/          the benchmark runner (exists)
 
 Each step goes through all four stages for the keywords it adds, and lands as its own pull request. The benchmark comment shows what the step decides, and its table of reasons for `Unknown` shows what blocks the most checks.
 
-1. **Schema graph:** nodes, locations, errors, references through `referencing`.
+1. **Schema graph:** nodes, locations, errors, references through `referencing`. Done.
 2. **Engine skeleton:** context, budget, terms, variables, lazy negation and fast mode; `type`, booleans, `null`, the connectives, `$ref` with recursion. First `Yes` and `No`.
 3. **Numbers.**
 4. **Strings:** the `language` module, then patterns, formats and lengths in the engine.

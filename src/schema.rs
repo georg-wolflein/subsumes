@@ -1,0 +1,297 @@
+//! The schema graph: what the load stage makes of the two schemas of a check.
+//!
+//! Every subschema is a [`Node`]: a boolean, or the keywords of an object, with one typed
+//! field for each keyword that says what a schema accepts. A subschema and the target of a
+//! reference are [`NodeId`]s, so a recursive schema is a cycle in the graph.
+//!
+//! Loading has two steps. [`parse`] reads A and B from top to bottom and needs nothing else.
+//! [`Unlinked::link`] then resolves every reference, and parses the documents that the
+//! references lead to.
+
+// Nothing reads the graph until the lowering stage exists.
+#![cfg_attr(not(test), expect(dead_code))]
+#![cfg_attr(test, allow(dead_code))]
+
+mod link;
+mod parse;
+
+use std::fmt::Write;
+
+use serde_json::{Number, Value};
+
+use crate::Side;
+
+pub(crate) use link::Documents;
+pub(crate) use parse::parse;
+
+/// The two schemas of a check and every document they reference, as nodes.
+#[derive(Debug)]
+pub(crate) struct Graph<'a> {
+    nodes: Vec<Node<'a>>,
+    /// The root of A.
+    pub a: NodeId,
+    /// The root of B.
+    pub b: NodeId,
+}
+
+impl<'a> Graph<'a> {
+    pub fn node(&self, id: NodeId) -> &Node<'a> {
+        &self.nodes[id.index()]
+    }
+
+    /// How many nodes the graph has.
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Where a node is: a URI reference whose fragment is a JSON Pointer.
+    pub fn location(&self, id: NodeId) -> String {
+        location(&self.nodes, &self.node(id).origin)
+    }
+}
+
+/// The id of a node of the graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct NodeId(u32);
+
+impl NodeId {
+    fn new(index: usize) -> Self {
+        Self(u32::try_from(index).expect("a graph has fewer than 2^32 nodes"))
+    }
+
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// One subschema.
+#[derive(Debug)]
+pub(crate) struct Node<'a> {
+    /// The schema whose check reached the node. A document that both schemas reference has
+    /// a node for each, because its references resolve within the schema that reached it.
+    pub side: Side,
+    pub origin: Origin<'a>,
+    /// The node that begins the resource of this one: the nearest node above it that has an
+    /// `$id`, or else the root it was reached from. A node that begins a resource names itself.
+    pub resource: NodeId,
+    pub schema: Schema<'a>,
+}
+
+/// How a node was reached, which says where it is.
+#[derive(Debug)]
+pub(crate) enum Origin<'a> {
+    /// The root of A or of B.
+    Root,
+    /// The target of a reference that is not a subschema of a node known before: the root of
+    /// another document, or a value in a place where the draft puts no schema. The string is
+    /// the URI of the target; inside A or B it is only the fragment.
+    Reference(String),
+    /// A subschema of `parent`: the value of `keyword`, or one of several values in it.
+    Child {
+        parent: NodeId,
+        keyword: &'a str,
+        part: Part<'a>,
+    },
+}
+
+/// Which of the subschemas of a keyword a node is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Part<'a> {
+    /// The keyword holds one schema, as `not` does.
+    Whole,
+    /// The schema under a name, as in `properties`.
+    Name(&'a str),
+    /// The schema at a position, as in `allOf`.
+    Index(usize),
+}
+
+#[derive(Debug)]
+pub(crate) enum Schema<'a> {
+    Bool(bool),
+    Object(Box<Keywords<'a>>),
+}
+
+/// The keywords of a schema object that say what it accepts.
+///
+/// A keyword that is absent is `None`, `false` or empty. Keywords that only annotate, such as
+/// `title`, and keywords that the draft does not define are not read. `$id`, `$anchor` and
+/// `$defs` are not here either: they only say where a reference can point, and every reference
+/// is already resolved.
+#[derive(Debug, Default)]
+pub(crate) struct Keywords<'a> {
+    /// The target of `$ref`.
+    pub reference: Option<NodeId>,
+    pub dynamic_reference: Option<DynamicReference<'a>>,
+    pub dynamic_anchor: Option<&'a str>,
+
+    pub all_of: Vec<NodeId>,
+    pub any_of: Vec<NodeId>,
+    pub one_of: Vec<NodeId>,
+    pub not: Option<NodeId>,
+    pub if_: Option<NodeId>,
+    pub then: Option<NodeId>,
+    pub else_: Option<NodeId>,
+    pub dependent_schemas: Vec<(&'a str, NodeId)>,
+
+    pub types: Option<Types>,
+    pub enumeration: Option<&'a [Value]>,
+    pub constant: Option<&'a Value>,
+
+    pub minimum: Option<&'a Number>,
+    pub maximum: Option<&'a Number>,
+    pub exclusive_minimum: Option<&'a Number>,
+    pub exclusive_maximum: Option<&'a Number>,
+    pub multiple_of: Option<&'a Number>,
+
+    pub min_length: Option<u64>,
+    pub max_length: Option<u64>,
+    pub pattern: Option<&'a str>,
+    pub format: Option<&'a str>,
+
+    pub prefix_items: Vec<NodeId>,
+    pub items: Option<NodeId>,
+    pub contains: Option<NodeId>,
+    pub min_contains: Option<u64>,
+    pub max_contains: Option<u64>,
+    pub min_items: Option<u64>,
+    pub max_items: Option<u64>,
+    pub unique_items: bool,
+    pub unevaluated_items: Option<NodeId>,
+
+    pub properties: Vec<(&'a str, NodeId)>,
+    pub pattern_properties: Vec<(&'a str, NodeId)>,
+    pub additional_properties: Option<NodeId>,
+    pub property_names: Option<NodeId>,
+    pub required: Vec<&'a str>,
+    pub dependent_required: Vec<(&'a str, Vec<&'a str>)>,
+    pub min_properties: Option<u64>,
+    pub max_properties: Option<u64>,
+    pub unevaluated_properties: Option<NodeId>,
+}
+
+/// A `$dynamicRef`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DynamicReference<'a> {
+    /// The reference as written. Its fragment names the dynamic anchor to look for.
+    pub reference: &'a str,
+    /// What it resolves to before any dynamic scope is taken into account.
+    pub target: NodeId,
+}
+
+/// One of the seven names that `type` takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Type {
+    Null,
+    Boolean,
+    Object,
+    Array,
+    Number,
+    String,
+    Integer,
+}
+
+impl Type {
+    fn named(name: &str) -> Option<Self> {
+        Some(match name {
+            "null" => Self::Null,
+            "boolean" => Self::Boolean,
+            "object" => Self::Object,
+            "array" => Self::Array,
+            "number" => Self::Number,
+            "string" => Self::String,
+            "integer" => Self::Integer,
+            _ => return None,
+        })
+    }
+}
+
+/// A set of types: the value of `type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Types(u8);
+
+impl Types {
+    pub fn contains(self, kind: Type) -> bool {
+        self.0 & (1 << kind as u8) != 0
+    }
+
+    /// Adds a type; `false` if it was there already.
+    fn insert(&mut self, kind: Type) -> bool {
+        let added = !self.contains(kind);
+        self.0 |= 1 << kind as u8;
+        added
+    }
+}
+
+/// The location of the node with this origin.
+fn location(nodes: &[Node], origin: &Origin) -> String {
+    let mut steps = Vec::new();
+    let mut origin = origin;
+    let mut location = loop {
+        match origin {
+            Origin::Root => break "#".to_owned(),
+            Origin::Reference(uri) if uri.contains('#') => break uri.clone(),
+            Origin::Reference(uri) => break format!("{uri}#"),
+            Origin::Child {
+                parent,
+                keyword,
+                part,
+            } => {
+                steps.push((*keyword, *part));
+                origin = &nodes[parent.index()].origin;
+            }
+        }
+    };
+    for (keyword, part) in steps.into_iter().rev() {
+        push_step(&mut location, keyword, part);
+    }
+    location
+}
+
+/// Appends the place of a subschema to the location of its parent.
+fn push_step(location: &mut String, keyword: &str, part: Part) {
+    push_token(location, keyword);
+    match part {
+        Part::Whole => {}
+        Part::Name(name) => push_token(location, name),
+        Part::Index(index) => write!(location, "/{index}").expect("a string takes any text"),
+    }
+}
+
+/// Appends one token of a JSON Pointer, escaped for the pointer and for a URI fragment.
+fn push_token(location: &mut String, token: &str) {
+    location.push('/');
+    for byte in token.bytes() {
+        match byte {
+            b'~' => location.push_str("~0"),
+            b'/' => location.push_str("~1"),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => location.push(char::from(byte)),
+            b'-' | b'.' | b'_' | b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b','
+            | b';' | b'=' | b':' | b'@' | b'?' => location.push(char::from(byte)),
+            _ => write!(location, "%{byte:02X}").expect("a string takes any text"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_token_is_escaped_for_the_pointer_and_for_the_fragment() {
+        let mut location = "#".to_owned();
+        push_token(&mut location, "$defs");
+        push_token(&mut location, "a/b~c");
+        push_token(&mut location, "x y#é");
+        assert_eq!(location, "#/$defs/a~1b~0c/x%20y%23%C3%A9");
+    }
+
+    #[test]
+    fn a_set_of_types_knows_what_it_holds() {
+        let mut types = Types::default();
+        assert!(types.insert(Type::Integer));
+        assert!(types.insert(Type::Null));
+        assert!(!types.insert(Type::Integer));
+        assert!(types.contains(Type::Null));
+        assert!(!types.contains(Type::Number));
+    }
+}
