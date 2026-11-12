@@ -1,6 +1,7 @@
 mod compare;
 mod counterexample;
 mod inspect;
+mod patterns;
 mod results;
 mod run;
 

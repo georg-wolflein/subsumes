@@ -5,15 +5,16 @@
 //! narrow schema, whose instances were to be accepted, and invalid under the wide schema,
 //! which was to accept them.
 //!
-//! The validator reads the schemas as closely to the library as it can: as draft 2020-12,
-//! with patterns matched by the `regex` crate and with `format` asserted. Two things it still
-//! reads in its own way, which matter once a counterexample is a string that a pattern or a
-//! format is about: it translates a pattern from ECMA 262 before the `regex` crate sees it,
-//! and it has its own idea of each format.
+//! The validator reads the schemas as the library does: as draft 2020-12, with `format`
+//! asserted, and with every pattern in the dialect of the `regex` crate, which the
+//! [`patterns`] module sees to. One thing it still reads in its own way, which matters once a
+//! counterexample is a string that a format is about: it has its own idea of each format.
 
 use jsonschema::{Draft, PatternOptions, Validator};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::patterns;
 
 /// What the validator makes of the counterexample of a `No`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,7 +61,7 @@ fn validator(schema: &Value) -> Result<Validator, String> {
         .with_draft(Draft::Draft202012)
         .with_pattern_options(PatternOptions::regex())
         .should_validate_formats(true)
-        .build(schema)
+        .build(&patterns::spelled_out(schema))
         .map_err(|error| format!("the validator does not take a schema: {error}"))
 }
 
@@ -173,18 +174,104 @@ mod tests {
     }
 
     #[test]
-    fn a_pattern_is_read_as_ecma_262_first() {
-        // To the `regex` crate, and so to the library, `\d` is any digit of Unicode. The
-        // validator makes `[0-9]` of it, as ECMA 262 has it. No counterexample depends on
-        // that yet; this test is here to fail when the validator changes its mind.
-        let (anything, digit) = (json!(false), json!({"pattern": "^\\d$"}));
+    fn a_pattern_matches_what_it_matches_in_the_regex_crate() {
+        // Each of these says something else in ECMA 262, which the validator reads by itself:
+        // the classes of Unicode, the line ends, the operations on classes, the flags.
+        let patterns = [
+            r"^\d$",
+            r"^\D$",
+            r"^\w+$",
+            r"^\W$",
+            r"^\s$",
+            r"^\S*$",
+            "^.$",
+            "(?s)^.$",
+            r"^[\d-]+$",
+            r"^[a-z&&[^b]]$",
+            r"^[\w--\d]$",
+            r"^[a-c~~b-d]$",
+            r"^[[:alpha:]&]$",
+            r"[^\s\S]",
+            r"\P{any}",
+            r"^\a$",
+            "(?i)^straße$",
+            "(?x) ^ a b $ # and no more",
+            r"^\p{Greek}+$",
+            r"a\b",
+        ];
+        let strings = [
+            "",
+            "3",
+            "٣",
+            "a",
+            "b",
+            "d",
+            "é",
+            "_",
+            "&",
+            "-",
+            "~",
+            "[",
+            " ",
+            "\n",
+            "\r",
+            "\u{7}",
+            "\u{85}",
+            "\u{feff}",
+            "\u{2028}",
+            "ab",
+            "a b",
+            "a-",
+            "3-٣",
+            "STRASSE",
+            "Straße",
+            "λόγος",
+        ];
+        for pattern in patterns {
+            let expected = regex::Regex::new(pattern).unwrap();
+            let validator = validator(&json!({"pattern": pattern})).unwrap();
+            let names = validator_of_names(pattern);
+            for string in strings {
+                let matches = expected.is_match(string);
+                assert_eq!(
+                    validator.is_valid(&json!(string)),
+                    matches,
+                    "{pattern:?} on {string:?}"
+                );
+                // The same pattern as a key of `patternProperties`, with the name as the string.
+                assert_eq!(
+                    names.is_valid(&json!({string: null})),
+                    matches,
+                    "{pattern:?} on the name {string:?}"
+                );
+            }
+        }
+    }
+
+    /// Accepts an object whose names all match the pattern, by way of `patternProperties`.
+    fn validator_of_names(pattern: &str) -> Validator {
+        let schema = json!({"patternProperties": {pattern: true}, "additionalProperties": false});
+        validator(&schema).unwrap()
+    }
+
+    #[test]
+    fn a_pattern_is_read_so_wherever_a_reference_leads() {
+        // To the `regex` crate, and so to the library, `\d` is any digit of Unicode.
+        let digit = json!({
+            "$ref": "#/types/digit",
+            "types": {"digit": {"pattern": r"^\d$"}},
+        });
         assert_eq!(
-            confirmation(&anything, &digit, &json!("3")),
+            confirmation(&json!(false), &digit, &json!("٣")),
             Confirmation::Confirmed
         );
         assert_eq!(
-            confirmation(&anything, &digit, &json!("٣")),
-            Confirmation::RejectedByNarrow
+            confirmation(&json!({"pattern": "^[0-9]$"}), &digit, &json!("٣")),
+            Confirmation::Confirmed
+        );
+        assert_eq!(
+            confirmation(&digit, &json!(true), &json!("٣")),
+            Confirmation::AcceptedByWide
         );
     }
 

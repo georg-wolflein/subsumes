@@ -257,6 +257,9 @@ version = "0.0.0"
 dependencies = [
  "clap",
  "jsonschema",
+ "percent-encoding",
+ "regex",
+ "regex-syntax",
  "serde",
  "serde_json",
  "subsumes",
