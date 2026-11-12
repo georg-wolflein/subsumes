@@ -8,8 +8,8 @@ use crate::Side;
 /// schemas that the library cannot decide.
 ///
 /// A location is a URI reference whose fragment is a JSON Pointer, such as
-/// `#/properties/age/minimum`. Inside a document other than the schema itself it starts with
-/// the URI of that document.
+/// `#/properties/age/minimum`. Inside a meta-schema of the draft it starts with the URI of that
+/// meta-schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
@@ -27,7 +27,8 @@ pub enum Error {
         /// The value of the `$schema`.
         dialect: String,
     },
-    /// A keyword has a value that the draft does not allow, such as `"minLength": "3"`.
+    /// A keyword has a value that the draft does not allow, such as `"minLength": "3"`, or
+    /// two parts of a schema declare the same `$id` or the same anchor.
     ///
     /// This is an error wherever the keyword stands, even in a definition that nothing uses.
     InvalidKeyword {
@@ -38,8 +39,9 @@ pub enum Error {
         /// What the value must be.
         message: String,
     },
-    /// A reference resolves to nothing: its document was not given to the checker, or its
-    /// fragment names nothing in the document.
+    /// A reference resolves to nothing: the schema has no resource with that URI, or the
+    /// fragment names nothing in the resource. A schema has to carry what it references, apart
+    /// from the meta-schemas of the draft.
     UnresolvedReference {
         /// The argument whose check ran into it.
         schema: Side,
@@ -47,11 +49,6 @@ pub enum Error {
         location: String,
         /// The reference as written.
         reference: String,
-    },
-    /// The documents given to the checker cannot be used.
-    InvalidDocuments {
-        /// What is wrong with them.
-        message: String,
     },
 }
 
@@ -85,9 +82,6 @@ impl fmt::Display for Error {
                     f,
                     "{location} in schema {schema} refers to {reference}, which resolves to nothing"
                 )
-            }
-            Self::InvalidDocuments { message } => {
-                write!(f, "the documents of the checker cannot be used: {message}")
             }
         }
     }

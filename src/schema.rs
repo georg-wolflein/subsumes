@@ -4,15 +4,18 @@
 //! field for each keyword that says what a schema accepts. A subschema and the target of a
 //! reference are [`NodeId`]s, so a recursive schema is a cycle in the graph.
 //!
-//! Loading has two steps. [`parse`] reads A and B from top to bottom and needs nothing else.
-//! [`Unlinked::link`] then resolves every reference, and parses the documents that the
-//! references lead to.
+//! Loading has two steps. [`parse`] reads A and B from top to bottom. [`Unlinked::link`] then
+//! resolves every reference. A schema stands on its own: a reference leads to a place inside
+//! it or to a meta-schema of the draft, which the library carries.
+//!
+//! [`Unlinked::link`]: parse::Unlinked::link
 
 // Nothing reads the graph until the lowering stage exists.
 #![cfg_attr(not(test), expect(dead_code))]
 #![cfg_attr(test, allow(dead_code))]
 
 mod link;
+mod meta;
 mod parse;
 
 use std::fmt::Write;
@@ -21,10 +24,9 @@ use serde_json::{Number, Value};
 
 use crate::Side;
 
-pub(crate) use link::Documents;
 pub(crate) use parse::parse;
 
-/// The two schemas of a check and every document they reference, as nodes.
+/// The two schemas of a check and every meta-schema they reference, as nodes.
 #[derive(Debug)]
 pub(crate) struct Graph<'a> {
     nodes: Vec<Node<'a>>,
@@ -67,12 +69,12 @@ impl NodeId {
 /// One subschema.
 #[derive(Debug)]
 pub(crate) struct Node<'a> {
-    /// The schema whose check reached the node. A document that both schemas reference has
-    /// a node for each, because its references resolve within the schema that reached it.
+    /// The schema that the node is part of. A meta-schema that both schemas reference has a
+    /// node for each.
     pub side: Side,
     pub origin: Origin<'a>,
     /// The node that begins the resource of this one: the nearest node above it that has an
-    /// `$id`, or else the root it was reached from. A node that begins a resource names itself.
+    /// `$id`, or else the root of its document. A node that begins a resource names itself.
     pub resource: NodeId,
     pub schema: Schema<'a>,
 }
@@ -83,8 +85,8 @@ pub(crate) enum Origin<'a> {
     /// The root of A or of B.
     Root,
     /// The target of a reference that is not a subschema of a node known before: the root of
-    /// another document, or a value in a place where the draft puts no schema. The string is
-    /// the URI of the target; inside A or B it is only the fragment.
+    /// a meta-schema, or a value in a place where the draft puts no schema. The string is the
+    /// location of the target.
     Reference(String),
     /// A subschema of `parent`: the value of `keyword`, or one of several values in it.
     Child {
@@ -143,18 +145,18 @@ pub(crate) struct Keywords<'a> {
     pub exclusive_maximum: Option<&'a Number>,
     pub multiple_of: Option<&'a Number>,
 
-    pub min_length: Option<u64>,
-    pub max_length: Option<u64>,
+    pub min_length: Option<Count>,
+    pub max_length: Option<Count>,
     pub pattern: Option<&'a str>,
     pub format: Option<&'a str>,
 
     pub prefix_items: Vec<NodeId>,
     pub items: Option<NodeId>,
     pub contains: Option<NodeId>,
-    pub min_contains: Option<u64>,
-    pub max_contains: Option<u64>,
-    pub min_items: Option<u64>,
-    pub max_items: Option<u64>,
+    pub min_contains: Option<Count>,
+    pub max_contains: Option<Count>,
+    pub min_items: Option<Count>,
+    pub max_items: Option<Count>,
     pub unique_items: bool,
     pub unevaluated_items: Option<NodeId>,
 
@@ -164,9 +166,18 @@ pub(crate) struct Keywords<'a> {
     pub property_names: Option<NodeId>,
     pub required: Vec<&'a str>,
     pub dependent_required: Vec<(&'a str, Vec<&'a str>)>,
-    pub min_properties: Option<u64>,
-    pub max_properties: Option<u64>,
+    pub min_properties: Option<Count>,
+    pub max_properties: Option<Count>,
     pub unevaluated_properties: Option<NodeId>,
+}
+
+/// How many characters, items or properties a keyword such as `minItems` asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Count {
+    Of(u64),
+    /// More than a `u64` holds, as `1e30` is. Two such counts are not known to be equal, so
+    /// nothing may be concluded from one.
+    Beyond,
 }
 
 /// A `$dynamicRef`.

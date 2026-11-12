@@ -1,14 +1,20 @@
 //! The first step of loading: a schema document as nodes, with its references still open.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
-use referencing::UriRef;
+use fluent_uri::{Uri, UriRef};
 use serde_json::{Map, Number, Value};
 
-use super::{Keywords, Node, NodeId, Origin, Part, Schema, Type, Types, location, push_token};
+use super::{
+    Count, Keywords, Node, NodeId, Origin, Part, Schema, Type, Types, location, push_token,
+};
 use crate::{Error, Side};
 
 const DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
+
+/// The URI that A and B start with. A schema without an `$id` has no URI of its own, and the
+/// two are kept apart by their side, so both can have this one.
+pub(super) const ROOT: &str = "json-schema:///";
 
 /// A and B as nodes, with their references not yet resolved.
 #[derive(Debug)]
@@ -18,16 +24,6 @@ pub(crate) struct Unlinked<'a> {
     pub(super) b: NodeId,
 }
 
-impl Unlinked<'_> {
-    /// Whether one of the two schemas has a reference to resolve. One that has none needs
-    /// no [`Scope`](super::link::Scope).
-    pub(crate) fn has_references(&self, side: Side) -> bool {
-        let nodes = &self.builder.nodes;
-        let mut references = self.builder.references.iter();
-        references.any(|reference| nodes[reference.node.index()].side == side)
-    }
-}
-
 /// Parses every subschema of A and of B.
 ///
 /// # Errors
@@ -35,10 +31,18 @@ impl Unlinked<'_> {
 /// When a root is no schema, when a schema declares another dialect, or when a keyword has a
 /// value that the draft does not allow, wherever in the document it stands.
 pub(crate) fn parse<'a>(a: &'a Value, b: &'a Value) -> Result<Unlinked<'a>, Error> {
+    let root = Uri::parse(ROOT).expect("the root URI is valid").normalize();
     let mut builder = Builder::default();
-    let a = builder.tree(Side::A, a, Origin::Root)?;
-    let b = builder.tree(Side::B, b, Origin::Root)?;
+    let a = builder.document(Side::A, a, Origin::Root, root.clone())?;
+    let b = builder.document(Side::B, b, Origin::Root, root)?;
     Ok(Unlinked { builder, a, b })
+}
+
+/// The URI that `reference` names in a resource with this base URI, in the normal form in which
+/// equal URIs are equal strings. `None` if it names none.
+pub(super) fn resolve(base: &Uri<String>, reference: &str) -> Option<Uri<String>> {
+    let reference = UriRef::parse(reference).ok()?;
+    Some(reference.resolve_against(base).ok()?.normalize())
 }
 
 /// The nodes parsed so far, and what is left to do about them.
@@ -51,6 +55,12 @@ pub(super) struct Builder<'a> {
     known: [HashMap<usize, NodeId>; 2],
     /// Every `$ref` and `$dynamicRef` met, in the order of the nodes.
     pub references: Vec<Reference<'a>>,
+    /// The base URI of every node that begins a resource.
+    pub bases: HashMap<NodeId, Uri<String>>,
+    /// The resources of A and of B that a reference can name, by their URI.
+    pub resources: [HashMap<String, NodeId>; 2],
+    /// The nodes that a reference can name by an anchor, by their resource and the name.
+    pub anchors: HashMap<(NodeId, &'a str), NodeId>,
 }
 
 /// A `$ref` or `$dynamicRef` as written.
@@ -77,12 +87,28 @@ impl ReferenceKeyword {
     }
 }
 
+/// Where a tree of nodes begins.
+enum Start {
+    /// At the root of a document, which has this URI unless it names another in its `$id`.
+    Document(Uri<String>),
+    /// At a value inside this resource.
+    Within(NodeId),
+}
+
 /// A value waiting to be parsed. Its node id follows from its place in the queue.
 struct Entry<'a> {
     value: &'a Value,
     origin: Origin<'a>,
-    /// The resource of the parent; `None` for the first entry of a tree.
+    /// The resource of the parent; `None` for the root of a document.
     resource: Option<NodeId>,
+}
+
+/// What a schema object says about how a reference can name it.
+#[derive(Default)]
+struct Names<'a> {
+    id: Option<&'a str>,
+    anchor: Option<&'a str>,
+    dynamic_anchor: Option<&'a str>,
 }
 
 /// What is wrong with the value of a keyword.
@@ -105,24 +131,65 @@ impl<'a> Builder<'a> {
         self.known[index(side)].get(&address(value)).copied()
     }
 
-    /// Parses `root` and every subschema below it, breadth first, and returns the node of
-    /// `root`. Nothing recurses, so the depth of a document does not matter.
-    pub fn tree(
+    /// Where a node is.
+    pub fn location(&self, node: NodeId) -> String {
+        location(&self.nodes, &self.nodes[node.index()].origin)
+    }
+
+    /// Parses a document: `root` and every subschema below it. A reference can name its
+    /// resources by their URI and its anchors by their name.
+    pub fn document(
         &mut self,
         side: Side,
         root: &'a Value,
         origin: Origin<'a>,
+        uri: Uri<String>,
+    ) -> Result<NodeId, Error> {
+        self.tree(side, root, origin, Start::Document(uri))
+    }
+
+    /// Parses a value that a reference points to although the draft puts no schema there, and
+    /// every subschema below it. `resource` is the resource that the value is in. No reference
+    /// can name what the value declares, because the draft does not look for it there.
+    pub fn subtree(
+        &mut self,
+        side: Side,
+        root: &'a Value,
+        origin: Origin<'a>,
+        resource: NodeId,
+    ) -> Result<NodeId, Error> {
+        self.tree(side, root, origin, Start::Within(resource))
+    }
+
+    /// Parses `root` and every subschema below it, breadth first, and returns the node of
+    /// `root`. Nothing recurses, so the depth of a document does not matter.
+    fn tree(
+        &mut self,
+        side: Side,
+        root: &'a Value,
+        origin: Origin<'a>,
+        start: Start,
     ) -> Result<NodeId, Error> {
         let first = NodeId::new(self.nodes.len());
         self.known[index(side)].insert(address(root), first);
+        let (resource, named) = match start {
+            Start::Document(uri) => {
+                self.bases.insert(first, uri);
+                (None, true)
+            }
+            Start::Within(resource) => (Some(resource), false),
+        };
         let mut queue = VecDeque::from([Entry {
             value: root,
             origin,
-            resource: None,
+            resource,
         }]);
         while let Some(entry) = queue.pop_front() {
             let id = NodeId::new(self.nodes.len());
-            let mut resource = entry.resource.unwrap_or(id);
+            // The resource that the node is in if it does not begin one itself.
+            let around = entry.resource.unwrap_or(id);
+            let mut resource = around;
+            let mut names = Names::default();
             let schema = match entry.value {
                 Value::Bool(value) => Schema::Bool(*value),
                 Value::Object(map) => {
@@ -159,10 +226,17 @@ impl<'a> Builder<'a> {
                             reference,
                         });
                     };
-                    match keywords(map, &mut child, &mut reference) {
+                    match keywords(map, &mut names, &mut child, &mut reference) {
                         Ok(keywords) => Schema::Object(Box::new(keywords)),
-                        Err((keyword, problem)) => {
-                            return Err(self.error(side, &entry.origin, keyword, problem));
+                        Err((keyword, Problem::Shape(message))) => {
+                            return Err(self.invalid(side, &entry.origin, keyword, message));
+                        }
+                        Err((keyword, Problem::Dialect(dialect))) => {
+                            return Err(Error::UnsupportedDialect {
+                                schema: side,
+                                location: self.keyword_location(&entry.origin, keyword),
+                                dialect: dialect.to_owned(),
+                            });
                         }
                     }
                 }
@@ -177,6 +251,46 @@ impl<'a> Builder<'a> {
                     });
                 }
             };
+
+            if let Some(reference) = names.id {
+                let base = &self.bases[&around];
+                // An empty fragment is allowed and says nothing.
+                let reference = reference.strip_suffix('#').unwrap_or(reference);
+                let Some(uri) = resolve(base, reference) else {
+                    let message = format!("cannot be resolved against the base URI {base}");
+                    return Err(self.invalid(side, &entry.origin, "$id", message));
+                };
+                self.bases.insert(id, uri);
+            }
+            if named {
+                if resource == id {
+                    let uri = self.bases[&id].as_str();
+                    if let Some(&other) = self.resources[index(side)].get(uri) {
+                        let message = format!("is the URI of {} already", self.location(other));
+                        return Err(self.invalid(side, &entry.origin, "$id", message));
+                    }
+                    self.resources[index(side)].insert(uri.to_owned(), id);
+                }
+                let anchors = [
+                    ("$anchor", names.anchor),
+                    ("$dynamicAnchor", names.dynamic_anchor),
+                ];
+                for (keyword, name) in anchors {
+                    let Some(name) = name else { continue };
+                    match self.anchors.get(&(resource, name)) {
+                        Some(&other) if other != id => {
+                            let message =
+                                format!("is the anchor of {} already", self.location(other));
+                            return Err(self.invalid(side, &entry.origin, keyword, message));
+                        }
+                        Some(_) => {}
+                        None => {
+                            self.anchors.insert((resource, name), id);
+                        }
+                    }
+                }
+            }
+
             self.nodes.push(Node {
                 side,
                 origin: entry.origin,
@@ -188,25 +302,29 @@ impl<'a> Builder<'a> {
         Ok(first)
     }
 
-    fn error(&self, side: Side, origin: &Origin, keyword: &str, problem: Problem) -> Error {
+    /// The location of a keyword of the node with this origin.
+    fn keyword_location(&self, origin: &Origin, keyword: &str) -> String {
         let mut location = location(&self.nodes, origin);
         push_token(&mut location, keyword);
-        match problem {
-            Problem::Shape(message) => Error::InvalidKeyword {
-                schema: side,
-                location,
-                message: message.to_owned(),
-            },
-            Problem::Dialect(dialect) => Error::UnsupportedDialect {
-                schema: side,
-                location,
-                dialect: dialect.to_owned(),
-            },
+        location
+    }
+
+    fn invalid(
+        &self,
+        side: Side,
+        origin: &Origin,
+        keyword: &str,
+        message: impl Into<String>,
+    ) -> Error {
+        Error::InvalidKeyword {
+            schema: side,
+            location: self.keyword_location(origin, keyword),
+            message: message.into(),
         }
     }
 }
 
-fn index(side: Side) -> usize {
+pub(super) fn index(side: Side) -> usize {
     match side {
         Side::A => 0,
         Side::B => 1,
@@ -222,29 +340,32 @@ fn address(value: &Value) -> usize {
 /// its node; `reference` is called for `$ref` and `$dynamicRef`. An error names the keyword.
 fn keywords<'a>(
     map: &'a Map<String, Value>,
+    names: &mut Names<'a>,
     child: &mut impl FnMut(&'a str, Part<'a>, &'a Value) -> NodeId,
     reference: &mut impl FnMut(ReferenceKeyword, &'a str),
 ) -> Result<Keywords<'a>, (&'a str, Problem<'a>)> {
     let mut keywords = Keywords::default();
     for (key, value) in map {
-        keyword(key, value, &mut keywords, child, reference)
+        keyword(key, value, &mut keywords, names, child, reference)
             .map_err(|problem| (key.as_str(), problem))?;
     }
+    names.dynamic_anchor = keywords.dynamic_anchor;
     Ok(keywords)
 }
 
-/// Reads one keyword into `keywords`.
+/// Reads one keyword into `keywords`, or into `names` if it only says how the schema is named.
 fn keyword<'a>(
     key: &'a str,
     value: &'a Value,
     keywords: &mut Keywords<'a>,
+    names: &mut Names<'a>,
     child: &mut impl FnMut(&'a str, Part<'a>, &'a Value) -> NodeId,
     reference: &mut impl FnMut(ReferenceKeyword, &'a str),
 ) -> Result<(), Problem<'a>> {
     match key {
         "$schema" => {
             let dialect = string(value)?;
-            if dialect.trim_end_matches('#') != DRAFT_2020_12 {
+            if dialect.strip_suffix('#').unwrap_or(dialect) != DRAFT_2020_12 {
                 return Err(Problem::Dialect(dialect));
             }
         }
@@ -256,13 +377,18 @@ fn keyword<'a>(
             {
                 return Err("must not have a fragment".into());
             }
+            names.id = Some(id);
         }
-        "$anchor" => {
-            anchor(value)?;
-        }
+        "$anchor" => names.anchor = Some(anchor(value)?),
         "$dynamicAnchor" => keywords.dynamic_anchor = Some(anchor(value)?),
         "$ref" => reference(ReferenceKeyword::Ref, reference_to(value)?),
         "$dynamicRef" => reference(ReferenceKeyword::DynamicRef, reference_to(value)?),
+        "$vocabulary" => {
+            let vocabularies = value.as_object();
+            if !vocabularies.is_some_and(|map| map.values().all(Value::is_boolean)) {
+                return Err("must be an object whose values are booleans".into());
+            }
+        }
 
         // These hold schemas that apply nowhere by themselves. They are parsed like every
         // other subschema, so that a reference into them finds a node.
@@ -271,6 +397,25 @@ fn keyword<'a>(
         }
         "contentSchema" => {
             child(key, Part::Whole, value);
+        }
+
+        // Keywords of older drafts. They assert nothing in this one, but its meta-schema still
+        // says what they may hold.
+        "dependencies" => {
+            const MESSAGE: &str = "must be an object whose values are schemas or arrays of strings without repetition";
+            for (name, dependency) in value.as_object().ok_or(MESSAGE)? {
+                if dependency.is_array() {
+                    strings(dependency).map_err(|_| MESSAGE)?;
+                } else {
+                    child(key, Part::Name(name), dependency);
+                }
+            }
+        }
+        "$recursiveAnchor" => {
+            anchor(value)?;
+        }
+        "$recursiveRef" => {
+            string(value)?;
         }
 
         "allOf" => keywords.all_of = listed(key, value, child)?,
@@ -351,17 +496,18 @@ fn number(value: &Value) -> Result<&Number, &'static str> {
     value.as_number().ok_or("must be a number")
 }
 
-/// A non-negative integer. The draft counts `2.0` as an integer, and a count beyond what a
-/// machine can hold stands for the largest one that it can.
-fn count(value: &Value) -> Result<u64, &'static str> {
+/// A non-negative integer. The draft counts `2.0` as an integer.
+fn count(value: &Value) -> Result<Count, &'static str> {
     const MESSAGE: &str = "must be a non-negative integer";
+    // 2^64, the first float that a `u64` does not hold.
+    const BEYOND: f64 = 18_446_744_073_709_551_616.0;
     let number = value.as_number().ok_or(MESSAGE)?;
     if let Some(count) = number.as_u64() {
-        return Ok(count);
+        return Ok(Count::Of(count));
     }
     match number.as_f64() {
-        // The cast saturates, which is the rounding wanted here.
-        Some(count) if count >= 0.0 && count.fract() == 0.0 => Ok(count as u64),
+        Some(count) if count >= BEYOND => Ok(Count::Beyond),
+        Some(count) if count >= 0.0 && count.fract() == 0.0 => Ok(Count::Of(count as u64)),
         _ => Err(MESSAGE),
     }
 }
@@ -374,16 +520,16 @@ fn uri_reference(value: &Value) -> Result<&str, &'static str> {
     Ok(reference)
 }
 
-/// The value of `$ref` or `$dynamicRef`. Only the part that names a document has to be a URI
-/// reference; whether the fragment leads anywhere is for the resolution to say.
+/// The value of `$ref` or `$dynamicRef`. Only the part before the `#`, which names a resource,
+/// has to be a URI reference. The fragment may hold characters that a URI does not allow, as
+/// many schemas write the names of their definitions; whether it leads anywhere is for the
+/// resolution to say.
 fn reference_to(value: &Value) -> Result<&str, &'static str> {
     let reference = value.as_str().ok_or(URI_REFERENCE)?;
-    if !reference.starts_with('#') {
-        let document = reference
-            .rsplit_once('#')
-            .map_or(reference, |(document, _)| document);
-        UriRef::parse(document).map_err(|_| URI_REFERENCE)?;
-    }
+    let resource = reference
+        .split_once('#')
+        .map_or(reference, |(resource, _)| resource);
+    UriRef::parse(resource).map_err(|_| URI_REFERENCE)?;
     Ok(reference)
 }
 
@@ -423,15 +569,21 @@ fn types(value: &Value) -> Result<Types, &'static str> {
 /// An array of strings without repetition.
 fn strings(value: &Value) -> Result<Vec<&str>, &'static str> {
     const MESSAGE: &str = "must be an array of strings without repetition";
-    let mut names = Vec::new();
-    for name in value.as_array().ok_or(MESSAGE)? {
-        let name = name.as_str().ok_or(MESSAGE)?;
-        if names.contains(&name) {
-            return Err(MESSAGE);
-        }
-        names.push(name);
-    }
-    Ok(names)
+    // Up to this many names, comparing each with those before it needs no allocation and is
+    // quick. Beyond, it would take time quadratic in their number.
+    const FEW: usize = 16;
+    let names = value.as_array().ok_or(MESSAGE)?;
+    let names: Vec<&str> = names
+        .iter()
+        .map(|name| name.as_str().ok_or(MESSAGE))
+        .collect::<Result<_, _>>()?;
+    let repeats = if names.len() <= FEW {
+        (1..names.len()).any(|position| names[..position].contains(&names[position]))
+    } else {
+        let mut seen = HashSet::with_capacity(names.len());
+        !names.iter().all(|name| seen.insert(*name))
+    };
+    if repeats { Err(MESSAGE) } else { Ok(names) }
 }
 
 /// The subschemas of a keyword that holds a non-empty array of them.
@@ -537,24 +689,25 @@ mod tests {
         assert_eq!(keywords.exclusive_minimum.unwrap().as_i64(), Some(-1));
         assert_eq!(keywords.exclusive_maximum.unwrap().as_i64(), Some(11));
         assert_eq!(keywords.multiple_of.unwrap().as_f64(), Some(0.5));
+        let counts = [
+            keywords.min_length,
+            keywords.max_length,
+            keywords.min_items,
+            keywords.max_items,
+            keywords.min_contains,
+            keywords.max_contains,
+            keywords.min_properties,
+            keywords.max_properties,
+        ];
         assert_eq!(
-            (keywords.min_length, keywords.max_length),
-            (Some(1), Some(2))
+            counts,
+            [1, 2, 3, 4, 5, 6, 7, 8].map(|count| Some(Count::Of(count)))
         );
         assert_eq!(
             (keywords.pattern, keywords.format),
             (Some("^a"), Some("date"))
         );
-        assert_eq!((keywords.min_items, keywords.max_items), (Some(3), Some(4)));
-        assert_eq!(
-            (keywords.min_contains, keywords.max_contains),
-            (Some(5), Some(6))
-        );
         assert!(keywords.unique_items);
-        assert_eq!(
-            (keywords.min_properties, keywords.max_properties),
-            (Some(7), Some(8))
-        );
         assert_eq!(keywords.required, ["a", "b"]);
         assert_eq!(keywords.dependent_required, [("a", vec!["b"])]);
         assert_eq!(keywords.dynamic_anchor, Some("node"));
@@ -706,13 +859,69 @@ mod tests {
 
     #[test]
     fn a_count_may_be_written_as_a_float() {
-        let schema = json!({"minLength": 2.0, "maxLength": 1e300});
+        let schema = json!({
+            "minLength": 2.0,
+            "maxLength": 1e19,
+            "minItems": u64::MAX,
+            // Larger than a `u64` holds. That one is larger than the other is not kept, so
+            // the two must not come out as the same number.
+            "maxItems": 18_446_744_073_709_551_616.0,
+            "minProperties": 1e30,
+            "maxProperties": 1e20,
+        });
         let unlinked = parsed(&schema).unwrap();
         let keywords = object(&unlinked, unlinked.a);
+        assert_eq!(keywords.min_length, Some(Count::Of(2)));
         assert_eq!(
-            (keywords.min_length, keywords.max_length),
-            (Some(2), Some(u64::MAX))
+            keywords.max_length,
+            Some(Count::Of(10_000_000_000_000_000_000))
         );
+        assert_eq!(keywords.min_items, Some(Count::Of(u64::MAX)));
+        assert_eq!(keywords.max_items, Some(Count::Beyond));
+        assert_eq!(keywords.min_properties, Some(Count::Beyond));
+        assert_eq!(keywords.max_properties, Some(Count::Beyond));
+    }
+
+    #[test]
+    fn a_long_list_of_names_is_checked_for_repetition_too() {
+        let names: Vec<String> = (0..40_000).map(|number| format!("name{number}")).collect();
+        let unlinked_names = json!({"required": names});
+        let unlinked = parsed(&unlinked_names).unwrap();
+        assert_eq!(object(&unlinked, unlinked.a).required.len(), 40_000);
+
+        let mut repeated = names;
+        repeated.push("name7".to_owned());
+        assert_eq!(invalid(json!({"required": repeated})).0, "#/required");
+        let seventeen = json!({"dependentRequired": {"a": vec!["b"; 17]}});
+        assert_eq!(invalid(seventeen).0, "#/dependentRequired");
+    }
+
+    #[test]
+    fn keywords_of_older_drafts_keep_the_shape_that_the_meta_schema_gives_them() {
+        let schema = json!({
+            "dependencies": {"a": ["b", "c"], "d": {"minLength": 1}, "e": true},
+            "$recursiveAnchor": "anchor",
+            "$recursiveRef": "#",
+            "$vocabulary": {"https://example.com/vocabulary": false},
+        });
+        let unlinked = parsed(&schema).unwrap();
+        // The schemas under `dependencies` are nodes, so that a reference finds them.
+        let locations: Vec<String> = (1..unlinked.b.index())
+            .map(|index| location_of(&unlinked, NodeId::new(index)))
+            .collect();
+        assert_eq!(locations, ["#/dependencies/d", "#/dependencies/e"]);
+
+        let cases = [
+            (json!({"dependencies": {"a": 1}}), "#/dependencies/a"),
+            (json!({"dependencies": {"a": ["b", "b"]}}), "#/dependencies"),
+            (json!({"dependencies": ["a"]}), "#/dependencies"),
+            (json!({"$recursiveAnchor": true}), "#/$recursiveAnchor"),
+            (json!({"$recursiveRef": false}), "#/$recursiveRef"),
+            (json!({"$vocabulary": {"a": 1}}), "#/$vocabulary"),
+        ];
+        for (schema, location) in cases {
+            assert_eq!(invalid(schema.clone()).0, location, "{schema}");
+        }
     }
 
     #[test]
@@ -722,7 +931,6 @@ mod tests {
             "deprecated": "use another",
             "examples": {},
             "$comment": [],
-            "dependencies": {"a": 1},
             "x-custom": {"$ref": 1, "type": "text"},
             "enum": [{"$ref": 1, "type": "text"}],
             "const": {"minLength": "1"},
@@ -739,15 +947,18 @@ mod tests {
         assert!(parsed(&draft_2020_12).is_ok());
 
         let draft_07 = "http://json-schema.org/draft-07/schema#";
-        let schema = json!({"$defs": {"a": {"$id": "a.json", "$schema": draft_07}}});
-        assert_eq!(
-            parsed(&schema).unwrap_err(),
-            Error::UnsupportedDialect {
-                schema: Side::A,
-                location: "#/$defs/a/$schema".to_owned(),
-                dialect: draft_07.to_owned(),
-            }
-        );
+        let two_fragments = format!("{DRAFT_2020_12}##");
+        for dialect in [draft_07, two_fragments.as_str()] {
+            let schema = json!({"$defs": {"a": {"$id": "a.json", "$schema": dialect}}});
+            assert_eq!(
+                parsed(&schema).unwrap_err(),
+                Error::UnsupportedDialect {
+                    schema: Side::A,
+                    location: "#/$defs/a/$schema".to_owned(),
+                    dialect: dialect.to_owned(),
+                }
+            );
+        }
     }
 
     #[test]
@@ -782,6 +993,97 @@ mod tests {
         assert_eq!(resource_of(object(&unlinked, items).not.unwrap()), named);
         // B is a tree of its own.
         assert_eq!(resource_of(unlinked.b), unlinked.b);
+    }
+
+    #[test]
+    fn an_id_is_resolved_against_the_base_around_it() {
+        let schema = json!({
+            "$id": "https://example.com/schemas/root.json",
+            "properties": {
+                "relative": {"$id": "inner/a.json", "items": {"$id": "b.json#"}},
+                "absolute": {"$id": "urn:example:other"},
+                "normal": {"$id": "HTTPS://EXAMPLE.com/a/../%7Ec"},
+            },
+        });
+        let unlinked = parsed(&schema).unwrap();
+        let builder = &unlinked.builder;
+        let mut bases: Vec<(String, &str)> = builder
+            .bases
+            .iter()
+            .map(|(node, base)| (builder.location(*node), base.as_str()))
+            .collect();
+        bases.sort();
+        let root = "https://example.com/schemas/root.json";
+        assert_eq!(
+            bases,
+            [
+                // A and B.
+                ("#".to_owned(), root),
+                ("#".to_owned(), ROOT),
+                ("#/properties/absolute".to_owned(), "urn:example:other"),
+                ("#/properties/normal".to_owned(), "https://example.com/~c"),
+                (
+                    "#/properties/relative".to_owned(),
+                    "https://example.com/schemas/inner/a.json"
+                ),
+                (
+                    "#/properties/relative/items".to_owned(),
+                    "https://example.com/schemas/inner/b.json"
+                ),
+            ]
+        );
+        // Each is a resource that a reference of A can name.
+        assert_eq!(builder.resources[index(Side::A)].len(), 5);
+        assert_eq!(builder.resources[index(Side::A)][root], unlinked.a);
+        assert_eq!(builder.resources[index(Side::B)][ROOT], unlinked.b);
+
+        // Without an `$id` at the root, the others start from the URI that every root has.
+        let schema = json!({"items": {"$id": "item.json"}});
+        let unlinked = parsed(&schema).unwrap();
+        let resources = &unlinked.builder.resources[index(Side::A)];
+        assert!(resources.contains_key("json-schema:///item.json"));
+
+        let opaque = json!({"$id": "urn:example:root", "items": {"$id": "item.json"}});
+        assert_eq!(
+            invalid(opaque),
+            (
+                "#/items/$id".to_owned(),
+                "cannot be resolved against the base URI urn:example:root".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn a_uri_or_an_anchor_names_one_place_only() {
+        let twice = json!({"$defs": {"a": {"$id": "x.json"}, "b": {"$id": "./x.json"}}});
+        assert_eq!(
+            invalid(twice),
+            (
+                "#/$defs/b/$id".to_owned(),
+                "is the URI of #/$defs/a already".to_owned()
+            )
+        );
+        let anchors = json!({"$defs": {"a": {"$anchor": "x"}, "b": {"$dynamicAnchor": "x"}}});
+        assert_eq!(
+            invalid(anchors),
+            (
+                "#/$defs/b/$dynamicAnchor".to_owned(),
+                "is the anchor of #/$defs/a already".to_owned()
+            )
+        );
+
+        // One place may have both kinds of anchor, and two resources may use one name.
+        let schema = json!({
+            "$anchor": "x",
+            "$dynamicAnchor": "x",
+            "$defs": {"a": {"$id": "a.json", "$anchor": "x"}},
+        });
+        let unlinked = parsed(&schema).unwrap();
+        let anchors = &unlinked.builder.anchors;
+        assert_eq!(anchors[&(unlinked.a, "x")], unlinked.a);
+        assert_eq!(anchors[&(NodeId::new(1), "x")], NodeId::new(1));
+        // B is the same schema here, and has its own.
+        assert_eq!(parse(&schema, &schema).unwrap().builder.anchors.len(), 4);
     }
 
     #[test]

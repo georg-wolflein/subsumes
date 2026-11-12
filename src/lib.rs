@@ -16,6 +16,10 @@
 //! # Ok::<(), subsumes::Error>(())
 //! ```
 //!
+//! A schema has to stand on its own. A `$ref` resolves inside the schema or to a meta-schema of
+//! the draft, so a schema that is spread over several files is bundled into one first, as the
+//! specification describes: each file goes under `$defs` with its URI as its `$id`.
+//!
 //! The library has no engine yet. It loads both schemas, so one that is not a valid schema is
 //! an [`Error`], and every check of two valid schemas returns [`Verdict::Unknown`].
 
@@ -35,8 +39,7 @@ pub use verdict::{Reason, Side, Verdict};
 
 /// Does `a` accept every instance that is valid under `b`?
 ///
-/// This is [`Checker::subsumes`] with the default settings: the default work budget, and no
-/// documents for references to point to.
+/// This is [`Checker::subsumes`] with the default work budget.
 ///
 /// # Errors
 ///

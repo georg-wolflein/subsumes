@@ -20,25 +20,27 @@ A subsumes B exactly when no instance satisfies `all[B, not A]`. The engine norm
 - **Equal leaves cancel.** Two leaves from the same keyword with the same value are one predicate, so `u ∧ ¬u` is refuted. A schema subsumes itself even if it contains `uniqueItems: true`.
 - **Two causes of the verdict `Unknown`.** An unsupported construct, reported with its schema and location, or the budget. A check that needs the infinite unfolding of a recursive schema counts as the first, at the reference that closes the cycle.
 - **One budget, in steps.** Everything that can blow up charges it: insertions into canonical conjunctions, automaton states, `unevaluated*` scenarios, the search for a counterexample, nesting depth. There is no other limit. Steps do not depend on the machine, so a pair gets the same verdict everywhere. The default of 500,000 comes from the Python version and is set anew once there are measurements.
-- **Invalid input is an error, not a verdict.** A root that is no schema, another dialect, a keyword of the wrong shape, a reference that resolves to nothing. Each error names the schema and the location. A pattern that the `regex` crate rejects is not an error but an `Unknown` leaf.
+- **Invalid input is an error, not a verdict.** A root that is no schema, another dialect, a keyword of the wrong shape, an `$id` or an anchor declared twice, a reference that resolves to nothing. Each error names the schema and the location. A pattern that the `regex` crate rejects is not an error but an `Unknown` leaf.
 - **No validator in the library.** A counterexample is returned unchecked. Tooling outside the library checks counterexamples; see [Testing](#testing).
 - **Patterns are parsed by `regex-syntax`**, so the dialect is that of the `regex` crate by construction. The automata are our own; see [String languages](#string-languages).
 - **`format` is asserted** for the formats that are regular languages: `date`, `time`, `date-time`, `duration`, `uuid`, `ipv4`, `ipv6`, `hostname`, `email`, `uri`, `uri-reference`, `json-pointer`, `relative-json-pointer`. One table of patterns in the Rust dialect defines them. Any other format is an `Unknown` leaf.
 - **Numbers are exact.** Every bound and `multipleOf` is a rational, taken from the shortest decimal of the number, so `0.0075` is a multiple of `0.0001`. Plain `serde_json` is enough.
-- **Nothing is fetched.** A reference resolves within A, within B, to a document given to the checker, or to a meta-schema of the draft, which the library carries.
-- **Pure Rust, no solver.** Dependencies: `serde_json`, `referencing`, `regex-syntax` and `num-rational`.
+- **A schema stands on its own.** A reference resolves within A, within B, or to a meta-schema of the draft, which the library carries. Nothing is fetched and no other document can be given: a schema spread over several files is bundled first, as the specification describes. That loses nothing and keeps the API and the load stage small.
+- **The library resolves references itself.** The parser visits every subschema anyway, so it indexes each `$id` and anchor as it goes, and `fluent-uri` resolves the URIs. The `referencing` crate is made for a validator: its lookup follows the dynamic scope, it wants every referenced document present, it reads fragments loosely and it recurses. It is the oracle of the tests instead.
+- **A fragment may be written loosely, and is read strictly.** The fragment of a `$ref` may hold characters that a URI does not allow, such as a space, because many schemas name their definitions that way and validators accept it. It is percent-decoded once, and a JSON Pointer in it is read as RFC 6901 defines it.
+- **Pure Rust, no solver.** Dependencies: `serde_json`, `fluent-uri`, `regex-syntax` and `num-rational`.
 
 ## API
 
 ```
 subsumes(&a, &b) -> Result<Verdict, Error>
 
-Checker::new().budget(steps).resource(uri, document)
+Checker::new().budget(steps)
     .subsumes(&a, &b) -> Result<Verdict, Error>
     .check(&a, &b)    -> Result<Check, Error>    // the verdict and the steps spent
 ```
 
-Schemas and documents are `serde_json::Value`. A `Checker` does not change while it checks, so one can be shared between threads.
+Schemas are `serde_json::Value`. A `Checker` does not change while it checks, so one can be shared between threads.
 
 ## Pipeline
 
@@ -52,12 +54,15 @@ generate   conjunction    ->  counterexample
 ### Load
 
 - A subschema is a *node*: a boolean, or a struct with one typed field per keyword that says what a schema accepts, and its children as node ids. Nodes are parsed by hand from the `Value`, not derived with serde.
-- Loading has two steps. The first parses A and B from top to bottom and needs nothing else. The second resolves every reference to a node, and parses the documents that the references lead to.
-- Load parses every subschema of A, of B and of each document they reference, before the engine starts. A keyword of the wrong shape is an error wherever it stands, even in a definition that nothing uses. Input errors come from this stage only: lowering and the engine cannot fail on input.
+- Loading has two steps. The first parses A and B from top to bottom. As it goes, it resolves each `$id` against the base URI around it, and indexes the resources by their URI and the anchors by their resource and name. The second resolves every reference to a node.
+- Load parses every subschema of A and of B before the engine starts. A keyword of the wrong shape is an error wherever it stands, even in a definition that nothing uses. Input errors come from this stage only: lowering and the engine cannot fail on input.
 - Every node keeps its location, a URI reference with a JSON Pointer fragment. Leaves and errors report it.
-- Keywords that the draft does not define are ignored, as the specification says. Keywords that only annotate, such as `title`, are not read either.
-- References go through the `referencing` crate. The documents of the checker form one registry, built once. A check extends it with A and, separately, with B, because two versions of a schema usually share an `$id`. A schema without references needs no registry.
-- A document of the checker is read only when a reference leads to it. Then all of it is parsed, once for each of the two schemas that reach it, because its references resolve within that schema.
+- The shape of a keyword is the one that the meta-schema of the draft gives it. That includes the keywords of older drafts which the meta-schema still describes, such as `dependencies`; they assert nothing. Keywords that the draft does not define are ignored, as the specification says. Keywords that only annotate, such as `title`, are not read either.
+- A count such as `minItems` is a `u64`. One that is larger, such as `1e30`, is kept as "beyond", and the engine answers `Unknown` where the answer depends on it.
+- A reference names a resource and a place in it. The resource is the one the reference stands in, one of the same schema by its URI, or a meta-schema. The place is the fragment: empty, a JSON Pointer or an anchor. A and B are resolved apart, because two versions of a schema usually share an `$id`.
+- Resolution is static. A `$dynamicRef` gets the target that a `$ref` would have; what the dynamic scope makes of it is for the engine.
+- A reference may point to a value where the draft puts no schema, such as `#/x-shared/name`. The value is parsed as a schema when the reference is resolved. No reference can name what it declares, because the draft does not look for an `$id` or an anchor there.
+- A meta-schema is parsed when a reference leads to it, once for each of the two schemas.
 
 ### Lower
 
@@ -123,6 +128,7 @@ Regular languages of strings are one module of the library, `language`. It uses 
 
 - **Unit tests** per module.
 - **The corpus.** CI runs every pull request over the pinned [benchmark](https://github.com/georg-wolflein/subsumes-benchmark) release and comments the comparison with `main`. It fails on a wrong verdict, on an error, and on a check that `main` decided and the pull request answers `Unknown`, unless the pull request has the label `allow-lost-verdicts`. Steps and times are reported, not enforced.
+- **References.** The tests resolve every reference of the corpus with the `referencing` crate as well, and the targets must be the same. CI runs this next to the benchmark. The crate is a dependency of the tests only.
 - **Languages.** Property tests on random patterns compare the automata with two oracles: the `regex` crate on which strings match, and `regexsolver` on intersection, complement and inclusion. Both are dependencies of the tests only.
 - **`No`.** A checker outside the library validates each counterexample against both schemas, with patterns matched by the `regex` crate. It is not built yet.
 - **`Yes`** has nothing to validate. Beyond the labels of the corpus there are metamorphic tests: `a` subsumes `a`, `a` subsumes `allOf[a, x]`, and `anyOf[a, x]` subsumes `a`.
@@ -134,7 +140,7 @@ src/
   lib.rs, checker.rs, verdict.rs, error.rs    the API (exists)
   context.rs      the state of one check: arenas, memo tables, budget
   schema.rs       load: nodes, typed keywords, locations (exists)
-  schema/         its two steps: parse, and link for the references (exists)
+  schema/         its two steps, parse and link, and the meta-schemas of the draft (exists)
   term.rs         terms, variables, c-references, one-level negation
   lower.rs        schema graph to terms: rewrites and scenarios
   normalize.rs    the engine
@@ -150,7 +156,7 @@ harness/          the benchmark runner (exists)
 
 Each step goes through all four stages for the keywords it adds, and lands as its own pull request. The benchmark comment shows what the step decides, and its table of reasons for `Unknown` shows what blocks the most checks.
 
-1. **Schema graph:** nodes, locations, errors, references through `referencing`. Done.
+1. **Schema graph:** nodes, locations, errors, references. Done.
 2. **Engine skeleton:** context, budget, terms, variables, lazy negation and fast mode; `type`, booleans, `null`, the connectives, `$ref` with recursion. First `Yes` and `No`.
 3. **Numbers.**
 4. **Strings:** the `language` module, then patterns, formats and lengths in the engine.
@@ -162,5 +168,6 @@ Each step goes through all four stages for the keywords it adds, and lands as it
 ## Not planned
 
 - Drafts other than 2020-12.
+- Fetching documents, or taking documents next to the two schemas.
 - Explanations beyond the counterexample.
 - For now: other regex dialects, a command line tool, bindings for other languages.

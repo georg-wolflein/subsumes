@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use subsumes::Checker;
 
 use crate::results::{Direction, Outcome, Record};
@@ -26,7 +26,7 @@ pub fn run(corpus: &Path) -> Result<Vec<Record>, String> {
             corpus.display()
         ));
     }
-    let checker = checker(corpus)?;
+    let checker = Checker::new();
     let mut records = Vec::new();
     for case in cases(corpus)? {
         let folder = corpus.join(&case);
@@ -52,16 +52,6 @@ pub fn run(corpus: &Path) -> Result<Vec<Record>, String> {
         }
     }
     Ok(records)
-}
-
-/// A checker that knows every document the schemas of the corpus refer to.
-fn checker(corpus: &Path) -> Result<Checker, String> {
-    let resources: Map<String, Value> = json(&corpus.join("resources.json"))?;
-    Ok(resources
-        .into_iter()
-        .fold(Checker::new(), |checker, (uri, document)| {
-            checker.resource(&uri, document)
-        }))
 }
 
 /// The cases of the corpus: every folder that holds a `case.json`, as its path inside the

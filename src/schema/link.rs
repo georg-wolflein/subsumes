@@ -1,157 +1,43 @@
 //! The second step of loading: every reference resolved to a node.
 //!
-//! Resolution is the work of the `referencing` crate, and this module is the only one that
-//! uses it for that.
+//! A reference names a resource and a place in it. The resource is the one that the reference
+//! stands in, another one of the same schema, named by its URI, or a meta-schema of the draft.
+//! The place is the fragment: nothing for the resource itself, a JSON Pointer, or the name of
+//! an anchor.
+//!
+//! Resolution is static. A `$dynamicRef` gets the target that a `$ref` would have, and what
+//! the dynamic scope makes of it is for the engine to say.
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::borrow::Cow;
 
-use referencing::{Draft, Registry, RegistryBuilder, Resolver, ResourceRef, Retrieve, Uri};
 use serde_json::Value;
 
-use super::parse::{Builder, Reference, ReferenceKeyword, Unlinked};
-use super::{DynamicReference, Graph, NodeId, Origin, Schema, location, push_token};
+use super::parse::{Builder, Reference, ReferenceKeyword, Unlinked, index, resolve};
+use super::{DynamicReference, Graph, NodeId, Origin, Schema, meta, push_token};
 use crate::{Error, Side};
 
-/// The URI of A and of B during a check. A schema without an `$id` has no URI of its own, and
-/// each of the two has its own registry, so both can have this one.
-const ROOT: &str = "json-schema:///";
-
-/// The documents given to a checker, indexed once for all its checks.
-#[derive(Debug, Clone)]
-pub(crate) struct Documents {
-    /// The documents, on top of the meta-schemas that `referencing` ships.
-    registry: Registry<'static>,
-    /// The documents that the given ones reference and that nobody gave.
-    missing: Vec<String>,
-}
-
-impl Documents {
-    /// # Errors
-    ///
-    /// When a URI is not one, or `referencing` cannot index a document.
-    pub(crate) fn new(documents: &BTreeMap<String, Arc<Value>>) -> Result<Self, Error> {
-        let asked = Asked::default();
-        let pairs = documents
-            .iter()
-            .map(|(uri, document)| (uri, Arc::clone(document)));
-        let registry = referencing::SPECIFICATIONS
-            .extend(pairs)
-            .and_then(|builder| prepare(builder, &asked))
-            .map_err(|error| Error::InvalidDocuments {
-                message: error.to_string(),
-            })?;
-        Ok(Self {
-            registry,
-            missing: asked.take(),
-        })
-    }
-
-    /// What `schema` can refer to as one of the two schemas of a check.
-    ///
-    /// # Errors
-    ///
-    /// When `referencing` cannot index the schema. [`parse`](super::parse) catches what is
-    /// known to cause that, with its location, so it should run first.
-    pub(crate) fn scope<'x>(&'x self, side: Side, schema: &'x Value) -> Result<Scope<'x>, Error> {
-        let asked = Asked::default();
-        let registry = self
-            .registry
-            .add(ROOT, schema)
-            .and_then(|builder| prepare(builder, &asked))
-            .map_err(|error| Error::InvalidKeyword {
-                schema: side,
-                location: "#".to_owned(),
-                message: error.to_string(),
-            })?;
-        Ok(Scope {
-            registry,
-            missing: asked.take(),
-            documents: self,
-        })
-    }
-}
-
-/// What one of the two schemas can refer to: itself, the documents of the checker and the
-/// meta-schemas. A and B each have their own, because two versions of a schema usually share
-/// an `$id`.
-#[derive(Debug)]
-pub(crate) struct Scope<'x> {
-    registry: Registry<'x>,
-    /// The documents that the schema references and that nobody gave.
-    missing: Vec<String>,
-    documents: &'x Documents,
-}
-
-impl Scope<'_> {
-    /// Whether nobody gave the document with this URI.
-    fn lacks(&self, uri: &str) -> bool {
-        let mut missing = self.missing.iter().chain(&self.documents.missing);
-        missing.any(|missing| missing == uri)
-    }
-}
-
-/// Nothing is fetched. `referencing` asks for every document that is referenced and not given;
-/// each gets `true` in its place and its URI is noted, so that a reference to it can be
-/// reported where it stands.
-#[derive(Debug, Default, Clone)]
-struct Asked(Arc<Mutex<Vec<String>>>);
-
-impl Asked {
-    fn take(&self) -> Vec<String> {
-        std::mem::take(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner))
-    }
-}
-
-impl Retrieve for Asked {
-    fn retrieve(
-        &self,
-        uri: &Uri<String>,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let mut asked = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        asked.push(uri.as_str().to_owned());
-        Ok(Value::Bool(true))
-    }
-}
-
-fn prepare<'x>(
-    builder: RegistryBuilder<'x>,
-    asked: &Asked,
-) -> Result<Registry<'x>, referencing::Error> {
-    builder
-        .draft(Draft::Draft202012)
-        .retrieve_known_draft_meta_schemas(false)
-        .retriever(asked.clone())
-        .prepare()
-}
-
 impl<'a> Unlinked<'a> {
-    /// Resolves every reference, and parses every document that a reference leads to.
-    ///
-    /// A schema needs its scope only if it [has references](Self::has_references).
+    /// Resolves every reference, and parses every meta-schema that a reference leads to.
     ///
     /// # Errors
     ///
-    /// When a reference resolves to nothing, or a document it leads to is not a valid schema.
-    pub(crate) fn link<'g>(
-        self,
-        a: Option<&'g Scope<'g>>,
-        b: Option<&'g Scope<'g>>,
-    ) -> Result<Graph<'g>, Error>
-    where
-        'a: 'g,
-    {
-        let mut linker = Linker {
-            builder: self.builder,
-            scopes: [a, b],
-            resolvers: HashMap::new(),
-        };
-        // Parsing a document adds its references to the end of the list.
+    /// When a reference resolves to nothing, or when it points to a value that is no schema.
+    pub(crate) fn link(self) -> Result<Graph<'a>, Error> {
+        let mut builder = self.builder;
+        // Parsing a meta-schema adds its references to the end of the list.
         let mut next = 0;
-        while let Some(&reference) = linker.builder.references.get(next) {
+        while let Some(&reference) = builder.references.get(next) {
             next += 1;
-            let target = linker.resolve(reference)?;
-            let node = &mut linker.builder.nodes[reference.node.index()];
+            let Some(target) = builder.target(reference)? else {
+                let mut location = builder.location(reference.node);
+                push_token(&mut location, reference.keyword.name());
+                return Err(Error::UnresolvedReference {
+                    schema: builder.nodes[reference.node.index()].side,
+                    location,
+                    reference: reference.reference.to_owned(),
+                });
+            };
+            let node = &mut builder.nodes[reference.node.index()];
             if let Schema::Object(keywords) = &mut node.schema {
                 match reference.keyword {
                     ReferenceKeyword::Ref => keywords.reference = Some(target),
@@ -165,168 +51,184 @@ impl<'a> Unlinked<'a> {
             }
         }
         Ok(Graph {
-            nodes: linker.builder.nodes,
+            nodes: builder.nodes,
             a: self.a,
             b: self.b,
         })
     }
 }
 
-struct Linker<'g> {
-    builder: Builder<'g>,
-    /// The scope of A and that of B.
-    scopes: [Option<&'g Scope<'g>>; 2],
-    /// The resolver of every node that begins a resource, once it was needed.
-    resolvers: HashMap<NodeId, Resolver<'g>>,
-}
-
-impl<'g> Linker<'g> {
-    /// The scope of a side. Without one, none of its references resolves.
-    fn scope(&self, reference: Reference) -> Result<&'g Scope<'g>, Error> {
-        let side = self.builder.nodes[reference.node.index()].side;
-        let scope = match side {
-            Side::A => self.scopes[0],
-            Side::B => self.scopes[1],
+impl<'a> Builder<'a> {
+    /// The node that a reference points to, or `None` if it points to nothing.
+    fn target(&mut self, reference: Reference<'a>) -> Result<Option<NodeId>, Error> {
+        let node = &self.nodes[reference.node.index()];
+        let (side, own) = (node.side, node.resource);
+        let (resource, fragment) = reference
+            .reference
+            .split_once('#')
+            .unwrap_or((reference.reference, ""));
+        let resource = if resource.is_empty() {
+            own
+        } else {
+            let Some(resource) = self.resource(side, own, resource)? else {
+                return Ok(None);
+            };
+            resource
         };
-        scope.ok_or_else(|| Error::UnresolvedReference {
-            schema: side,
-            location: self.location(reference.node, reference.keyword.name()),
-            reference: reference.reference.to_owned(),
-        })
+        let Some(fragment) = percent_decoded(fragment) else {
+            return Ok(None);
+        };
+        if fragment.is_empty() {
+            Ok(Some(resource))
+        } else if fragment.starts_with('/') {
+            self.at_pointer(side, resource, &fragment)
+        } else {
+            Ok(self.anchors.get(&(resource, &*fragment)).copied())
+        }
     }
 
-    /// The node that a reference points to.
-    fn resolve(&mut self, reference: Reference<'g>) -> Result<NodeId, Error> {
-        let node = &self.builder.nodes[reference.node.index()];
-        let (side, resource) = (node.side, node.resource);
-        let scope = self.scope(reference)?;
-        let resolver = self.resolver(scope, resource)?;
-        let resolved = resolver
-            .lookup(reference.reference)
-            .ok()
-            .filter(|resolved| !scope.lacks(resolved.resolver().base_uri().as_str()));
-        let Some(resolved) = resolved else {
-            return Err(Error::UnresolvedReference {
-                schema: side,
-                location: self.location(reference.node, reference.keyword.name()),
-                reference: reference.reference.to_owned(),
-            });
+    /// The node that begins the resource which a URI reference names, where the reference
+    /// stands in the resource `own`.
+    fn resource(
+        &mut self,
+        side: Side,
+        own: NodeId,
+        reference: &str,
+    ) -> Result<Option<NodeId>, Error> {
+        let base = &self.bases[&own];
+        let Some(uri) = resolve(base, reference) else {
+            return Ok(None);
         };
-        let target = resolved.contents();
-        if let Some(node) = self.builder.known(side, target) {
-            return Ok(node);
+        // A resource in a place where the draft puts no schema is in no map, but a reference
+        // inside it can still name it.
+        if uri.as_str() == base.as_str() {
+            return Ok(Some(own));
         }
-
-        // The target is in a document that is not parsed yet, or in a place where the draft
-        // puts no schema. First parse the resource around it, as a whole.
-        let base = resolved.resolver().base_uri();
-        let within = scope.registry.resolver(Uri::clone(&base));
-        if let Ok(resource) = within.lookup("")
-            && self.builder.known(side, resource.contents()).is_none()
-        {
-            let origin = Origin::Reference(base.as_str().to_owned());
-            let root = self.builder.tree(side, resource.contents(), origin)?;
-            self.resolvers.insert(root, within.clone());
-            if let Some(node) = self.builder.known(side, target) {
-                return Ok(node);
-            }
+        if let Some(&resource) = self.resources[index(side)].get(uri.as_str()) {
+            return Ok(Some(resource));
         }
-        let origin = Origin::Reference(absolute(&resolver, reference.reference));
-        let node = self.builder.tree(side, target, origin)?;
-        self.resolvers.insert(node, within);
-        Ok(node)
+        let Some(document) = meta::document(uri.as_str()) else {
+            return Ok(None);
+        };
+        let origin = Origin::Reference(uri.as_str().to_owned());
+        self.document(side, document, origin, uri).map(Some)
     }
 
-    /// The resolver for the references of a resource: its base URI is that of the resource.
-    fn resolver(&mut self, scope: &'g Scope<'g>, resource: NodeId) -> Result<Resolver<'g>, Error> {
-        // The resources around this one that have no resolver yet, from the inside out.
-        let mut pending = Vec::new();
-        let mut current = resource;
-        let mut resolver = loop {
-            if let Some(resolver) = self.resolvers.get(&current) {
-                break resolver.clone();
-            }
-            pending.push(current);
-            let node = &self.builder.nodes[current.index()];
-            match node.origin {
-                Origin::Child { parent, .. } => {
-                    current = self.builder.nodes[parent.index()].resource;
-                }
-                // The root of A or of B. The target of a reference gets its resolver when
-                // it is parsed.
-                Origin::Root | Origin::Reference(_) => {
-                    let root = referencing::uri::from_str(ROOT).expect("the root URI is valid");
-                    break scope.registry.resolver(root);
-                }
-            }
-        };
-        for resource in pending.into_iter().rev() {
-            let value = self.builder.values[resource.index()];
-            resolver = resolver
-                .in_subresource(ResourceRef::new(value, Draft::Draft202012))
-                .map_err(|error| Error::InvalidKeyword {
-                    schema: self.builder.nodes[resource.index()].side,
-                    location: self.location(resource, "$id"),
-                    message: error.to_string(),
-                })?;
-            self.resolvers.insert(resource, resolver.clone());
+    /// The node at a JSON Pointer inside a resource, or `None` if the pointer leads nowhere.
+    fn at_pointer(
+        &mut self,
+        side: Side,
+        resource: NodeId,
+        pointer: &str,
+    ) -> Result<Option<NodeId>, Error> {
+        let tokens = || pointer[1..].split('/');
+        let mut value = self.values[resource.index()];
+        // The nearest node on the way, and whether the way ends at it.
+        let (mut above, mut ends_there) = (resource, false);
+        for token in tokens() {
+            let Some(next) = step(value, token) else {
+                return Ok(None);
+            };
+            value = next;
+            let node = self.known(side, value);
+            (above, ends_there) = (node.unwrap_or(above), node.is_some());
         }
-        Ok(resolver)
-    }
+        if ends_there {
+            return Ok(Some(above));
+        }
 
-    /// The location of a keyword of a node.
-    fn location(&self, node: NodeId, keyword: &str) -> String {
-        let nodes = &self.builder.nodes;
-        let mut location = location(nodes, &nodes[node.index()].origin);
-        push_token(&mut location, keyword);
-        location
+        // The target is in a place where the draft puts no schema, so it is parsed only now.
+        // An `$id` between the nearest node and the target does not count either.
+        let mut location = self.location(resource);
+        for token in tokens() {
+            // Every token was taken a moment ago, so it has no escape that is none.
+            push_token(&mut location, &unescaped(token).unwrap_or_default());
+        }
+        let around = self.nodes[above.index()].resource;
+        self.subtree(side, value, Origin::Reference(location), around)
+            .map(Some)
     }
 }
 
-/// The URI that a reference names, for the location of a target that no node holds yet.
-fn absolute(resolver: &Resolver, reference: &str) -> String {
-    let (document, fragment) = match reference.strip_prefix('#') {
-        Some(fragment) => ("", fragment),
-        None => reference.rsplit_once('#').unwrap_or((reference, "")),
-    };
-    let base = resolver.base_uri();
-    let document = if document.is_empty() {
-        base.as_str().to_owned()
-    } else {
-        resolver
-            .resolve_uri(&base.borrow(), document)
-            .map_or_else(|_| document.to_owned(), |uri| uri.as_str().to_owned())
-    };
-    if document == ROOT {
-        format!("#{fragment}")
-    } else {
-        format!("{document}#{fragment}")
+/// One step of a JSON Pointer, as RFC 6901 reads it.
+fn step<'a>(value: &'a Value, token: &str) -> Option<&'a Value> {
+    match value {
+        Value::Object(map) => map.get(&*unescaped(token)?),
+        Value::Array(items) => {
+            // An index is `0` or a number without a leading zero, and it has no sign.
+            let digits = token.bytes().all(|byte| byte.is_ascii_digit());
+            if !digits || (token.starts_with('0') && token != "0") {
+                return None;
+            }
+            items.get(token.parse::<usize>().ok()?)
+        }
+        _ => None,
     }
+}
+
+/// A token of a JSON Pointer without its escapes: `~1` is `/` and `~0` is `~`. `None` if a
+/// `~` begins neither.
+fn unescaped(token: &str) -> Option<Cow<'_, str>> {
+    if !token.contains('~') {
+        return Some(Cow::Borrowed(token));
+    }
+    let mut plain = String::with_capacity(token.len());
+    let mut characters = token.chars();
+    while let Some(character) = characters.next() {
+        plain.push(match character {
+            '~' => match characters.next()? {
+                '0' => '~',
+                '1' => '/',
+                _ => return None,
+            },
+            other => other,
+        });
+    }
+    Some(Cow::Owned(plain))
+}
+
+/// A fragment with its percent-encoded bytes decoded, or `None` if they are not UTF-8. A `%`
+/// that begins no encoded byte stands for itself, as in the many references that are written
+/// without any encoding.
+fn percent_decoded(fragment: &str) -> Option<Cow<'_, str>> {
+    if !fragment.contains('%') {
+        return Some(Cow::Borrowed(fragment));
+    }
+    let digit = |byte: Option<&u8>| char::from(*byte?).to_digit(16);
+    let bytes = fragment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut position = 0;
+    while let Some(&byte) = bytes.get(position) {
+        let digits = (
+            digit(bytes.get(position + 1)),
+            digit(bytes.get(position + 2)),
+        );
+        if let (b'%', (Some(high), Some(low))) = (byte, digits) {
+            decoded.push(u8::try_from(high * 16 + low).expect("two hex digits are one byte"));
+            position += 3;
+        } else {
+            decoded.push(byte);
+            position += 1;
+        }
+    }
+    String::from_utf8(decoded).ok().map(Cow::Owned)
 }
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
 
-    use super::super::{Keywords, Type, parse};
+    use referencing::{Draft, Registry, Resolver, ResourceRef};
+    use serde_json::{Map, json};
+
+    use super::super::parse::{ROOT, parse};
+    use super::super::{Keywords, Type};
     use super::*;
 
-    /// Loads A and B with the given documents, and hands the graph to `inspect`.
-    fn load<R>(
-        a: &Value,
-        b: &Value,
-        documents: &[(&str, Value)],
-        inspect: impl FnOnce(&Graph) -> R,
-    ) -> Result<R, Error> {
-        let documents = documents
-            .iter()
-            .map(|(uri, document)| ((*uri).to_owned(), Arc::new(document.clone())))
-            .collect();
-        let documents = Documents::new(&documents)?;
-        let unlinked = parse(a, b)?;
-        let scope_a = documents.scope(Side::A, a)?;
-        let scope_b = documents.scope(Side::B, b)?;
-        let graph = unlinked.link(Some(&scope_a), Some(&scope_b))?;
+    /// Loads A and B, and hands the graph to `inspect`.
+    fn load<R>(a: &Value, b: &Value, inspect: impl FnOnce(&Graph) -> R) -> Result<R, Error> {
+        let graph = parse(a, b)?.link()?;
         Ok(inspect(&graph))
     }
 
@@ -349,8 +251,13 @@ mod tests {
         target(graph, *property)
     }
 
-    fn unresolved(a: &Value, documents: &[(&str, Value)]) -> (Side, String, String) {
-        match load(a, &json!(true), documents, |_| ()) {
+    /// Where the `$ref` of A leads.
+    fn root_target(schema: &Value) -> Result<String, Error> {
+        load(schema, &json!(true), |graph| target(graph, graph.a))
+    }
+
+    fn unresolved(a: &Value) -> (Side, String, String) {
+        match load(a, &json!(true), |_| ()) {
             Err(Error::UnresolvedReference {
                 schema,
                 location,
@@ -360,9 +267,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_reference_leads_to_the_node_of_its_target() {
-        let schema = json!({
+    fn pointers_and_anchors() -> Value {
+        json!({
             "properties": {
                 "root": {"$ref": "#"},
                 "later": {"$ref": "#/$defs/later"},
@@ -374,8 +280,12 @@ mod tests {
                 "later": {"items": {"$anchor": "here"}},
                 "a/b c": {},
             },
-        });
-        load(&schema, &json!(true), &[], |graph| {
+        })
+    }
+
+    #[test]
+    fn a_reference_leads_to_the_node_of_its_target() {
+        load(&pointers_and_anchors(), &json!(true), |graph| {
             assert_eq!(property_target(graph, "root"), "#");
             assert_eq!(property_target(graph, "later"), "#/$defs/later");
             assert_eq!(property_target(graph, "nested"), "#/$defs/later/items");
@@ -388,15 +298,15 @@ mod tests {
         .unwrap();
     }
 
-    #[test]
-    fn a_reference_resolves_against_the_id_in_scope() {
-        let schema = json!({
+    fn resources_in_one_schema() -> Value {
+        json!({
             "$id": "https://example.com/root.json",
             "properties": {
                 "by_id": {"$ref": "https://example.com/root.json#/$defs/a"},
                 "relative": {"$ref": "inner.json"},
                 "into": {"$ref": "inner.json#/$defs/b"},
                 "anchor": {"$ref": "inner.json#here"},
+                "itself": {"$ref": ""},
             },
             "$defs": {
                 "a": {},
@@ -406,14 +316,19 @@ mod tests {
                     "$defs": {"b": {"$anchor": "here"}},
                 },
             },
-        });
-        load(&schema, &json!(true), &[], |graph| {
+        })
+    }
+
+    #[test]
+    fn a_reference_resolves_against_the_id_in_scope() {
+        load(&resources_in_one_schema(), &json!(true), |graph| {
             assert_eq!(property_target(graph, "by_id"), "#/$defs/a");
             assert_eq!(property_target(graph, "relative"), "#/$defs/inner");
             assert_eq!(property_target(graph, "into"), "#/$defs/inner/$defs/b");
             assert_eq!(property_target(graph, "anchor"), "#/$defs/inner/$defs/b");
+            assert_eq!(property_target(graph, "itself"), "#");
             // Inside the inner resource a pointer starts at its root.
-            let inner = object(graph, object(graph, graph.a).properties[3].1).reference;
+            let inner = object(graph, object(graph, graph.a).properties[4].1).reference;
             assert_eq!(target(graph, inner.unwrap()), "#/$defs/inner/$defs/b");
         })
         .unwrap();
@@ -425,7 +340,7 @@ mod tests {
         let a = json!({"$id": id, "$ref": format!("{id}#/$defs/x"), "$defs": {"x": {"type": "string"}}});
         let b =
             json!({"$id": id, "$ref": format!("{id}#/$defs/x"), "$defs": {"x": {"type": "null"}}});
-        load(&a, &b, &[], |graph| {
+        load(&a, &b, |graph| {
             let of_a = object(graph, graph.a).reference.unwrap();
             let of_b = object(graph, graph.b).reference.unwrap();
             assert_eq!(
@@ -438,105 +353,43 @@ mod tests {
         .unwrap();
     }
 
-    #[test]
-    fn a_reference_to_a_document_of_the_checker_parses_that_document() {
-        let documents = [(
-            "https://example.com/defs.json",
-            json!({"$defs": {"name": {"type": "string"}, "other": {"$ref": "#/$defs/name"}}}),
-        )];
-        let a = json!({"$ref": "https://example.com/defs.json#/$defs/other"});
-        let b = json!({"items": {"$ref": "https://example.com/defs.json"}});
-        load(&a, &b, &documents, |graph| {
-            let other = object(graph, graph.a).reference.unwrap();
-            assert_eq!(
-                graph.location(other),
-                "https://example.com/defs.json#/$defs/other"
-            );
-            assert_eq!(
-                target(graph, other),
-                "https://example.com/defs.json#/$defs/name"
-            );
-            // B reaches the same document and gets nodes of its own for it.
-            let items = object(graph, graph.b).items.unwrap();
-            let document = object(graph, items).reference.unwrap();
-            assert_eq!(graph.location(document), "https://example.com/defs.json#");
-            assert_eq!(graph.node(document).side, Side::B);
-            assert_ne!(graph.node(other).resource, document);
-            // A, its document with two definitions, B with its items, and the document again.
-            assert_eq!(graph.len(), 1 + 3 + 2 + 3);
+    /// A schema that carries the documents it references, as bundling leaves it.
+    fn bundled() -> Value {
+        json!({
+            "properties": {
+                "other": {"$ref": "https://example.com/defs.json#/$defs/other"},
+                "directory": {"$ref": "https://example.com/retrieved.json"},
+            },
+            "$defs": {
+                "defs": {
+                    "$id": "https://example.com/defs.json",
+                    "$defs": {"name": {"type": "string"}, "other": {"$ref": "#/$defs/name"}},
+                },
+                // The URI that a document gives itself is the base of its references.
+                "retrieved": {"$id": "https://example.com/retrieved.json", "$ref": "base/"},
+                "base": {"$id": "https://example.com/base/", "$ref": "child"},
+                "child": {"$id": "https://example.com/base/child"},
+                "decoy": {"$id": "https://example.com/child"},
+            },
         })
-        .unwrap();
     }
 
     #[test]
-    fn a_part_of_a_document_that_was_reached_before_is_not_parsed_again() {
-        let documents = [(
-            "https://example.com/outer.json",
-            json!({"$defs": {"inner": {"$id": "inner.json", "type": "string"}}}),
-        )];
-        let schema = json!({"allOf": [
-            {"$ref": "https://example.com/inner.json"},
-            {"$ref": "https://example.com/outer.json"},
-        ]});
-        load(&schema, &json!(true), &documents, |graph| {
-            let branches = &object(graph, graph.a).all_of;
-            assert_eq!(
-                target(graph, branches[0]),
-                "https://example.com/inner.json#"
-            );
-            assert_eq!(
-                target(graph, branches[1]),
-                "https://example.com/outer.json#"
-            );
-            // A, its two branches, the inner resource, the outer document, and B.
-            assert_eq!(graph.len(), 6);
+    fn a_bundled_document_is_found_by_its_uri() {
+        load(&bundled(), &json!(true), |graph| {
+            assert_eq!(property_target(graph, "other"), "#/$defs/defs/$defs/other");
+            let other = object(graph, graph.a).properties[1].1;
+            let other = object(graph, other).reference.unwrap();
+            assert_eq!(target(graph, other), "#/$defs/defs/$defs/name");
+
+            assert_eq!(property_target(graph, "directory"), "#/$defs/retrieved");
+            let directory = object(graph, graph.a).properties[0].1;
+            let retrieved = object(graph, directory).reference.unwrap();
+            assert_eq!(target(graph, retrieved), "#/$defs/base");
+            let base = object(graph, retrieved).reference.unwrap();
+            assert_eq!(target(graph, base), "#/$defs/child");
         })
         .unwrap();
-    }
-
-    #[test]
-    fn a_document_is_read_only_when_a_reference_leads_to_it() {
-        let draft_07 = "http://json-schema.org/draft-07/schema#";
-        let documents = [
-            (
-                "https://example.com/broken.json",
-                json!({"$defs": {"a": {"minLength": "1"}}}),
-            ),
-            ("https://example.com/old.json", json!({"$schema": draft_07})),
-            (
-                "https://example.com/dangling.json",
-                json!({"$ref": "nowhere.json"}),
-            ),
-        ];
-        assert!(load(&json!({}), &json!({}), &documents, |_| ()).is_ok());
-
-        let broken = json!({"$ref": "https://example.com/broken.json"});
-        assert_eq!(
-            load(&json!(true), &broken, &documents, |_| ()).unwrap_err(),
-            Error::InvalidKeyword {
-                schema: Side::B,
-                location: "https://example.com/broken.json#/$defs/a/minLength".to_owned(),
-                message: "must be a non-negative integer".to_owned(),
-            }
-        );
-        let old = json!({"$ref": "https://example.com/old.json"});
-        assert_eq!(
-            load(&old, &json!(true), &documents, |_| ()).unwrap_err(),
-            Error::UnsupportedDialect {
-                schema: Side::A,
-                location: "https://example.com/old.json#/$schema".to_owned(),
-                dialect: draft_07.to_owned(),
-            }
-        );
-        let dangling = json!({"$ref": "https://example.com/dangling.json"});
-        assert_eq!(
-            unresolved(&dangling, &documents),
-            (
-                Side::A,
-                "https://example.com/dangling.json#/$ref".to_owned(),
-                "nowhere.json".to_owned()
-            )
-        );
     }
 
     #[test]
@@ -565,19 +418,29 @@ mod tests {
                 json!({"$id": "https://example.com/a.json", "$ref": "b.json"}),
                 "#/$ref",
             ),
+            (
+                json!({"$ref": "https://json-schema.org/draft/2019-09/schema"}),
+                "#/$ref",
+            ),
+            // An anchor belongs to its resource and to no other.
+            (
+                json!({"$ref": "#here", "$defs": {"a": {"$id": "a.json", "$anchor": "here"}}}),
+                "#/$ref",
+            ),
+            (json!({"$ref": "urn:example:a#/x", "x": {}}), "#/$ref"),
         ];
         for (schema, location) in cases {
-            let (side, found, _) = unresolved(&schema, &[]);
+            let (side, found, _) = unresolved(&schema);
             assert_eq!((side, found.as_str()), (Side::A, location), "{schema}");
         }
-        let (_, _, reference) = unresolved(&json!({"$ref": "missing.json#/a"}), &[]);
+        let (_, _, reference) = unresolved(&json!({"$ref": "missing.json#/a"}));
         assert_eq!(reference, "missing.json#/a");
     }
 
     #[test]
     fn the_meta_schema_of_the_draft_is_known() {
         let schema = json!({"$ref": "https://json-schema.org/draft/2020-12/schema"});
-        load(&schema, &json!(true), &[], |graph| {
+        load(&schema, &schema, |graph| {
             let meta = object(graph, graph.a).reference.unwrap();
             assert_eq!(
                 graph.location(meta),
@@ -590,6 +453,14 @@ mod tests {
                 target(graph, applicator),
                 "https://json-schema.org/draft/2020-12/meta/applicator#"
             );
+            // B has nodes of its own for it.
+            let of_b = object(graph, graph.b).reference.unwrap();
+            assert_ne!(of_b, meta);
+            assert_eq!(
+                (graph.node(meta).side, graph.node(of_b).side),
+                (Side::A, Side::B)
+            );
+            assert_eq!(graph.location(of_b), graph.location(meta));
         })
         .unwrap();
     }
@@ -600,7 +471,7 @@ mod tests {
             "$dynamicAnchor": "node",
             "items": {"$dynamicRef": "#node"},
         });
-        load(&schema, &json!(true), &[], |graph| {
+        load(&schema, &json!(true), |graph| {
             let items = object(graph, object(graph, graph.a).items.unwrap());
             assert_eq!(
                 items.dynamic_reference,
@@ -614,35 +485,335 @@ mod tests {
         .unwrap();
     }
 
+    /// Both resources have a dynamic anchor of the same name, and the reference names one.
+    fn dynamic_anchors() -> Value {
+        json!({
+            "$id": "https://example.com/root",
+            "$dynamicAnchor": "node",
+            "$ref": "https://example.com/list#node",
+            "items": {"$dynamicRef": "list#node"},
+            "$defs": {
+                "list": {"$id": "https://example.com/list", "$dynamicAnchor": "node"},
+            },
+        })
+    }
+
+    #[test]
+    fn a_reference_to_a_dynamic_anchor_is_resolved_like_any_other() {
+        // The dynamic scope would lead both references back to the root.
+        load(&dynamic_anchors(), &json!(true), |graph| {
+            assert_eq!(target(graph, graph.a), "#/$defs/list");
+            let items = object(graph, object(graph, graph.a).items.unwrap());
+            let first = items.dynamic_reference.unwrap().target;
+            assert_eq!(graph.location(first), "#/$defs/list");
+        })
+        .unwrap();
+    }
+
+    fn targets_that_are_no_subschemas() -> Value {
+        json!({
+            "$ref": "#/x-shared/name",
+            "x-shared": {
+                "name": {"properties": {"first": {"$ref": "#/x-shared/text"}}},
+                "text": {},
+            },
+            "$defs": {
+                "inner": {
+                    "$id": "https://example.com/inner",
+                    "$ref": "#/x-inner/0",
+                    "x-inner": [{"$ref": "#/x-inner/1"}, {"$anchor": "unseen"}],
+                },
+            },
+        })
+    }
+
     #[test]
     fn a_target_where_the_draft_puts_no_schema_is_parsed_when_referenced() {
-        let schema = json!({
-            "$ref": "#/x-shared/name",
-            "x-shared": {"name": {"properties": {"first": {"$ref": "#/x-shared/text"}}}, "text": {}},
-        });
-        load(&schema, &json!(true), &[], |graph| {
+        load(&targets_that_are_no_subschemas(), &json!(true), |graph| {
             let name = object(graph, graph.a).reference.unwrap();
             assert_eq!(graph.location(name), "#/x-shared/name");
+            assert_eq!(graph.node(name).resource, graph.a);
             let first = object(graph, name).properties[0].1;
             assert_eq!(graph.location(first), "#/x-shared/name/properties/first");
+            // A pointer in it still starts at the root of the resource.
             assert_eq!(target(graph, first), "#/x-shared/text");
+
+            let mut nodes = (0..graph.len()).map(NodeId::new);
+            let inner = nodes
+                .find(|&node| graph.location(node) == "#/$defs/inner")
+                .unwrap();
+            let first = object(graph, inner).reference.unwrap();
+            assert_eq!(graph.location(first), "#/$defs/inner/x-inner/0");
+            assert_eq!(graph.node(first).resource, inner);
+            assert_eq!(target(graph, first), "#/$defs/inner/x-inner/1");
         })
         .unwrap();
 
         let bad = json!({"$ref": "#/x-shared", "x-shared": 1});
         assert_eq!(
-            load(&bad, &json!(true), &[], |_| ()).unwrap_err(),
+            load(&bad, &json!(true), |_| ()).unwrap_err(),
             Error::InvalidKeyword {
                 schema: Side::A,
                 location: "#/x-shared".to_owned(),
                 message: "must be a schema: an object or a boolean".to_owned(),
             }
         );
+        // What such a value declares is not looked for, so no reference can name it.
+        let unseen = json!({"$ref": "#/x/0", "x": [{"$ref": "#unseen"}, {"$anchor": "unseen"}]});
+        assert_eq!(unresolved(&unseen).1, "#/x/0/$ref");
     }
 
     #[test]
-    fn a_uri_that_is_none_makes_the_documents_unusable() {
-        let error = load(&json!({}), &json!({}), &[("not a uri", json!({}))], |_| ()).unwrap_err();
-        assert!(matches!(error, Error::InvalidDocuments { .. }), "{error:?}");
+    fn a_fragment_is_decoded_before_it_is_read() {
+        let anchor = json!({"$ref": "#%78", "$defs": {"a": {"$anchor": "x"}}});
+        assert_eq!(root_target(&anchor).unwrap(), "#/$defs/a");
+        let pointer = json!({"$ref": "#%2F$defs%2Fx", "$defs": {"x": false}});
+        assert_eq!(root_target(&pointer).unwrap(), "#/$defs/x");
+        // `%25` is a percent sign, and what follows it is not decoded again.
+        let percent = json!({"$ref": "#/$defs/100%2541", "$defs": {"100%41": {}, "100A": {}}});
+        assert_eq!(root_target(&percent).unwrap(), "#/$defs/100%2541");
+        let tilde = json!({"$ref": "#/$defs/a~1b~0c", "$defs": {"a/b~c": {}}});
+        assert_eq!(root_target(&tilde).unwrap(), "#/$defs/a~1b~0c");
+    }
+
+    #[test]
+    fn a_pointer_is_read_as_strictly_as_it_is_defined() {
+        let cases = [
+            json!({"$ref": "#/allOf/00", "allOf": [false]}),
+            json!({"$ref": "#/allOf/+0", "allOf": [false]}),
+            json!({"$ref": "#/allOf/1", "allOf": [false]}),
+            json!({"$ref": "#/allOf/-", "allOf": [false]}),
+            json!({"$ref": "#/allOf/", "allOf": [false]}),
+            json!({"$ref": "#/$defs/~2", "$defs": {"~2": false}}),
+            json!({"$ref": "#/$defs/a~", "$defs": {"a~": false}}),
+            json!({"$ref": "#/type/x", "type": "string"}),
+            json!({"$ref": "#/$defs/%FF", "$defs": {"a": false}}),
+        ];
+        for schema in cases {
+            assert_eq!(unresolved(&schema).1, "#/$ref", "{schema}");
+        }
+        let mut branches = vec![json!(true); 10];
+        branches.push(json!({}));
+        let index = json!({"$ref": "#/allOf/10", "allOf": branches});
+        assert_eq!(root_target(&index).unwrap(), "#/allOf/10");
+        let empty_name = json!({"$ref": "#/$defs/", "$defs": {"": {}}});
+        assert_eq!(root_target(&empty_name).unwrap(), "#/$defs/");
+    }
+
+    #[test]
+    fn a_fragment_may_hold_what_a_uri_does_not_allow() {
+        let schema = json!({
+            "properties": {
+                "space": {"$ref": "#/$defs/item array"},
+                "letters": {"$ref": "#/$defs/Größe"},
+                "percent": {"$ref": "#/$defs/50%"},
+            },
+            "$defs": {"item array": {}, "Größe": {}, "50%": {}},
+        });
+        load(&schema, &json!(true), |graph| {
+            assert_eq!(property_target(graph, "space"), "#/$defs/item%20array");
+            assert_eq!(property_target(graph, "letters"), "#/$defs/Gr%C3%B6%C3%9Fe");
+            assert_eq!(property_target(graph, "percent"), "#/$defs/50%25");
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_referenced_value_may_be_nested_deeply() {
+        let mut deep = json!({});
+        for _ in 0..100_000 {
+            deep = Value::Object(Map::from_iter([("not".to_owned(), deep)]));
+        }
+        let schema = Value::Object(Map::from_iter([
+            ("$ref".to_owned(), json!("#/x")),
+            ("x".to_owned(), deep),
+        ]));
+        let nodes = load(&schema, &json!(true), |graph| graph.len()).unwrap();
+        assert_eq!(nodes, 100_003);
+        // Dropping a value this deep would recurse, which is no concern of this test.
+        std::mem::forget(schema);
+    }
+
+    #[test]
+    fn the_parts_of_a_fragment_are_read_as_their_rules_say() {
+        assert_eq!(unescaped("a~1b~0c~01").unwrap(), "a/b~c~1");
+        assert_eq!(unescaped("plain").unwrap(), "plain");
+        assert_eq!(unescaped("~"), None);
+        assert_eq!(unescaped("~x"), None);
+        assert_eq!(percent_decoded("a%20b%C3%A9").unwrap(), "a b\u{e9}");
+        assert_eq!(percent_decoded("100%").unwrap(), "100%");
+        assert_eq!(percent_decoded("%zz%4").unwrap(), "%zz%4");
+        assert_eq!(percent_decoded("%2541").unwrap(), "%41");
+        assert_eq!(percent_decoded("%FF"), None);
+    }
+
+    // The tests below hold this module against the `referencing` crate, which resolves
+    // references for the validator `jsonschema`.
+
+    /// The resolver of `referencing` for the references of a resource.
+    fn resolver<'r>(
+        builder: &Builder<'r>,
+        registry: &'r Registry<'r>,
+        resource: NodeId,
+    ) -> Option<Resolver<'r>> {
+        let root = |uri: &str| registry.resolver(referencing::uri::from_str(uri).unwrap());
+        let outer = match &builder.nodes[resource.index()].origin {
+            Origin::Root => root(ROOT),
+            Origin::Child { parent, .. } => {
+                resolver(builder, registry, builder.nodes[parent.index()].resource)?
+            }
+            Origin::Reference(uri) if !uri.contains('#') => root(uri),
+            // A resource in a place where the draft puts no schema, which the crate never
+            // enters.
+            Origin::Reference(_) => return None,
+        };
+        let value = builder.values[resource.index()];
+        outer
+            .in_subresource(ResourceRef::new(value, Draft::Draft202012))
+            .ok()
+    }
+
+    /// What `referencing` finds for a reference. Its lookup follows the dynamic scope, which
+    /// a static resolution must not, so the fragment is looked up from the resource that the
+    /// reference names: there the scope holds nothing else.
+    fn found_by_referencing<'r>(
+        registry: &'r Registry<'r>,
+        resolver: &Resolver<'r>,
+        reference: &str,
+    ) -> Option<&'r Value> {
+        let (resource, fragment) = reference.split_once('#').unwrap_or((reference, ""));
+        let base = resolver.base_uri();
+        let uri = if resource.is_empty() {
+            (*base).clone()
+        } else {
+            (*resolver.resolve_uri(&base.borrow(), resource).ok()?).clone()
+        };
+        let resolved = registry.resolver(uri).lookup(&format!("#{fragment}"));
+        resolved.ok().map(|resolved| resolved.contents())
+    }
+
+    /// The crate's copies of the meta-schemas declare a `$vocabulary` where the ones that
+    /// json-schema.org serves declare none. Nothing else differs.
+    fn without_vocabulary(meta_schema: &Value) -> Value {
+        let mut meta_schema = meta_schema.clone();
+        if let Value::Object(keywords) = &mut meta_schema {
+            keywords.remove("$vocabulary");
+        }
+        meta_schema
+    }
+
+    /// Resolves every reference of a schema with this module and with `referencing`. Returns
+    /// how many references both resolved to the same value, and every difference.
+    fn compared(schema: &Value) -> (usize, Vec<String>) {
+        let truth = Value::Bool(true);
+        let mut builder = match parse(schema, &truth) {
+            Ok(unlinked) => unlinked.builder,
+            Err(error) => return (0, vec![format!("is not parsed: {error}")]),
+        };
+        let registry = referencing::SPECIFICATIONS
+            .add(ROOT, schema)
+            .and_then(|registry| registry.draft(Draft::Draft202012).prepare());
+        let registry = match registry {
+            Ok(registry) => registry,
+            Err(error) => return (0, vec![format!("is not indexed by referencing: {error}")]),
+        };
+        let (mut same, mut differences) = (0, Vec::new());
+        let mut next = 0;
+        while let Some(&reference) = builder.references.get(next) {
+            next += 1;
+            let node = &builder.nodes[reference.node.index()];
+            let Some(resolver) = resolver(&builder, &registry, node.resource) else {
+                continue;
+            };
+            let theirs = found_by_referencing(&registry, &resolver, reference.reference);
+            let place = format!(
+                "{} to {}",
+                builder.location(reference.node),
+                reference.reference
+            );
+            match (builder.target(reference), theirs) {
+                (Ok(Some(ours)), Some(theirs)) => {
+                    let ours = builder.values[ours.index()];
+                    // Each of the two has its own copy of a meta-schema.
+                    let equal = std::ptr::eq(ours, theirs)
+                        || (builder.known(Side::A, theirs).is_none()
+                            && without_vocabulary(ours) == without_vocabulary(theirs));
+                    if equal {
+                        same += 1;
+                    } else {
+                        differences.push(format!("{place}: another value"));
+                    }
+                }
+                (Ok(None), None) => {}
+                (Ok(Some(ours)), None) => {
+                    let ours = builder.location(ours);
+                    differences.push(format!("{place}: only this library, {ours}"));
+                }
+                (Ok(None), Some(_)) => differences.push(format!("{place}: only referencing")),
+                (Err(error), _) => differences.push(format!("{place}: {error}")),
+            }
+        }
+        (same, differences)
+    }
+
+    #[test]
+    fn referencing_finds_the_same_targets() {
+        let schemas = [
+            (pointers_and_anchors(), 5),
+            (resources_in_one_schema(), 6),
+            (bundled(), 5),
+            (dynamic_anchors(), 2),
+            (targets_that_are_no_subschemas(), 4),
+        ];
+        for (schema, references) in schemas {
+            assert_eq!(compared(&schema), (references, Vec::new()), "{schema}");
+        }
+        // The meta-schema of the draft and the eight that it draws in.
+        let meta = json!({"$ref": "https://json-schema.org/draft/2020-12/schema"});
+        let (same, differences) = compared(&meta);
+        assert_eq!(differences, Vec::<String>::new());
+        assert!(same > 40, "{same}");
+    }
+
+    /// Every `a.json` and `b.json` of the corpus.
+    fn corpus_schemas(corpus: &Path) -> Vec<PathBuf> {
+        let (mut schemas, mut pending) = (Vec::new(), vec![corpus.to_owned()]);
+        while let Some(folder) = pending.pop() {
+            for entry in std::fs::read_dir(&folder).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.ends_with("a.json") || path.ends_with("b.json") {
+                    schemas.push(path);
+                }
+            }
+        }
+        schemas.sort();
+        schemas
+    }
+
+    #[test]
+    #[ignore = "needs the corpus in benchmark/, which `make corpus` downloads"]
+    fn referencing_finds_the_same_targets_in_the_corpus() {
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("benchmark");
+        let schemas = corpus_schemas(&corpus);
+        assert!(schemas.len() > 20_000, "{} schemas", schemas.len());
+        let mut references = 0;
+        let mut differences = BTreeMap::new();
+        for path in &schemas {
+            let text = std::fs::read_to_string(path).unwrap();
+            let schema: Value = serde_json::from_str(&text).unwrap();
+            let (same, found) = compared(&schema);
+            references += same;
+            if !found.is_empty() {
+                differences.insert(path.strip_prefix(&corpus).unwrap().to_owned(), found);
+            }
+        }
+        println!(
+            "{} schemas, {references} references with the same target",
+            schemas.len()
+        );
+        assert_eq!(differences, BTreeMap::new());
+        assert!(references > 100_000, "{references} references");
     }
 }

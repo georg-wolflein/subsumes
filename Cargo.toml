@@ -4,8 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-referencing = "0.61"
+fluent-uri = "0.4"
 serde_json = "1"
+
+[dev-dependencies]
+# Resolves references too, and the tests hold the library against it.
+referencing = "0.61"
 
 [workspace]
 members = ["harness"]

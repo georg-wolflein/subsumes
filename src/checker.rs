@@ -1,15 +1,11 @@
-use std::collections::BTreeMap;
-use std::sync::{Arc, OnceLock};
-
 use serde_json::Value;
 
-use crate::schema::{self, Documents};
-use crate::{Error, Reason, Side, Verdict};
+use crate::{Error, Reason, Side, Verdict, schema};
 
 /// The work budget of the Python version; to be set anew once there is an engine to measure.
 const DEFAULT_BUDGET: u64 = 500_000;
 
-/// The settings of a check: its work budget and the documents that references may point to.
+/// The settings of a check. So far that is its work budget.
 ///
 /// A checker does not change while it checks, so one can be shared between threads.
 ///
@@ -17,11 +13,9 @@ const DEFAULT_BUDGET: u64 = 500_000;
 /// use serde_json::json;
 /// use subsumes::Checker;
 ///
-/// let checker = Checker::new()
-///     .budget(100_000)
-///     .resource("https://example.com/name.json", json!({"type": "string"}));
+/// let checker = Checker::new().budget(100_000);
 ///
-/// let a = json!({"$ref": "https://example.com/name.json"});
+/// let a = json!({"type": "string"});
 /// let b = json!({"type": "string", "minLength": 1});
 /// let verdict = checker.subsumes(&a, &b)?;
 /// # Ok::<(), subsumes::Error>(())
@@ -29,19 +23,14 @@ const DEFAULT_BUDGET: u64 = 500_000;
 #[derive(Debug, Clone)]
 pub struct Checker {
     budget: u64,
-    resources: BTreeMap<String, Arc<Value>>,
-    /// The resources as the load stage needs them, indexed at the first check.
-    documents: OnceLock<Result<Documents, Error>>,
 }
 
 impl Checker {
-    /// A checker with the default work budget and no documents.
+    /// A checker with the default work budget.
     #[must_use]
     pub fn new() -> Self {
         Self {
             budget: DEFAULT_BUDGET,
-            resources: BTreeMap::new(),
-            documents: OnceLock::new(),
         }
     }
 
@@ -50,19 +39,6 @@ impl Checker {
     #[must_use]
     pub fn budget(mut self, steps: u64) -> Self {
         self.budget = steps;
-        self
-    }
-
-    /// Adds a document that a `$ref` in either schema may point to, under its URI. Nothing is
-    /// ever fetched: a reference resolves to the schema itself, to a document added here or to
-    /// a meta-schema of the draft.
-    ///
-    /// A document is read only when a reference leads to it. One that is then not a valid
-    /// schema is an [`Error`] of that check.
-    #[must_use]
-    pub fn resource(mut self, uri: &str, document: Value) -> Self {
-        self.resources.insert(uri.to_owned(), Arc::new(document));
-        self.documents = OnceLock::new();
         self
     }
 
@@ -81,17 +57,7 @@ impl Checker {
     ///
     /// When `a` or `b` cannot be checked at all; see [`Error`].
     pub fn check(&self, a: &Value, b: &Value) -> Result<Check, Error> {
-        let unlinked = schema::parse(a, b)?;
-        // A schema without references needs nothing but itself, so no index is built for it.
-        let scope = |side, schema| {
-            if unlinked.has_references(side) {
-                self.documents()?.scope(side, schema).map(Some)
-            } else {
-                Ok(None)
-            }
-        };
-        let (scope_a, scope_b) = (scope(Side::A, a)?, scope(Side::B, b)?);
-        let _graph = unlinked.link(scope_a.as_ref(), scope_b.as_ref())?;
+        let _graph = schema::parse(a, b)?.link()?;
         // Without an engine nothing is supported, so the whole of A is the construct in the way.
         Ok(Check {
             verdict: Verdict::Unknown {
@@ -102,13 +68,6 @@ impl Checker {
             },
             steps: 0,
         })
-    }
-
-    fn documents(&self) -> Result<&Documents, Error> {
-        let documents = self
-            .documents
-            .get_or_init(|| Documents::new(&self.resources));
-        documents.as_ref().map_err(Error::clone)
     }
 }
 
@@ -217,26 +176,15 @@ mod tests {
     }
 
     #[test]
-    fn a_reference_resolves_to_a_document_of_the_checker() {
+    fn a_schema_has_to_carry_what_it_references() {
         let uri = "https://example.com/name.json";
-        let schema = json!({"$ref": uri});
-        let checker = Checker::new();
+        let alone = json!({"$ref": uri});
         assert!(matches!(
-            checker.check(&schema, &json!(true)),
+            Checker::new().check(&alone, &json!(true)),
             Err(Error::UnresolvedReference { .. })
         ));
-        // A document added after a check is seen by the next one.
-        let checker = checker.resource(uri, json!({"type": "string"}));
-        assert!(checker.check(&schema, &schema).is_ok());
-    }
-
-    #[test]
-    fn documents_that_cannot_be_used_fail_the_checks_that_need_them() {
-        let checker = Checker::new().resource("not a uri", json!({}));
-        assert!(checker.check(&json!({}), &json!(true)).is_ok());
-        let error = checker
-            .check(&json!({"$ref": "#"}), &json!(true))
-            .unwrap_err();
-        assert!(matches!(error, Error::InvalidDocuments { .. }), "{error:?}");
+        let bundled = json!({"$ref": uri, "$defs": {"name": {"$id": uri, "type": "string"}}});
+        assert!(Checker::new().check(&bundled, &alone).is_err());
+        assert!(Checker::new().check(&bundled, &bundled).is_ok());
     }
 }
