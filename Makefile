@@ -1,7 +1,7 @@
 # The benchmark corpus is a release of https://github.com/georg-wolflein/subsumes-benchmark,
 # pinned by its version and by the SHA-256 of its archive.
-BENCHMARK_VERSION := 0.1.1
-BENCHMARK_SHA256 := 2e2d57e6d8ae7650736a277250b6792c84e574449e1c7f75e68ce66d861e0c34
+BENCHMARK_VERSION := 0.2.0
+BENCHMARK_SHA256 := 2cf9fa8a5ee174402ea68ace2253c31fc2d5d157150cd0df9789519d4aca7d92
 BENCHMARK_URL := https://github.com/georg-wolflein/subsumes-benchmark/releases/download/v$(BENCHMARK_VERSION)/corpus.tar.zst
 
 .PHONY: ci lint format format-check test corpus benchmark
