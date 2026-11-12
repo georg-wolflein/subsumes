@@ -25,7 +25,7 @@ A subsumes B exactly when no instance satisfies `all[B, not A]`. The engine norm
 - **Patterns are parsed by `regex-syntax`**, so the dialect is that of the `regex` crate by construction. The automata are our own; see [String languages](#string-languages).
 - **`format` is asserted** for the formats that are regular languages: `date`, `time`, `date-time`, `duration`, `uuid`, `ipv4`, `ipv6`, `hostname`, `email`, `uri`, `uri-reference`, `json-pointer`, `relative-json-pointer`. One table of patterns in the Rust dialect defines them. Any other format is an `Unknown` leaf.
 - **Numbers are exact.** Every bound and `multipleOf` is a rational, taken from the shortest decimal of the number, so `0.0075` is a multiple of `0.0001`. Plain `serde_json` is enough.
-- **Nothing is fetched.** A reference resolves within A, within B, to a document given to the checker, or to a meta-schema of the draft, which `referencing` ships.
+- **Nothing is fetched.** A reference resolves within A, within B, to a document given to the checker, or to a meta-schema of the draft, which the library carries.
 - **Pure Rust, no solver.** Dependencies: `serde_json`, `referencing`, `regex-syntax` and `num-rational`.
 
 ## API
@@ -138,6 +138,7 @@ src/
   canonical/      numbers, strings, objects, arrays
   language/       string languages: automata over scalar ranges, word sets
   formats.rs      the format table
+  meta_schemas.rs the meta-schema of draft 2020-12 and those of its vocabularies (exists)
   generate.rs     counterexamples
 harness/          the benchmark runner (exists)
 ```
