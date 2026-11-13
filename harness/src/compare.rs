@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use crate::counterexample::Confirmation;
 use crate::results::{Counts, Direction, Outcome, Record};
 
 /// The label on a pull request that accepts checks lost to `Unknown`.
@@ -84,6 +85,7 @@ pub fn compare(head: &[Record], base: Option<&Base>, allow_lost: bool) -> Compar
     });
     parts.push(tally(head, base));
     parts.push(totals(head, base, changes.as_ref()));
+    parts.extend(counterexamples(head));
     parts.extend(failures(head));
     if let Some(changes) = &changes {
         parts.extend(lost(&changes.lost, allow_lost));
@@ -184,24 +186,42 @@ fn totals(head: &[Record], base: Option<&Base>, changes: Option<&Changes>) -> St
     text
 }
 
+/// What a validator made of the counterexamples. One that is none is a wrong verdict and
+/// named among the failures; one that was not looked at is named here, with the reason.
+fn counterexamples(head: &[Record]) -> Option<String> {
+    let counts = Counts::of(head);
+    if counts.no == 0 {
+        return None;
+    }
+    let mut text = format!(
+        "A validator confirms {} of {}.",
+        number(counts.confirmed),
+        plural(counts.no as usize, "counterexample"),
+    );
+    let unchecked: Vec<String> = head
+        .iter()
+        .filter_map(|record| match &record.outcome {
+            Outcome::No {
+                confirmation: Confirmation::NotChecked(why),
+                ..
+            } => Some(format!("{}: {why}", record.name())),
+            _ => None,
+        })
+        .collect();
+    if !unchecked.is_empty() {
+        let heading = format!("{} not checked", plural(unchecked.len(), "counterexample"));
+        text += &format!("\n\n{}", details(&heading, &bullets(&unchecked)));
+    }
+    Some(text)
+}
+
 /// What fails the run whatever the base says: wrong verdicts and errors.
 fn failures(head: &[Record]) -> Vec<String> {
     let mut parts = Vec::new();
     let wrong: Vec<String> = head
         .iter()
         .filter(|record| record.is_wrong())
-        .map(|record| {
-            let expected = if record.expected == Some(true) {
-                "Yes"
-            } else {
-                "No"
-            };
-            format!(
-                "{}: {}, and the corpus says {expected}",
-                record.name(),
-                record.outcome.label()
-            )
-        })
+        .map(Record::described)
         .collect();
     if !wrong.is_empty() {
         let heading = plural(wrong.len(), "wrong verdict");
@@ -210,7 +230,7 @@ fn failures(head: &[Record]) -> Vec<String> {
     let errors: Vec<String> = head
         .iter()
         .filter(|record| record.is_error())
-        .map(|record| format!("{}: {}", record.name(), record.outcome.label()))
+        .map(Record::described)
         .collect();
     if !errors.is_empty() {
         let heading = plural(errors.len(), "error");
@@ -447,8 +467,13 @@ mod tests {
     }
 
     fn no() -> Outcome {
+        no_with(Confirmation::Confirmed)
+    }
+
+    fn no_with(confirmation: Confirmation) -> Outcome {
         Outcome::No {
             counterexample: json!(0),
+            confirmation,
         }
     }
 
@@ -475,6 +500,46 @@ mod tests {
         assert!(comment.contains("| **total** | 3 | 1 | 1 | 1 | 0 | 0 |"));
         assert!(comment.contains("took 8 steps in total"));
         assert!(comment.contains("| `budget` | 1 |"));
+        assert!(comment.contains("A validator confirms 1 of 1 counterexample."));
+    }
+
+    #[test]
+    fn a_run_without_a_no_says_nothing_of_counterexamples() {
+        let comment = compare(&[record("one/a", Outcome::Yes, 3)], None, false).comment;
+        assert!(!comment.contains("counterexample"), "{comment}");
+    }
+
+    #[test]
+    fn a_counterexample_that_is_none_is_a_wrong_verdict() {
+        let head = [
+            record("one/a", no(), 1),
+            record("one/b", no_with(Confirmation::RejectedByNarrow), 1),
+            record("one/c", no_with(Confirmation::AcceptedByWide), 1),
+        ];
+        let comment = compare(&head, None, false).comment;
+        assert!(comment.contains("A validator confirms 1 of 3 counterexamples."));
+        assert!(comment.contains(
+            "### :x: 2 wrong verdicts\n\n\
+             - `one/b` a_subsumes_b: No, and `b.json` rejects the counterexample `0`\n\
+             - `one/c` a_subsumes_b: No, and `a.json` accepts the counterexample `0`"
+        ));
+        assert!(comment.contains("| **total** | 3 | 0 | 3 | 0 | 2 | 0 |"));
+    }
+
+    #[test]
+    fn a_counterexample_that_was_not_checked_is_named_with_the_reason() {
+        let unchecked = Confirmation::NotChecked("the validator does not take a schema".to_owned());
+        let head = [
+            record("one/a", no(), 1),
+            record("one/b", no_with(unchecked), 1),
+        ];
+        let comment = compare(&head, None, false).comment;
+        assert!(comment.contains("A validator confirms 1 of 2 counterexamples."));
+        assert!(comment.contains("<summary>1 counterexample not checked</summary>"));
+        assert!(comment.contains("- `one/b` a_subsumes_b: the validator does not take a schema"));
+        // It is no wrong verdict.
+        assert!(comment.contains("| **total** | 2 | 0 | 2 | 0 | 0 | 0 |"));
+        assert!(!comment.contains(":x:"), "{comment}");
     }
 
     #[test]

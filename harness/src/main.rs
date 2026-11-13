@@ -1,5 +1,7 @@
 mod compare;
+mod counterexample;
 mod inspect;
+mod patterns;
 mod results;
 mod run;
 
@@ -23,7 +25,9 @@ struct Cli {
 enum Command {
     /// Check every case of the corpus in both directions and write one line per check.
     ///
-    /// Fails when a verdict contradicts its label or the library rejects a schema.
+    /// A validator is asked about the counterexample of every No. Fails when a verdict
+    /// contradicts its label, when a counterexample is none, or when the library rejects a
+    /// schema.
     Run(RunArguments),
     /// Render the results as the benchmark comment of a pull request.
     ///
@@ -109,11 +113,15 @@ fn run(arguments: &RunArguments) -> Result<bool, String> {
         counts.steps,
         counts.nanos as f64 / 1e9
     );
+    println!(
+        "{} of {} counterexamples confirmed by a validator, {} not checked",
+        counts.confirmed, counts.no, counts.unchecked
+    );
     let failed = records
         .iter()
         .filter(|record| record.is_wrong() || record.is_error());
     for record in failed.take(NAMED) {
-        eprintln!("{}: {}", record.name(), record.outcome.label());
+        eprintln!("{}", record.described());
     }
     Ok(counts.wrong == 0 && counts.errors == 0)
 }
