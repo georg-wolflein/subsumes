@@ -76,7 +76,8 @@ pub fn spelled_out(schema: &Value) -> Value {
 }
 
 /// The pattern as the `regex` crate reads it, with every class written as its ranges. `None`
-/// for a pattern that the `regex` crate does not take, which stays as it is.
+/// for a pattern that the `regex` crate does not take, which stays as it is: the validator
+/// reads it as ECMA 262 then, and takes the schema where it can make something of the pattern.
 fn pattern_spelled_out(pattern: &str) -> Option<String> {
     let read = regex_syntax::Parser::new().parse(pattern).ok()?;
     // The printer writes the class of no character as `[a&&b]`, an intersection, which ECMA
