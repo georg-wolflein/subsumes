@@ -34,11 +34,13 @@ pub enum Reason {
         /// outside the range that the library models, as `maximum: 1e30` is.
         location: String,
     },
-    /// A number is valid under B and invalid under A, but the library found no such number
-    /// that it can give. Every such number may be beyond the range that the library models,
-    /// as every number above 2^64 - 1 is. Or it may be one that no JSON value holds exactly:
-    /// a number between two floats that are next to each other has more digits than a float
-    /// keeps. So A does not subsume B, and there is no counterexample to give.
+    /// A number may be valid under B and invalid under A, but the library found no such
+    /// number that it can give. Every such number may be beyond the range that the library
+    /// models, as every number above 2^64 - 1 is. Or it may be one that no JSON value holds
+    /// exactly: a number between two floats that are next to each other has more digits than
+    /// a float keeps. Whether there is such a number at all, the library does not always
+    /// know: where two `multipleOf` have a least common multiple beyond the range, there may
+    /// be none, and A may subsume B.
     Unrepresentable,
     /// The check ran out of its work budget.
     Budget,
@@ -51,8 +53,8 @@ impl fmt::Display for Reason {
                 write!(f, "{location} in schema {schema} is not supported")
             }
             Self::Unrepresentable => f.write_str(
-                "the schemas differ in a number that is beyond the range of the library or \
-                 that a JSON value does not hold exactly",
+                "the schemas may differ in a number, but only in one that is beyond the range \
+                 of the library or that a JSON value does not hold exactly",
             ),
             Self::Budget => f.write_str("the check ran out of its work budget"),
         }

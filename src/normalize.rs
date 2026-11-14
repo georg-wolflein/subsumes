@@ -43,7 +43,8 @@ pub(crate) enum Cause {
     /// A predicate that the engine does not model.
     Leaf(LeafId),
     /// The branch accepts numbers, and none that the library can give: they are beyond the
-    /// range that the engine models, or no JSON number stands for them.
+    /// range that the engine models, or no JSON number stands for them. A branch whose
+    /// numbers hold more than was asked for may also accept none that was.
     Number,
 }
 
@@ -963,6 +964,17 @@ mod tests {
         assert_eq!(counterexample(&json!(false), &both), json!(0));
         yes(&json!({"multipleOf": 3}), &both);
         assert_eq!(reason(&json!({"const": 0}), &both), Reason::Unrepresentable);
+        // The set keeps one of the two, so it may hold numbers where B accepts none. Here the
+        // least common multiple is above the maximum, so A subsumes B, and the library cannot
+        // tell.
+        let none = json!({
+            "type": "number",
+            "minimum": 1,
+            "maximum": prime,
+            "multipleOf": prime,
+            "allOf": [{"multipleOf": 3}],
+        });
+        assert_eq!(reason(&json!(false), &none), Reason::Unrepresentable);
     }
 
     #[test]

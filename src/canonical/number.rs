@@ -237,7 +237,9 @@ impl Numbers {
             let mut any = false;
             for &times in candidates.iter().filter(|times| within(**times)) {
                 any = true;
-                budget.charge(1)?;
+                // A candidate is held against every excluded number, so a set with many of
+                // them costs more for each.
+                budget.charge(1 + every.len() as u64)?;
                 // A number beyond the range is none that was removed.
                 let found = step.times(times);
                 let is_removed = found.is_some_and(|found| self.removed.contains(&found));
@@ -552,7 +554,7 @@ mod tests {
     }
 
     #[test]
-    fn the_search_costs_a_step_for_each_candidate() {
+    fn the_search_costs_a_step_for_each_candidate_and_for_each_excluded_number() {
         let search = |asked: &[&str], budget: u64| {
             let mut budget = Budget::new(budget);
             let found = numbers(asked).is_empty(&mut budget);
@@ -561,10 +563,11 @@ mod tests {
         // An interval alone is compared and not searched.
         assert_eq!(search(&[">= 1", "<= 2", "not mof 1"], 0), (Ok(false), 0));
         assert_eq!(search(&["mof 1", ">= 5"], 1), (Ok(false), 1));
-        // 24 to 28 are excluded, and 29 is not.
+        // 24 to 28 are excluded, and 29 is not: six candidates, each held against three
+        // excluded numbers.
         let asked = ["mof 1", "not mof 2", "not mof 3", "not mof 5", ">= 24"];
-        assert_eq!(search(&asked, 6), (Ok(false), 6));
-        assert_eq!(search(&asked, 5), (Err(Exhausted), 5));
+        assert_eq!(search(&asked, 24), (Ok(false), 24));
+        assert_eq!(search(&asked, 23), (Err(Exhausted), 23));
         // A number that was taken out is a candidate like any other.
         let asked = ["mof 1", ">= 1", "!= 1", "!= 2", "!= 3"];
         assert_eq!(search(&asked, 4), (Ok(false), 4));
@@ -572,7 +575,7 @@ mod tests {
         assert_eq!(search(&["mof 4", "not mof 2"], 0), (Ok(true), 0));
         // The largest numbers of the range and the smallest are numbers like any other.
         let far = ["mof 1e-16", ">= 1e19", "not mof 1e19"];
-        assert_eq!(search(&far, 2), (Ok(false), 2));
+        assert_eq!(search(&far, 4), (Ok(false), 4));
     }
 
     #[test]

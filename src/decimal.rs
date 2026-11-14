@@ -115,7 +115,9 @@ fn named(text: &str) -> Option<Decimal> {
     let unscaled: i128 = [whole, fraction].concat().parse().ok()?;
     // Each digit behind the point is one power of ten less, and a unit is a few more.
     let places = i64::try_from(fraction.len()).ok()?;
-    let power = exponent.checked_sub(places)? + i64::from(Decimal::PLACES);
+    let power = exponent
+        .checked_sub(places)?
+        .checked_add(i64::from(Decimal::PLACES))?;
     let scale = 10_i128.checked_pow(u32::try_from(power.unsigned_abs()).ok()?)?;
     let units = if power >= 0 {
         unscaled.checked_mul(scale)?
@@ -126,6 +128,22 @@ fn named(text: &str) -> Option<Decimal> {
         return None;
     };
     Decimal::of_units(units)
+}
+
+/// Whether a JSON number is more than zero. It is read from the text, as every number is, so
+/// that a number outside the range has its sign too: with the feature for numbers of any
+/// precision, `1e-400` is more than zero, though the float nearest to it is zero.
+pub(crate) fn is_positive(number: &Number) -> bool {
+    names_positive(&number.to_string())
+}
+
+/// Whether the text of a JSON number names one that is more than zero: it has no sign, and a
+/// digit other than zero before its exponent.
+fn names_positive(text: &str) -> bool {
+    let digits = text
+        .split_once(['e', 'E'])
+        .map_or(text, |(digits, _)| digits);
+    !digits.starts_with('-') && digits.bytes().any(|digit| matches!(digit, b'1'..=b'9'))
 }
 
 /// The JSON number that stands for exactly this number, if there is one: an integer that an
@@ -246,12 +264,45 @@ mod tests {
         assert_eq!(shown("1e1000000000"), None);
         assert_eq!(shown("1e-1000000000"), None);
         assert_eq!(shown("1e99999999999999999999"), None);
+        // The exponent is an `i64`, and the unit's places do not carry it over.
+        assert_eq!(shown("1e9223372036854775807"), None);
+        assert_eq!(shown("0.5e9223372036854775807"), None);
+        assert_eq!(shown("1e-9223372036854775808"), None);
+        assert_eq!(shown("0.5e-9223372036854775808"), None);
         assert_eq!(shown(&format!("1{}", "0".repeat(1000))), None);
         assert_eq!(shown(&format!("0.{}1", "0".repeat(1000))), None);
         // Zeros behind the last place of a unit are no more places, while the text is not
         // too long to read.
         assert_eq!(shown(&format!("0.5{}", "0".repeat(30))), some("0.5"));
         assert_eq!(shown(&format!("0.5{}", "0".repeat(1000))), None);
+    }
+
+    #[test]
+    fn a_number_is_more_than_zero_by_its_text() {
+        for value in [
+            json!(1),
+            json!(0.5),
+            json!(1e-300),
+            json!(u64::MAX),
+            json!(1e300),
+        ] {
+            assert!(is_positive(value.as_number().unwrap()), "{value}");
+        }
+        for value in [json!(0), json!(0.0), json!(-0.0), json!(-2), json!(-1e-300)] {
+            assert!(!is_positive(value.as_number().unwrap()), "{value}");
+        }
+        // Texts that only the feature for numbers of any precision hands over.
+        for positive in [
+            "1e-400",
+            "1e400",
+            "0.001E-5000001",
+            "1e-9223372036854775808",
+        ] {
+            assert!(names_positive(positive), "{positive}");
+        }
+        for not in ["0e400", "0.000", "-0.0e-1", "-1e-400"] {
+            assert!(!names_positive(not), "{not}");
+        }
     }
 
     #[test]

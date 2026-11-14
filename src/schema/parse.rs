@@ -8,6 +8,7 @@ use serde_json::{Map, Number, Value};
 use super::{
     Count, Keywords, Node, NodeId, Origin, Part, Schema, Type, Types, location, push_token,
 };
+use crate::decimal::is_positive;
 use crate::{Error, Side};
 
 const DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
@@ -449,7 +450,7 @@ fn keyword<'a>(
         "exclusiveMaximum" => keywords.exclusive_maximum = Some(number(value)?),
         "multipleOf" => {
             let divisor = number(value)?;
-            if !divisor.as_f64().is_some_and(|divisor| divisor > 0.0) {
+            if !is_positive(divisor) {
                 return Err("must be greater than 0".into());
             }
             keywords.multiple_of = Some(divisor);
