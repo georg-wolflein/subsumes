@@ -36,6 +36,9 @@ mod context;
 mod error;
 mod generate;
 mod inspect;
+// The engine does not use the languages yet.
+#[expect(dead_code)]
+mod language;
 mod lower;
 mod meta_schemas;
 mod normalize;
