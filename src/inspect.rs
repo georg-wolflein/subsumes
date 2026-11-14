@@ -5,6 +5,7 @@
 
 use serde_json::{Value, json};
 
+use crate::rational::shown;
 use crate::schema::Graph;
 use crate::term::{Term, TermId, Terms, VarId};
 
@@ -73,6 +74,10 @@ fn row(graph: &Graph, terms: &Terms, part: TermId) -> Value {
             json!(["type", names.join(", ")])
         }
         Term::BoolConst(value) => json!(["is", value.to_string()]),
+        Term::NumConst(number) => json!(["is", shown(number)]),
+        Term::Min(_) | Term::ExMin(_) | Term::Max(_) | Term::ExMax(_) | Term::Mof(_) => {
+            json!(["number", terms.show(part)])
+        }
         Term::Unknown(leaf) => {
             let leaf = terms.leaf(*leaf);
             let about: Vec<&str> = leaf.domain.iter().map(|kind| kind.name()).collect();
@@ -119,6 +124,8 @@ fn referred(terms: &Terms, term: TermId) -> Vec<(VarId, &'static str)> {
                 pending.push((*inner, how));
             }
             Term::True | Term::False | Term::TypeIs(_) | Term::BoolConst(_) | Term::Unknown(_) => {}
+            Term::NumConst(_) => {}
+            Term::Min(_) | Term::ExMin(_) | Term::Max(_) | Term::ExMax(_) | Term::Mof(_) => {}
         }
     }
     found
@@ -193,6 +200,22 @@ mod tests {
                 {"kind": "applies", "from": 0, "to": 3, "keyword": ""},
                 {"kind": "applies", "from": 1, "to": 2, "keyword": ""},
                 {"kind": "applies", "from": 1, "to": 3, "keyword": "not"},
+            ])
+        );
+    }
+
+    #[test]
+    fn what_a_term_says_about_numbers_is_a_row_each() {
+        let schema = json!({"type": "integer", "const": 2.0, "minimum": 0, "multipleOf": 0.5});
+        let shown = shown(&schema, &json!(true), u64::MAX);
+        assert_eq!(
+            shown["stages"][1]["nodes"][0]["keywords"],
+            json!([
+                ["type", "number"],
+                ["number", "mof(1)"],
+                ["is", "2"],
+                ["number", "min(0)"],
+                ["number", "mof(0.5)"],
             ])
         );
     }

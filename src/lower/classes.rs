@@ -11,7 +11,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
+use serde_json::{Number, Value};
+
 use crate::context::{Budget, Exhausted};
+use crate::rational::exact;
 use crate::schema::{Count, Graph, Keywords, Node, NodeId, Part, Schema};
 
 /// A value as JSON text, which is equal for two values exactly when they are written alike.
@@ -131,19 +134,22 @@ fn assertions(id: NodeId, keywords: &Keywords, text: &mut String) {
     );
     put("$dynamicAnchor", keywords.dynamic_anchor.map(quoted));
     put("type", keywords.types.map(|types| format!("{types:?}")));
-    put("enum", keywords.enumeration.map(|values| written!(values)));
-    put("const", keywords.constant.map(|value| written!(value)));
-    put("minimum", keywords.minimum.map(ToString::to_string));
-    put("maximum", keywords.maximum.map(ToString::to_string));
-    put(
-        "exclusiveMinimum",
-        keywords.exclusive_minimum.map(ToString::to_string),
-    );
-    put(
-        "exclusiveMaximum",
-        keywords.exclusive_maximum.map(ToString::to_string),
-    );
-    put("multipleOf", keywords.multiple_of.map(ToString::to_string));
+    // A number is the number that it stands for, however it is written: `1.0` says what `1`
+    // says. Inside an array or an object it is told apart by how it is written, until those
+    // constants are terms.
+    let number = |number: &Number| exact(number).to_string();
+    let constant = |value: &Value| match value {
+        Value::Number(value) => number(value),
+        other => written!(other),
+    };
+    let listed = |values: &[Value]| values.iter().map(constant).collect::<Vec<_>>().join(",");
+    put("enum", keywords.enumeration.map(listed));
+    put("const", keywords.constant.map(constant));
+    put("minimum", keywords.minimum.map(number));
+    put("maximum", keywords.maximum.map(number));
+    put("exclusiveMinimum", keywords.exclusive_minimum.map(number));
+    put("exclusiveMaximum", keywords.exclusive_maximum.map(number));
+    put("multipleOf", keywords.multiple_of.map(number));
     put("minLength", count(keywords.min_length));
     put("maxLength", count(keywords.max_length));
     put("pattern", keywords.pattern.map(quoted));
@@ -313,6 +319,13 @@ mod tests {
             (json!({"required": ["a"]}), json!({"required": ["a", "b"]})),
             (json!({"uniqueItems": true}), json!({})),
             (json!({"$dynamicAnchor": "a"}), json!({})),
+            (json!({"minimum": 1}), json!({"minimum": 1.5})),
+            (json!({"minimum": 1}), json!({"exclusiveMinimum": 1})),
+            (json!({"const": 1}), json!({"const": "1"})),
+            (json!({"enum": [1, 2]}), json!({"enum": ["1,2"]})),
+            (json!({"enum": [1, 2]}), json!({"enum": [2, 1]})),
+            // A number inside a constant is compared as it is written, for now.
+            (json!({"const": [1]}), json!({"const": [1.0]})),
         ];
         for (a, b) in apart {
             let (of_a, of_b) = classed(&a, &b);
@@ -325,6 +338,14 @@ mod tests {
             ),
             (json!({"uniqueItems": false}), json!({})),
             (json!({"$defs": {"a": {}}, "$anchor": "x"}), json!({})),
+            // A number is the number that it stands for, however it is written.
+            (json!({"minimum": 1}), json!({"minimum": 1.0})),
+            (json!({"multipleOf": 0.5}), json!({"multipleOf": 5e-1})),
+            (json!({"const": 1}), json!({"const": 1.0})),
+            (
+                json!({"enum": [1, "a", null]}),
+                json!({"enum": [1.0, "a", null]}),
+            ),
         ];
         for (a, b) in alike {
             let (of_a, of_b) = classed(&a, &b);

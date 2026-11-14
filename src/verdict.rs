@@ -33,6 +33,11 @@ pub enum Reason {
         /// the cycle closes.
         location: String,
     },
+    /// A number is valid under B and invalid under A, but the library found no such number
+    /// that a JSON value holds exactly. A number between two floats that are next to each
+    /// other has more digits than a float keeps, for one. So A does not subsume B, and
+    /// there is no counterexample to give.
+    Unrepresentable,
     /// The check ran out of its work budget.
     Budget,
 }
@@ -43,6 +48,9 @@ impl fmt::Display for Reason {
             Self::Unsupported { schema, location } => {
                 write!(f, "{location} in schema {schema} is not supported")
             }
+            Self::Unrepresentable => f.write_str(
+                "the schemas differ in a number that a JSON value does not hold exactly",
+            ),
             Self::Budget => f.write_str("the check ran out of its work budget"),
         }
     }

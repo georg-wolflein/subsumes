@@ -16,13 +16,13 @@ Each check returns one of three verdicts:
 
 - **`Yes`**: Every instance valid under B is also valid under A.
 - **`No`**: Some instance is valid under B but invalid under A. The verdict carries such an instance as a counterexample.
-- **`Unknown`**: The library cannot decide and provides a reason: either the answer depends on an [unsupported construct](#unsupported-constructs), or the check ran out of its work budget.
+- **`Unknown`**: The library cannot decide and provides a reason: the answer depends on an [unsupported construct](#unsupported-constructs), the check ran out of its work budget, or the schemas differ in a [number](#numbers) that cannot be written exactly.
 
 ## Status
 
-The engine is being built keyword by keyword. So far it models the types, `null`, the booleans, `allOf`, `anyOf`, `oneOf`, `not`, `if`/`then`/`else` and `$ref`. A check whose answer depends on any other keyword returns `Unknown` and names the keyword. So does every check of a schema that uses a `$dynamicRef`, until the engine models it.
+The engine is being built keyword by keyword. So far it models the types, `null`, the booleans, numbers, `allOf`, `anyOf`, `oneOf`, `not`, `if`/`then`/`else` and `$ref`. For numbers that is `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, `integer`, and a number in `const` or `enum`. A check whose answer depends on any other keyword returns `Unknown` and names the keyword. So does every check of a schema that uses a `$dynamicRef`, until the engine models it.
 
-Two schemas that share such a keyword with the same value can still be decided, because what both say cancels. That is enough to decide about three in ten checks of the benchmark corpus.
+Two schemas that share such a keyword with the same value can still be decided, because what both say cancels. That is enough to decide about a third of the checks of the benchmark corpus.
 
 ## Goals
 
@@ -38,6 +38,14 @@ JSON Schema recommends ECMA-262 regular expressions for `pattern` and `patternPr
 The dialect changes answers. In ECMA-262, `\d` matches only `0` to `9`; in the `regex` crate it matches every Unicode decimal digit. So `^\d+$` accepts `"٣"` here and `^[0-9]+$` does not subsume it, although the two patterns are equivalent under ECMA-262.
 
 Other dialects may be supported later. For now this is the only one.
+
+## Numbers
+
+Numbers are compared exactly, not as floats. A number in a schema stands for the decimal that it is written as, so `0.0075` is a multiple of `0.0001`, and `1.0` is the integer `1`.
+
+A schema is a `serde_json` value, which keeps a number as a 64-bit integer or as a float. A number that was written with more digits than a float keeps, about 15, may have been rounded before the library sees it.
+
+A `Yes` holds for every number, however many digits it has. The counterexample of a `No` is a number that a `serde_json` value holds exactly. Where the library finds only numbers with more digits to tell two schemas apart, such as those between two floats that are next to each other, the verdict is `Unknown`.
 
 ## References
 

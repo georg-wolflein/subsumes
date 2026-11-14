@@ -1,9 +1,9 @@
 //! A test that holds the engine against every instance there could be.
 //!
-//! To the engine an instance matters only by its type, by which boolean it is, and by which
-//! of the leaves about its type it satisfies. A leaf may come out either way, since the engine
-//! knows nothing of what it means. So the kinds of instance can all be listed: a type, a
-//! boolean, and an answer for each leaf.
+//! To the engine an instance matters only by its type, by which boolean or which number it
+//! is, and by which of the leaves about its type it satisfies. A leaf may come out either
+//! way, since the engine knows nothing of what it means. So the kinds of instance can all be
+//! listed: a type, a boolean or a number, and an answer for each leaf.
 //!
 //! A small evaluator here says for each kind whether a schema accepts it. It reads the JSON
 //! and knows nothing of terms or branches, and it states again which keywords are about which
@@ -11,9 +11,24 @@
 //!
 //! - `Yes` exactly when every kind that B accepts, A accepts.
 //! - `No` only with an instance of which every kind is accepted by B and not by A.
-//! - `Unknown` only when some kind is accepted by B and not by A.
+//! - `Unknown` only when some kind is accepted by B and not by A, and no number is.
 //!
 //! The schemas are made at random from the keywords that hold no schema inside a leaf.
+//!
+//! # Numbers
+//!
+//! No leaf is about numbers: the engine knows what every keyword about them means, and the
+//! evaluator works it out again, in floats. There are more numbers than can be listed, but
+//! not more kinds of them. The schemas here take their bounds, their constants and what a
+//! number is to be a multiple of from a few numbers, all of them multiples of a half. A
+//! number matters to such a schema only by where it lies among the bounds and by which of
+//! the multiples it is. Every multiple of a half is its own kind, and the numbers between two
+//! of them that are next to each other are all of one kind, which the quarter between them
+//! is of too. Beyond the bounds everything repeats with the least number that all the
+//! multiples divide. So the quarters from a little below the least bound to a little above
+//! the greatest hold one number of every kind, and a float holds each of them exactly.
+//!
+//! A number that the engine gives may be any number, and is evaluated as it is.
 //!
 //! # Schemas that refer to themselves
 //!
@@ -35,11 +50,13 @@ use serde_json::{Value, json};
 use crate::testing::Random;
 use crate::{Checker, Reason, Verdict};
 
-/// One kind of instance: its type, which boolean it is if it is one, and the leaves that it
-/// satisfies. A leaf that was not given an answer is asked for and noted.
+/// One kind of instance: its type, which boolean it is if it is one, which number if it is
+/// one, and the leaves that it satisfies. A leaf that was not given an answer is asked for
+/// and noted.
 struct Kind<'k> {
     of_type: &'static str,
     boolean: bool,
+    number: f64,
     satisfies: &'k BTreeMap<String, bool>,
     asked: &'k RefCell<Vec<String>>,
 }
@@ -62,14 +79,17 @@ impl Kind<'_> {
         match value {
             Value::Null => self.of_type == "null",
             Value::Bool(value) => self.of_type == "boolean" && self.boolean == *value,
-            Value::Number(_) => {
-                self.of_type == "number" && self.leaf("number", format!("const {value}"))
-            }
+            Value::Number(value) => self.of_type == "number" && value.as_f64() == Some(self.number),
             Value::String(_) => {
                 self.of_type == "string" && self.leaf("string", format!("const {value}"))
             }
             other => panic!("no schema here has the constant {other}"),
         }
+    }
+
+    /// Whether the instance is no number, or a number of which this holds.
+    fn number(&self, holds: impl Fn(f64) -> bool) -> bool {
+        self.of_type != "number" || holds(self.number)
     }
 
     fn has(&self, name: &Value) -> bool {
@@ -93,6 +113,8 @@ impl Kind<'_> {
         let every = |schemas: &Value, accepts: &dyn Fn(&Value) -> bool| -> Vec<bool> {
             schemas.as_array().unwrap().iter().map(accepts).collect()
         };
+        // The number that a keyword about numbers holds.
+        let at = |value: &Value| value.as_f64().expect("the keyword holds a number");
         let mut accepted = true;
         for (keyword, value) in keywords {
             accepted &= match keyword.as_str() {
@@ -113,9 +135,9 @@ impl Kind<'_> {
                         .unwrap_or_else(|| vec![value.clone()]);
                     let number = names.contains(&json!("number"));
                     let named = names.iter().map(|name| match name.as_str().unwrap() {
-                        // An integer is a number that is a multiple of one.
+                        // An integer is a number without a fraction.
                         "integer" if self.of_type == "number" => {
-                            number || self.leaf("number", "multipleOf 1".to_owned())
+                            number || self.number.fract() == 0.0
                         }
                         name => name == self.of_type,
                     });
@@ -144,9 +166,11 @@ impl Kind<'_> {
                     (rejects(value) | then) & (accepts(value) | otherwise)
                 }
                 "minLength" | "maxLength" => self.leaf("string", format!("{keyword} {value}")),
-                "minimum" | "maximum" | "multipleOf" => {
-                    self.leaf("number", format!("{keyword} {value}"))
-                }
+                "minimum" => self.number(|number| number >= at(value)),
+                "maximum" => self.number(|number| number <= at(value)),
+                "exclusiveMinimum" => self.number(|number| number > at(value)),
+                "exclusiveMaximum" => self.number(|number| number < at(value)),
+                "multipleOf" => self.number(|number| (number / at(value)).fract() == 0.0),
                 "uniqueItems" => value == &json!(false) || self.leaf("array", keyword.clone()),
                 "minItems" => self.leaf("array", format!("{keyword} {value}")),
                 "required" => {
@@ -253,74 +277,94 @@ impl<'d> Document<'d> {
     }
 }
 
-/// The types, with both booleans, and an instance of each.
-fn kinds() -> [(&'static str, bool, Value); 7] {
-    [
-        ("null", false, json!(null)),
-        ("boolean", true, json!(true)),
-        ("boolean", false, json!(false)),
-        ("number", false, json!(0)),
-        ("string", false, json!("")),
-        ("array", false, json!([])),
-        ("object", false, json!({})),
-    ]
+/// An instance apart from its leaves: its type, which boolean it is, and which number.
+type Instance = (&'static str, bool, f64);
+
+/// The quarters that hold a number of every kind: from -8 to 9. The bounds and constants of
+/// the schemas here are from -1.5 to 2.5, and the least number that 0.5, 1, 1.5 and 2 all
+/// divide is 6.
+const QUARTERS: std::ops::RangeInclusive<i16> = -32..=36;
+
+/// The types, with both booleans and with a number of every kind.
+fn instances() -> Vec<Instance> {
+    let others = ["null", "string", "array", "object"].map(|of_type| (of_type, false, 0.0));
+    let booleans = [true, false].map(|boolean| ("boolean", boolean, 0.0));
+    let numbers = QUARTERS.map(|quarters| ("number", false, f64::from(quarters) / 4.0));
+    others.into_iter().chain(booleans).chain(numbers).collect()
 }
 
-/// What holds for the instances of one type that are one boolean.
+/// What a value is apart from its leaves. Of a string, an array and an object, the engine
+/// gives the empty one only.
+fn instance_of(value: &Value) -> Instance {
+    match value {
+        Value::Null => ("null", false, 0.0),
+        Value::Bool(boolean) => ("boolean", *boolean, 0.0),
+        Value::Number(number) => ("number", false, number.as_f64().expect("a float")),
+        Value::String(text) if text.is_empty() => ("string", false, 0.0),
+        Value::Array(items) if items.is_empty() => ("array", false, 0.0),
+        Value::Object(members) if members.is_empty() => ("object", false, 0.0),
+        other => panic!("the engine does not give {other} yet"),
+    }
+}
+
+/// What holds for the instances that are alike apart from their leaves.
 struct Found {
-    instance: Value,
+    of_type: &'static str,
     /// Some kind is surely accepted by B and not possibly by A.
     some_tells_apart: bool,
     /// Every kind is.
     all_tell_apart: bool,
 }
 
-/// Lists every kind of instance and asks the evaluator about A and B.
-fn evaluated(a: &Value, b: &Value) -> Vec<Found> {
-    let names = ["d", "e", "f"].into_iter();
-    let fragments = names.map(|name| (name.to_owned(), format!("/$defs/{name}")));
-    let fragments = fragments.collect();
-    let (a, b) = (&Document::new(a, &fragments), &Document::new(b, &fragments));
-    let ask = |of_type, boolean, satisfies: &BTreeMap<String, bool>| {
+/// Asks the evaluator about A and B, for an instance with every way of answering the leaves
+/// about it.
+fn found(a: &Document, b: &Document, (of_type, boolean, number): Instance) -> Found {
+    let ask = |satisfies: &BTreeMap<String, bool>| {
         let asked = RefCell::new(Vec::new());
         let kind = Kind {
             of_type,
             boolean,
+            number,
             satisfies,
             asked: &asked,
         };
         let ((_, a_possibly), (b_surely, _)) = (kind.accepted(a), kind.accepted(b));
         (b_surely & !a_possibly, asked.into_inner())
     };
-    let found = kinds().into_iter().map(|(of_type, boolean, instance)| {
-        // The first look finds the leaves that there are to answer.
-        let (_, mut leaves) = ask(of_type, boolean, &BTreeMap::new());
-        leaves.sort();
-        leaves.dedup();
-        assert!(
-            leaves.len() <= 14,
-            "{} leaves are too many to list",
-            leaves.len()
-        );
-        let mut found = Found {
-            instance,
-            some_tells_apart: false,
-            all_tell_apart: true,
+    // The first look finds the leaves that there are to answer. Without any, as for every
+    // number, it is the answer.
+    let (tells_apart, mut leaves) = ask(&BTreeMap::new());
+    if leaves.is_empty() {
+        return Found {
+            of_type,
+            some_tells_apart: tells_apart,
+            all_tell_apart: tells_apart,
         };
-        for answers in 0..1_u32 << leaves.len() {
-            let answer = |place: usize| answers >> place & 1 == 1;
-            let satisfies = leaves.iter().cloned().enumerate();
-            let satisfies = satisfies
-                .map(|(place, leaf)| (leaf, answer(place)))
-                .collect();
-            let (tells_apart, unanswered) = ask(of_type, boolean, &satisfies);
-            assert_eq!(unanswered, Vec::<String>::new());
-            found.some_tells_apart |= tells_apart;
-            found.all_tell_apart &= tells_apart;
-        }
-        found
-    });
-    found.collect()
+    }
+    leaves.sort();
+    leaves.dedup();
+    assert!(
+        leaves.len() <= 14,
+        "{} leaves are too many to list",
+        leaves.len()
+    );
+    let mut found = Found {
+        of_type,
+        some_tells_apart: false,
+        all_tell_apart: true,
+    };
+    for answers in 0..1_u32 << leaves.len() {
+        let answer = |place: usize| answers >> place & 1 == 1;
+        let satisfies = leaves.iter().cloned().enumerate();
+        let satisfies = satisfies
+            .map(|(place, leaf)| (leaf, answer(place)))
+            .collect();
+        let (tells_apart, unanswered) = ask(&satisfies);
+        assert_eq!(unanswered, Vec::<String>::new());
+        found.some_tells_apart |= tells_apart;
+        found.all_tell_apart &= tells_apart;
+    }
+    found
 }
 
 /// What the schemas of a pair are made of.
@@ -369,6 +413,17 @@ fn plain(random: &mut Random, shape: Shape) -> Value {
         json!({"minimum": 0}),
         json!({"maximum": 0, "type": "number"}),
         json!({"multipleOf": 1}),
+        json!({"minimum": 1}),
+        json!({"exclusiveMinimum": 0}),
+        json!({"maximum": 2.5}),
+        json!({"exclusiveMaximum": 2.5, "type": "number"}),
+        json!({"minimum": -1.5, "maximum": 1}),
+        json!({"multipleOf": 0.5}),
+        json!({"multipleOf": 1.5}),
+        json!({"multipleOf": 2, "type": "number"}),
+        json!({"type": "integer", "minimum": 1}),
+        json!({"const": 1.0}),
+        json!({"enum": [0, 2.5]}),
         json!({"uniqueItems": true}),
         json!({"minItems": 1, "type": "array"}),
         json!({"required": ["a"]}),
@@ -411,6 +466,7 @@ fn schema(random: &mut Random, depth: usize, shape: Shape) -> Value {
             ("type", json!(["string", "null"])),
             ("minLength", json!(1)),
             ("required", json!(["a"])),
+            ("maximum", json!(1)),
         ];
         let (keyword, value) = beside[random.below(beside.len())].clone();
         schema[keyword] = value;
@@ -448,6 +504,8 @@ fn document(mut schema: Value, definitions: &Value) -> Value {
 struct Tally {
     yes: usize,
     no: usize,
+    /// The checks that ended in `No` with a number.
+    numbers: usize,
     unknown: usize,
     /// The checks that ended in `Unknown` although there was an instance to give.
     missed: usize,
@@ -458,8 +516,18 @@ impl Tally {
     /// engine has to see everything that the evaluator sees, which it does where no schema
     /// refers to itself.
     fn compare(&mut self, a: &Value, b: &Value, complete: bool) {
-        let found = evaluated(a, b);
+        let names = ["d", "e", "f"].into_iter();
+        let fragments = names.map(|name| (name.to_owned(), format!("/$defs/{name}")));
+        let fragments = fragments.collect();
+        let (of_a, of_b) = (&Document::new(a, &fragments), &Document::new(b, &fragments));
+        let instances = instances().into_iter();
+        let found: Vec<Found> = instances
+            .map(|instance| found(of_a, of_b, instance))
+            .collect();
         let subsumed = found.iter().all(|found| !found.some_tells_apart);
+        // No leaf is about numbers, so a number that tells the two apart is an instance.
+        let mut numbers = found.iter().filter(|found| found.of_type == "number");
+        let a_number_tells_apart = numbers.any(|found| found.some_tells_apart);
         let verdict = Checker::new().subsumes(a, b).unwrap();
         let context = format!("does {a} subsume {b}? {verdict:?}");
         match &verdict {
@@ -468,15 +536,16 @@ impl Tally {
                 self.yes += 1;
             }
             Verdict::No { counterexample } => {
-                let found = found.iter().find(|found| found.instance == *counterexample);
-                let found = found.unwrap_or_else(|| panic!("{context}"));
+                let found = self::found(of_a, of_b, instance_of(counterexample));
                 assert!(found.all_tell_apart, "{context}");
                 self.no += 1;
+                self.numbers += usize::from(counterexample.is_number());
             }
             Verdict::Unknown {
                 reason: Reason::Unsupported { .. },
             } => {
                 assert!(!complete || !subsumed, "{context}");
+                assert!(!complete || !a_number_tells_apart, "{context}");
                 self.unknown += 1;
                 // There was an instance to give, and the engine did not find a branch for it.
                 self.missed += usize::from(found.iter().any(|found| found.all_tell_apart));
@@ -491,12 +560,13 @@ impl std::fmt::Display for Tally {
         let Self {
             yes,
             no,
+            numbers,
             unknown,
             missed,
         } = self;
         write!(
             f,
-            "{yes} Yes, {no} No, {unknown} Unknown, {missed} of them with an instance to give"
+            "{yes} Yes, {no} No, {numbers} of them with a number, {unknown} Unknown, {missed} of them with an instance to give"
         )
     }
 }
@@ -521,11 +591,15 @@ fn the_engine_agrees_with_every_instance_there_could_be() {
     }
     println!("{tally}");
     let Tally {
-        yes, no, unknown, ..
+        yes,
+        no,
+        numbers,
+        unknown,
+        ..
     } = tally;
     assert!(
-        yes > 500 && no > 500 && unknown > 200,
-        "{yes} {no} {unknown}"
+        yes > 500 && no > 500 && numbers > 300 && unknown > 200,
+        "{yes} {no} {numbers} {unknown}"
     );
 }
 
@@ -557,10 +631,14 @@ fn the_engine_agrees_on_schemas_that_refer_to_themselves() {
     }
     println!("{tally}");
     let Tally {
-        yes, no, unknown, ..
+        yes,
+        no,
+        numbers,
+        unknown,
+        ..
     } = tally;
     assert!(
-        yes > 300 && no > 150 && unknown > 100,
-        "{yes} {no} {unknown}"
+        yes > 300 && no > 150 && numbers > 100 && unknown > 100,
+        "{yes} {no} {numbers} {unknown}"
     );
 }

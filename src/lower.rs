@@ -4,10 +4,11 @@
 //! a variable, and the term of the variable says what its keywords say. Schemas that say the
 //! same share a variable, also between A and B.
 //!
-//! The engine models the types, `null`, the booleans, the connectives and references. Every
-//! other keyword becomes a predicate that it does not model, a leaf, which keeps the place
-//! where it stands. A leaf says something only about the instances its keyword is about:
-//! `minLength` about strings, and so a number satisfies it.
+//! The engine models the types, `null`, the booleans, numbers, the connectives and
+//! references. Every other keyword becomes a predicate that it does not model, a leaf, which
+//! keeps the place where it stands. A leaf says something only about the instances its
+//! keyword is about: `minLength` about strings, and so a number satisfies it. The terms
+//! about numbers are the same in that: a string satisfies `minimum`.
 
 mod classes;
 
@@ -17,6 +18,7 @@ use serde_json::Value;
 
 use self::classes::written;
 use crate::context::{Context, Exhausted};
+use crate::rational::{Rational, exact};
 use crate::schema::{Count, Graph, Keywords, NodeId, Schema, Type};
 use crate::term::{InstanceType, TermId, TypeSet, VarId};
 
@@ -129,7 +131,7 @@ impl Lowering<'_, '_> {
         let mut parts = Vec::new();
         self.connectives(id, keywords, &mut parts);
         self.any_type(id, keywords, &mut parts);
-        self.numbers(id, keywords, &mut parts);
+        self.numbers(keywords, &mut parts);
         self.strings(id, keywords, &mut parts);
         self.arrays(id, keywords, &mut parts);
         self.objects(id, keywords, &mut parts);
@@ -246,7 +248,7 @@ impl Lowering<'_, '_> {
             if types.contains(Type::Integer) && !types.contains(Type::Number) {
                 // An integer is a number that is a multiple of one.
                 parts.push(self.context.terms.type_is(set.union(NUMBER)));
-                parts.push(self.leaf(NUMBER, id, "type", "multipleOf 1".to_owned()));
+                parts.push(self.context.terms.mof(Rational::from_integer(1.into())));
             } else {
                 parts.push(self.context.terms.type_is(set));
             }
@@ -263,13 +265,13 @@ impl Lowering<'_, '_> {
         }
     }
 
-    /// The term for "the instance is this value". `null` and the booleans are terms of the
-    /// engine; any other value is of one type and a leaf over that type.
+    /// The term for "the instance is this value". `null`, the booleans and the numbers are
+    /// terms of the engine; any other value is of one type and a leaf over that type.
     fn constant(&mut self, id: NodeId, keyword: &'static str, value: &Value) -> TermId {
         let kind = match value {
             Value::Null => return self.context.terms.type_is(NULL),
             Value::Bool(value) => return self.context.terms.bool_const(*value),
-            Value::Number(_) => NUMBER,
+            Value::Number(number) => return self.context.terms.num_const(exact(number)),
             Value::String(_) => STRING,
             Value::Array(_) => ARRAY,
             Value::Object(_) => OBJECT,
@@ -279,18 +281,22 @@ impl Lowering<'_, '_> {
         self.context.terms.all_of([of_type, is_it])
     }
 
-    fn numbers(&mut self, id: NodeId, keywords: &Keywords, parts: &mut Vec<TermId>) {
-        let bounds = [
-            ("minimum", keywords.minimum),
-            ("maximum", keywords.maximum),
-            ("exclusiveMinimum", keywords.exclusive_minimum),
-            ("exclusiveMaximum", keywords.exclusive_maximum),
-            ("multipleOf", keywords.multiple_of),
-        ];
-        for (keyword, number) in bounds {
-            if let Some(number) = number {
-                parts.push(self.leaf(NUMBER, id, keyword, format!("{keyword} {number}")));
-            }
+    fn numbers(&mut self, keywords: &Keywords, parts: &mut Vec<TermId>) {
+        let terms = &mut self.context.terms;
+        if let Some(at) = keywords.minimum {
+            parts.push(terms.min(exact(at)));
+        }
+        if let Some(at) = keywords.maximum {
+            parts.push(terms.max(exact(at)));
+        }
+        if let Some(at) = keywords.exclusive_minimum {
+            parts.push(terms.ex_min(exact(at)));
+        }
+        if let Some(at) = keywords.exclusive_maximum {
+            parts.push(terms.ex_max(exact(at)));
+        }
+        if let Some(step) = keywords.multiple_of {
+            parts.push(terms.mof(exact(step)));
         }
     }
 
@@ -445,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn a_type_is_a_term_and_an_integer_is_a_number_with_a_leaf() {
+    fn a_type_is_a_term_and_an_integer_is_a_number_that_is_a_multiple_of_one() {
         assert_eq!(term(&json!(true)), "true");
         assert_eq!(term(&json!({})), "true");
         assert_eq!(term(&json!(false)), "false");
@@ -456,36 +462,58 @@ mod tests {
         );
         assert_eq!(
             term(&json!({"type": "integer"})),
-            "all(type(number), ?[multipleOf 1])"
+            "all(type(number), mof(1))"
         );
         assert_eq!(
             term(&json!({"type": ["integer", "null"]})),
-            "all(type(null | number), ?[multipleOf 1])"
+            "all(type(null | number), mof(1))"
         );
         // A number may be anything that an integer may be.
         assert_eq!(
             term(&json!({"type": ["integer", "number"]})),
             "type(number)"
         );
-        // The leaf is the one of the keyword that says the same.
-        assert_eq!(term(&json!({"multipleOf": 1})), "?[multipleOf 1]");
+        // The term is the one of the keyword that says the same.
+        assert_eq!(term(&json!({"multipleOf": 1})), "mof(1)");
     }
 
     #[test]
-    fn a_constant_is_a_term_if_it_is_null_or_a_boolean() {
+    fn a_keyword_about_numbers_is_a_term_with_the_number_itself() {
+        let schema = json!({
+            "minimum": 1,
+            "maximum": 1e30,
+            "exclusiveMinimum": -0.5,
+            "exclusiveMaximum": 2.50,
+            "multipleOf": 0.01,
+        });
+        assert_eq!(
+            term(&schema),
+            "all(min(1), max(1e+30), exmin(-0.5), exmax(2.5), mof(0.01))"
+        );
+        // One number is one term, however it is written, and the two schemas are one class.
+        assert_eq!(term(&json!({"minimum": 2.0})), "min(2)");
+        let (_, of_a, of_b) = lowered(&json!({"minimum": 2.0}), &json!({"minimum": 2}));
+        assert_eq!(of_a, of_b);
+    }
+
+    #[test]
+    fn a_constant_is_a_term_if_it_is_null_a_boolean_or_a_number() {
         assert_eq!(term(&json!({"const": null})), "type(null)");
         assert_eq!(term(&json!({"const": true})), "is(true)");
         assert_eq!(
             term(&json!({"enum": [null, false, 1, "a"]})),
-            r#"any(type(null), is(false), all(type(number), ?[const 1]), all(type(string), ?[const "a"]))"#
+            r#"any(type(null), is(false), is(1), all(type(string), ?[const "a"]))"#
         );
         assert_eq!(term(&json!({"enum": []})), "false");
         assert_eq!(
             term(&json!({"const": [1, {"a": null}]})),
             r#"all(type(array), ?[const [1,{"a":null}]])"#
         );
-        // One value is one leaf, whichever keyword holds it.
+        // One value is one term, whichever keyword holds it and however it is written.
         assert_eq!(term(&json!({"enum": [1]})), term(&json!({"const": 1})));
+        assert_eq!(term(&json!({"const": 1.0})), term(&json!({"const": 1})));
+        assert_eq!(term(&json!({"const": 0.5})), "is(0.5)");
+        assert_eq!(term(&json!({"enum": ["a"]})), term(&json!({"const": "a"})));
     }
 
     #[test]
@@ -554,8 +582,6 @@ mod tests {
     #[test]
     fn every_other_keyword_is_a_leaf_with_what_it_holds() {
         let schema = json!({
-            "minimum": 1,
-            "exclusiveMaximum": 2.5,
             "maxLength": 3,
             "pattern": "^a",
             "format": "date",
@@ -566,7 +592,7 @@ mod tests {
         });
         assert_eq!(
             term(&schema),
-            r#"all(?[minimum 1], ?[exclusiveMaximum 2.5], ?[maxLength 3], ?[pattern "^a"], ?[format "date"], ?[minItems 4], ?[uniqueItems], ?[required "a"], ?[minProperties 5])"#
+            r#"all(?[maxLength 3], ?[pattern "^a"], ?[format "date"], ?[minItems 4], ?[uniqueItems], ?[required "a"], ?[minProperties 5])"#
         );
         assert_eq!(term(&json!({"uniqueItems": false})), "true");
         // `minContains` says nothing without `contains`.
