@@ -5,7 +5,6 @@
 
 use serde_json::{Value, json};
 
-use crate::rational::shown;
 use crate::schema::Graph;
 use crate::term::{Term, TermId, Terms, VarId};
 
@@ -74,7 +73,7 @@ fn row(graph: &Graph, terms: &Terms, part: TermId) -> Value {
             json!(["type", names.join(", ")])
         }
         Term::BoolConst(value) => json!(["is", value.to_string()]),
-        Term::NumConst(number) => json!(["is", shown(number)]),
+        Term::NumConst(number) => json!(["is", number.to_string()]),
         Term::Min(_) | Term::ExMin(_) | Term::Max(_) | Term::ExMax(_) | Term::Mof(_) => {
             json!(["number", terms.show(part)])
         }

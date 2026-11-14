@@ -14,7 +14,7 @@ use std::fmt::Write;
 use serde_json::{Number, Value};
 
 use crate::context::{Budget, Exhausted};
-use crate::rational::exact;
+use crate::decimal::exact;
 use crate::schema::{Count, Graph, Keywords, Node, NodeId, Part, Schema};
 
 /// A value as JSON text, which is equal for two values exactly when they are written alike.
@@ -135,9 +135,12 @@ fn assertions(id: NodeId, keywords: &Keywords, text: &mut String) {
     put("$dynamicAnchor", keywords.dynamic_anchor.map(quoted));
     put("type", keywords.types.map(|types| format!("{types:?}")));
     // A number is the number that it stands for, however it is written: `1.0` says what `1`
-    // says. Inside an array or an object it is told apart by how it is written, until those
-    // constants are terms.
-    let number = |number: &Number| exact(number).to_string();
+    // says. Outside the range that the engine models it is told apart by how it is written,
+    // and so it is inside an array or an object, until those constants are terms.
+    let number = |number: &Number| match exact(number) {
+        Some(exact) => exact.to_string(),
+        None => number.to_string(),
+    };
     let constant = |value: &Value| match value {
         Value::Number(value) => number(value),
         other => written!(other),

@@ -16,7 +16,7 @@ Each check returns one of three verdicts:
 
 - **`Yes`**: Every instance valid under B is also valid under A.
 - **`No`**: Some instance is valid under B but invalid under A. The verdict carries such an instance as a counterexample.
-- **`Unknown`**: The library cannot decide and provides a reason: the answer depends on an [unsupported construct](#unsupported-constructs), the check ran out of its work budget, or the schemas differ in a [number](#numbers) that cannot be written exactly.
+- **`Unknown`**: The library cannot decide and provides a reason: the answer depends on an [unsupported construct](#unsupported-constructs), the check ran out of its work budget, or the schemas differ in a [number](#numbers) that is beyond the range of the library or that cannot be written exactly.
 
 ## Status
 
@@ -43,9 +43,11 @@ Other dialects may be supported later. For now this is the only one.
 
 Numbers are compared exactly, not as floats. A number in a schema stands for the decimal that it is written as, so `0.0075` is a multiple of `0.0001`, and `1.0` is the integer `1`.
 
+The library models the numbers whose size is below 2^64 and that have at most sixteen decimal places. That covers every 64-bit integer. A keyword with a number outside this range, such as `maximum: 1e30`, counts as an [unsupported construct](#unsupported-constructs): the rest of the schema is still compared, and a check whose answer depends on that keyword returns `Unknown` and names it.
+
 A schema is a `serde_json` value, which keeps a number as a 64-bit integer or as a float. A number that was written with more digits than a float keeps, about 15, may have been rounded before the library sees it.
 
-A `Yes` holds for every number, however many digits it has. The counterexample of a `No` is a number that a `serde_json` value holds exactly. Where the library finds only numbers with more digits to tell two schemas apart, such as those between two floats that are next to each other, the verdict is `Unknown`.
+The range is about the numbers in schemas, and nothing is assumed about instances. A `Yes` holds for every number, also for one outside the range or with more digits than a float keeps. The counterexample of a `No` is a number of the range that a `serde_json` value holds exactly. Where only other numbers tell two schemas apart, such as those above 2^64 or those between two floats that are next to each other, the verdict is `Unknown`.
 
 ## References
 
@@ -58,5 +60,6 @@ A schema that is spread over several files is bundled into one first, as [the sp
 A few JSON schema constructs are not modelled. A check whose answer depends on one of them returns `Unknown` (and a reason why):
 
 - `uniqueItems: true`.
+- A keyword about numbers whose number is outside the [range](#numbers) that the library models, such as `maximum: 1e30`.
 - Patterns with lookaround or backreferences, which the `regex` crate does not accept either, and patterns with word boundaries (`\b`, `\B`).
 - Formats that are not modelled as regular languages, such as `regex`, `idn-email`, `iri` and `uri-template`.

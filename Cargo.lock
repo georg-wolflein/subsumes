@@ -702,10 +702,6 @@ name = "subsumes"
 version = "0.1.0"
 dependencies = [
  "fluent-uri",
- "num-bigint",
- "num-integer",
- "num-rational",
- "num-traits",
  "referencing",
  "serde_json",
 ]

@@ -9,6 +9,9 @@
 //! keeps the place where it stands. A leaf says something only about the instances its
 //! keyword is about: `minLength` about strings, and so a number satisfies it. The terms
 //! about numbers are the same in that: a string satisfies `minimum`.
+//!
+//! A keyword about numbers is a term when its number is within the range that the engine
+//! models. With any other number it is a leaf.
 
 mod classes;
 
@@ -18,9 +21,9 @@ use serde_json::Value;
 
 use self::classes::written;
 use crate::context::{Context, Exhausted};
-use crate::rational::{Rational, exact};
+use crate::decimal::{Decimal, exact};
 use crate::schema::{Count, Graph, Keywords, NodeId, Schema, Type};
-use crate::term::{InstanceType, TermId, TypeSet, VarId};
+use crate::term::{InstanceType, TermId, Terms, TypeSet, VarId};
 
 /// Gives A and B their terms, and returns the variables of the two.
 ///
@@ -131,7 +134,7 @@ impl Lowering<'_, '_> {
         let mut parts = Vec::new();
         self.connectives(id, keywords, &mut parts);
         self.any_type(id, keywords, &mut parts);
-        self.numbers(keywords, &mut parts);
+        self.numbers(id, keywords, &mut parts);
         self.strings(id, keywords, &mut parts);
         self.arrays(id, keywords, &mut parts);
         self.objects(id, keywords, &mut parts);
@@ -248,7 +251,7 @@ impl Lowering<'_, '_> {
             if types.contains(Type::Integer) && !types.contains(Type::Number) {
                 // An integer is a number that is a multiple of one.
                 parts.push(self.context.terms.type_is(set.union(NUMBER)));
-                parts.push(self.context.terms.mof(Rational::from_integer(1.into())));
+                parts.push(self.context.terms.mof(Decimal::ONE));
             } else {
                 parts.push(self.context.terms.type_is(set));
             }
@@ -265,13 +268,17 @@ impl Lowering<'_, '_> {
         }
     }
 
-    /// The term for "the instance is this value". `null`, the booleans and the numbers are
-    /// terms of the engine; any other value is of one type and a leaf over that type.
+    /// The term for "the instance is this value". `null`, the booleans and the numbers of
+    /// the range are terms of the engine; any other value is of one type and a leaf over that
+    /// type.
     fn constant(&mut self, id: NodeId, keyword: &'static str, value: &Value) -> TermId {
         let kind = match value {
             Value::Null => return self.context.terms.type_is(NULL),
             Value::Bool(value) => return self.context.terms.bool_const(*value),
-            Value::Number(number) => return self.context.terms.num_const(exact(number)),
+            Value::Number(number) => match exact(number) {
+                Some(number) => return self.context.terms.num_const(number),
+                None => NUMBER,
+            },
             Value::String(_) => STRING,
             Value::Array(_) => ARRAY,
             Value::Object(_) => OBJECT,
@@ -281,22 +288,32 @@ impl Lowering<'_, '_> {
         self.context.terms.all_of([of_type, is_it])
     }
 
-    fn numbers(&mut self, keywords: &Keywords, parts: &mut Vec<TermId>) {
-        let terms = &mut self.context.terms;
-        if let Some(at) = keywords.minimum {
-            parts.push(terms.min(exact(at)));
-        }
-        if let Some(at) = keywords.maximum {
-            parts.push(terms.max(exact(at)));
-        }
-        if let Some(at) = keywords.exclusive_minimum {
-            parts.push(terms.ex_min(exact(at)));
-        }
-        if let Some(at) = keywords.exclusive_maximum {
-            parts.push(terms.ex_max(exact(at)));
-        }
-        if let Some(step) = keywords.multiple_of {
-            parts.push(terms.mof(exact(step)));
+    fn numbers(&mut self, id: NodeId, keywords: &Keywords, parts: &mut Vec<TermId>) {
+        type Term = fn(&mut Terms, Decimal) -> TermId;
+        let asked: [(_, _, Term); 5] = [
+            ("minimum", keywords.minimum, Terms::min),
+            ("maximum", keywords.maximum, Terms::max),
+            (
+                "exclusiveMinimum",
+                keywords.exclusive_minimum,
+                Terms::ex_min,
+            ),
+            (
+                "exclusiveMaximum",
+                keywords.exclusive_maximum,
+                Terms::ex_max,
+            ),
+            ("multipleOf", keywords.multiple_of, Terms::mof),
+        ];
+        for (keyword, number, term) in asked {
+            let Some(number) = number else {
+                continue;
+            };
+            parts.push(match exact(number) {
+                Some(number) => term(&mut self.context.terms, number),
+                // A number outside the range. Two keywords that hold the same one say the same.
+                None => self.leaf(NUMBER, id, keyword, format!("{keyword} {number}")),
+            });
         }
     }
 
@@ -481,19 +498,50 @@ mod tests {
     fn a_keyword_about_numbers_is_a_term_with_the_number_itself() {
         let schema = json!({
             "minimum": 1,
-            "maximum": 1e30,
+            "maximum": 1e3,
             "exclusiveMinimum": -0.5,
             "exclusiveMaximum": 2.50,
             "multipleOf": 0.01,
         });
         assert_eq!(
             term(&schema),
-            "all(min(1), max(1e+30), exmin(-0.5), exmax(2.5), mof(0.01))"
+            "all(min(1), max(1000), exmin(-0.5), exmax(2.5), mof(0.01))"
         );
         // One number is one term, however it is written, and the two schemas are one class.
         assert_eq!(term(&json!({"minimum": 2.0})), "min(2)");
         let (_, of_a, of_b) = lowered(&json!({"minimum": 2.0}), &json!({"minimum": 2}));
         assert_eq!(of_a, of_b);
+    }
+
+    #[test]
+    fn a_number_outside_the_range_makes_its_keyword_a_leaf() {
+        let schema = json!({"minimum": 0, "maximum": 1e30, "multipleOf": 1e-20});
+        assert_eq!(
+            term(&schema),
+            "all(min(0), ?[maximum 1e+30], ?[multipleOf 1e-20])"
+        );
+        assert_eq!(
+            term(&json!({"const": 1e30})),
+            "all(type(number), ?[const 1e+30])"
+        );
+        assert_eq!(
+            term(&json!({"enum": [1, -1e20]})),
+            "any(is(1), all(type(number), ?[const -1e+20]))"
+        );
+        // The largest number of the range and the smallest are terms.
+        assert_eq!(
+            term(&json!({"maximum": u64::MAX})),
+            "max(18446744073709551615)"
+        );
+        assert_eq!(
+            term(&json!({"multipleOf": 1e-16})),
+            "mof(0.0000000000000001)"
+        );
+        // Two keywords with one such number are one leaf, and their schemas one class.
+        let (_, of_a, of_b) = lowered(&json!({"maximum": 1e30}), &json!({"maximum": 1e30}));
+        assert_eq!(of_a, of_b);
+        let (_, of_a, of_b) = lowered(&json!({"maximum": 1e30}), &json!({"maximum": 1e31}));
+        assert_ne!(of_a, of_b);
     }
 
     #[test]

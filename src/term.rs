@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
-use crate::rational::{Rational, shown};
+use crate::decimal::Decimal;
 use crate::schema::{Graph, NodeId};
 
 /// One of the six types that an instance has. `integer` is none of them: an integer is a
@@ -119,17 +119,17 @@ pub(crate) enum Term {
     /// The instance is this boolean.
     BoolConst(bool),
     /// The instance is this number.
-    NumConst(Rational),
+    NumConst(Decimal),
     /// The instance is no number, or a number that is at least this.
-    Min(Rational),
+    Min(Decimal),
     /// The instance is no number, or a number that is more than this.
-    ExMin(Rational),
+    ExMin(Decimal),
     /// The instance is no number, or a number that is at most this.
-    Max(Rational),
+    Max(Decimal),
     /// The instance is no number, or a number that is less than this.
-    ExMax(Rational),
+    ExMax(Decimal),
     /// The instance is no number, or a multiple of this, which is more than zero.
-    Mof(Rational),
+    Mof(Decimal),
     /// The instance satisfies a predicate that the engine does not model.
     Unknown(LeafId),
     AllOf(Box<[TermId]>),
@@ -238,28 +238,28 @@ impl Terms {
         self.intern(Term::BoolConst(value))
     }
 
-    pub fn num_const(&mut self, number: Rational) -> TermId {
+    pub fn num_const(&mut self, number: Decimal) -> TermId {
         self.intern(Term::NumConst(number))
     }
 
-    pub fn min(&mut self, at: Rational) -> TermId {
+    pub fn min(&mut self, at: Decimal) -> TermId {
         self.intern(Term::Min(at))
     }
 
-    pub fn ex_min(&mut self, at: Rational) -> TermId {
+    pub fn ex_min(&mut self, at: Decimal) -> TermId {
         self.intern(Term::ExMin(at))
     }
 
-    pub fn max(&mut self, at: Rational) -> TermId {
+    pub fn max(&mut self, at: Decimal) -> TermId {
         self.intern(Term::Max(at))
     }
 
-    pub fn ex_max(&mut self, at: Rational) -> TermId {
+    pub fn ex_max(&mut self, at: Decimal) -> TermId {
         self.intern(Term::ExMax(at))
     }
 
     /// The term for "no number, or a multiple of `step`", which is more than zero.
-    pub fn mof(&mut self, step: Rational) -> TermId {
+    pub fn mof(&mut self, step: Decimal) -> TermId {
         self.intern(Term::Mof(step))
     }
 
@@ -425,12 +425,12 @@ impl Terms {
                 Term::BoolConst(value) => {
                     write!(text, "is({value})").expect("a string takes any text");
                 }
-                Term::NumConst(number) => write_number(text, "is", number),
-                Term::Min(at) => write_number(text, "min", at),
-                Term::ExMin(at) => write_number(text, "exmin", at),
-                Term::Max(at) => write_number(text, "max", at),
-                Term::ExMax(at) => write_number(text, "exmax", at),
-                Term::Mof(step) => write_number(text, "mof", step),
+                Term::NumConst(number) => write_number(text, "is", *number),
+                Term::Min(at) => write_number(text, "min", *at),
+                Term::ExMin(at) => write_number(text, "exmin", *at),
+                Term::Max(at) => write_number(text, "max", *at),
+                Term::ExMax(at) => write_number(text, "exmax", *at),
+                Term::Mof(step) => write_number(text, "mof", *step),
                 Term::Unknown(leaf) => {
                     write!(text, "?[{}]", self.leaf(*leaf).key).expect("a string takes any text");
                 }
@@ -450,14 +450,14 @@ impl Terms {
 }
 
 /// Writes a term about numbers, such as `min(0.5)`.
-fn write_number(text: &mut String, name: &str, number: &Rational) {
-    write!(text, "{name}({})", shown(number)).expect("a string takes any text");
+fn write_number(text: &mut String, name: &str, number: Decimal) {
+    write!(text, "{name}({number})").expect("a string takes any text");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rational::testing::number;
+    use crate::decimal::testing::number;
 
     fn leaf(terms: &mut Terms, key: &str) -> TermId {
         let string = TypeSet::of(InstanceType::String);
@@ -507,14 +507,14 @@ mod tests {
             terms.num_const(number("2")),
             terms.min(number("0.5")),
             terms.ex_min(number("-1")),
-            terms.max(number("1e30")),
+            terms.max(number("1e3")),
             terms.ex_max(number("3")),
             terms.mof(number("0.01")),
         ];
         let all = terms.all_of(all);
         assert_eq!(
             terms.show(all),
-            "all(is(2), min(0.5), exmin(-1), max(1e+30), exmax(3), mof(0.01))"
+            "all(is(2), min(0.5), exmin(-1), max(1000), exmax(3), mof(0.01))"
         );
     }
 

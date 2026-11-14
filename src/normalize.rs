@@ -42,7 +42,8 @@ pub(crate) enum Outcome {
 pub(crate) enum Cause {
     /// A predicate that the engine does not model.
     Leaf(LeafId),
-    /// The branch accepts numbers, and none that a JSON number stands for.
+    /// The branch accepts numbers, and none that the library can give: they are beyond the
+    /// range that the engine models, or no JSON number stands for them.
     Number,
 }
 
@@ -926,17 +927,17 @@ mod tests {
     }
 
     #[test]
-    fn a_number_that_no_json_value_holds_is_no_counterexample() {
+    fn a_number_that_the_library_cannot_give_is_no_counterexample() {
         // Every number between two floats that are next to each other has more digits than
-        // a float keeps.
+        // a float keeps. The floats of this size are the whole numbers.
         let between = json!({
             "type": "number",
-            "exclusiveMinimum": 0.1,
-            "exclusiveMaximum": 0.10000000000000002,
+            "exclusiveMinimum": 9_007_199_254_740_991_u64,
+            "exclusiveMaximum": 9_007_199_254_740_992_u64,
         });
         assert_eq!(reason(&json!(false), &between), Reason::Unrepresentable);
-        // So has every number above the largest float.
-        let beyond = json!({"type": "number", "exclusiveMinimum": f64::MAX});
+        // Every number above the largest of the range is beyond the range.
+        let beyond = json!({"type": "number", "exclusiveMinimum": u64::MAX});
         assert_eq!(reason(&json!(false), &beyond), Reason::Unrepresentable);
         assert_eq!(
             reason(&json!({"type": "integer"}), &beyond),
@@ -945,15 +946,65 @@ mod tests {
         // What holds for every number holds for these.
         yes(&json!({"minimum": 0}), &between);
         yes(&json!({"type": "number"}), &beyond);
-        yes(&json!({"minimum": 1e308}), &beyond);
+        yes(&json!({"minimum": 1e19}), &beyond);
         // Another instance is given where there is one, and a leaf is named where there is one.
-        let or_null = json!({"type": ["number", "null"], "exclusiveMinimum": f64::MAX});
+        let or_null = json!({"type": ["number", "null"], "exclusiveMinimum": u64::MAX});
         assert_eq!(counterexample(&json!(false), &or_null), json!(null));
         let or_string =
-            json!({"type": ["number", "string"], "exclusiveMinimum": f64::MAX, "minLength": 1});
+            json!({"type": ["number", "string"], "exclusiveMinimum": u64::MAX, "minLength": 1});
         assert_eq!(
             depends_on(&json!(false), &or_string),
             (Side::B, "#/minLength".to_owned())
+        );
+        // Two numbers to be a multiple of, whose least common multiple is beyond the range.
+        // Zero is a multiple of both, and no other number is given.
+        let prime = 18_446_744_073_709_551_557_u64;
+        let both = json!({"type": "number", "multipleOf": prime, "allOf": [{"multipleOf": 3}]});
+        assert_eq!(counterexample(&json!(false), &both), json!(0));
+        yes(&json!({"multipleOf": 3}), &both);
+        assert_eq!(reason(&json!({"const": 0}), &both), Reason::Unrepresentable);
+    }
+
+    #[test]
+    fn a_keyword_with_a_number_outside_the_range_is_a_leaf() {
+        let (to_1e30, to_1e31) = (json!({"maximum": 1e30}), json!({"maximum": 1e31}));
+        assert_eq!(
+            depends_on(&to_1e31, &to_1e30),
+            (Side::A, "#/maximum".to_owned())
+        );
+        // What two schemas say alike cancels, and the rest is compared as numbers.
+        yes(&to_1e30, &to_1e30.clone());
+        yes(
+            &json!({"type": "number", "maximum": 1e30}),
+            &json!({"type": "integer", "maximum": 1e30}),
+        );
+        yes(
+            &json!({"minimum": 0, "maximum": 1e30}),
+            &json!({"minimum": 5, "maximum": 1e30}),
+        );
+        assert_eq!(
+            counterexample(
+                &json!({"type": "number", "minimum": 5, "maximum": 1e30}),
+                &json!({"minimum": 0, "multipleOf": 1e-20})
+            ),
+            json!(null)
+        );
+        // A number from 0 to 5 tells the two apart, if it satisfies the leaf that both share.
+        assert_eq!(
+            depends_on(
+                &json!({"minimum": 5, "maximum": 1e30}),
+                &json!({"type": "number", "minimum": 0, "maximum": 1e30})
+            ),
+            (Side::A, "#/maximum".to_owned())
+        );
+        // A constant is the same: one number of an `enum` may be outside, and the others
+        // are numbers.
+        yes(&json!({"const": 1e30}), &json!({"enum": [1e30]}));
+        yes(&json!({"enum": [1, 1e30, 2]}), &json!({"enum": [2, 1]}));
+        yes(&json!({"type": "number"}), &json!({"const": 1e30}));
+        assert_eq!(
+            depends_on(&json!({"type": "integer"}), &json!({"const": 1e30})),
+            (Side::B, "#/const".to_owned())
         );
     }
 
