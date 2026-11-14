@@ -1,7 +1,7 @@
 use serde_json::Value;
 
 use crate::context::Context;
-use crate::normalize::{self, Outcome};
+use crate::normalize::{self, Cause, Outcome};
 use crate::{Error, Reason, Verdict, inspect, lower, schema};
 
 /// The work budget of the Python version; to be set anew once there is an engine to measure.
@@ -78,7 +78,10 @@ impl Checker {
         let verdict = match outcome {
             Ok(Outcome::Yes) => Verdict::Yes,
             Ok(Outcome::No(counterexample)) => Verdict::No { counterexample },
-            Ok(Outcome::Unknown(leaf)) => {
+            Ok(Outcome::Unknown(Cause::Number)) => Verdict::Unknown {
+                reason: Reason::Unrepresentable,
+            },
+            Ok(Outcome::Unknown(Cause::Leaf(leaf))) => {
                 let leaf = context.terms.leaf(leaf);
                 let reason = Reason::Unsupported {
                     schema: graph.node(leaf.node).side,
@@ -154,15 +157,15 @@ mod tests {
         let counterexample = json!(null);
         assert_eq!(check.verdict, Verdict::No { counterexample });
 
-        // The engine does not model numbers yet, and says which keyword stands in the way.
-        let (integer, number) = (json!({"type": "integer"}), json!({"type": "number"}));
-        let check = checker.check(&integer, &number).unwrap();
+        // The engine does not model strings yet, and says which keyword stands in the way.
+        let named = json!({"type": "string", "minLength": 1});
+        let check = checker.check(&named, &text).unwrap();
         assert_eq!(
             check.verdict,
             Verdict::Unknown {
                 reason: Reason::Unsupported {
                     schema: Side::A,
-                    location: "#/type".to_owned(),
+                    location: "#/minLength".to_owned(),
                 },
             }
         );
