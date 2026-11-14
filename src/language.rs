@@ -13,7 +13,7 @@
 //! - As an automaton, for anything else.
 //!
 //! A pattern is only parsed when it comes in. Its automaton is built when something is asked
-//! that needs it, so a pattern that cancels against itself costs nothing.
+//! that needs it, so a pattern that cancels against itself before that costs nothing.
 
 mod automaton;
 mod pattern;

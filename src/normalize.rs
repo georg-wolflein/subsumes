@@ -985,7 +985,7 @@ mod tests {
     }
 
     #[test]
-    fn what_two_schemas_share_about_strings_costs_no_automaton() {
+    fn a_pattern_that_is_asked_for_and_against_costs_no_automaton() {
         // The pattern takes thousands of steps to become an automaton.
         let pattern = "^(?:[a-f]{50}[0-9]{50}){20}$";
         let (a, b) = (
@@ -1003,6 +1003,17 @@ mod tests {
         };
         assert_eq!(checker.check(&b, &a).unwrap().verdict, unknown);
         let check = Checker::new().check(&b, &a).unwrap();
+        assert_eq!(check.verdict, Verdict::Yes);
+        assert!(check.steps > 4_000, "{}", check.steps);
+        // With a type next to the pattern, the negation of A is a split. The branch asks
+        // whether a string is left before it splits, and by then the pattern is an
+        // automaton, although the split then cancels it.
+        let typed = |schema: &Value| {
+            let mut schema = schema.clone();
+            schema["type"] = json!("string");
+            schema
+        };
+        let check = Checker::new().check(&typed(&a), &typed(&b)).unwrap();
         assert_eq!(check.verdict, Verdict::Yes);
         assert!(check.steps > 4_000, "{}", check.steps);
     }
