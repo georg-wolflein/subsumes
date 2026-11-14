@@ -80,11 +80,11 @@ fn row(graph: &Graph, terms: &Terms, languages: &Languages, part: TermId) -> Val
         Term::BoolConst(value) => json!(["is", value.to_string()]),
         Term::NumConst(number) => json!(["is", shown(number)]),
         Term::Min(_) | Term::ExMin(_) | Term::Max(_) | Term::ExMax(_) | Term::Mof(_) => {
-            json!(["number", terms.show(part)])
+            json!(["number", terms.show_with(part, languages)])
         }
         Term::StrConst(word) => json!(["is", format!("{word:?}")]),
         Term::Patt(language) => json!(["string", languages.show(*language)]),
-        Term::MinLen(_) | Term::MaxLen(_) => json!(["string", terms.show(part)]),
+        Term::MinLen(_) | Term::MaxLen(_) => json!(["string", terms.show_with(part, languages)]),
         Term::Unknown(leaf) => {
             let leaf = terms.leaf(*leaf);
             let about: Vec<&str> = leaf.domain.iter().map(|kind| kind.name()).collect();
@@ -96,11 +96,11 @@ fn row(graph: &Graph, terms: &Terms, languages: &Languages, part: TermId) -> Val
                 format!("{key}, about {about}, first at {place} in {side}")
             ])
         }
-        Term::AllOf(_) => json!(["all of", terms.show(part)]),
-        Term::AnyOf(_) => json!(["any of", terms.show(part)]),
-        Term::OneOf(_) => json!(["one of", terms.show(part)]),
-        Term::Not(inner) => json!(["not", terms.show(*inner)]),
-        Term::Ref(_) => json!(["also", terms.show(part)]),
+        Term::AllOf(_) => json!(["all of", terms.show_with(part, languages)]),
+        Term::AnyOf(_) => json!(["any of", terms.show_with(part, languages)]),
+        Term::OneOf(_) => json!(["one of", terms.show_with(part, languages)]),
+        Term::Not(inner) => json!(["not", terms.show_with(*inner, languages)]),
+        Term::Ref(_) => json!(["also", terms.show_with(part, languages)]),
     }
 }
 
@@ -235,17 +235,32 @@ mod tests {
             "maxLength": 2,
             "pattern": "^a",
             "format": "date",
+            "not": {"pattern": "b$"},
         });
         let shown = shown(&schema, &json!(true), u64::MAX);
+        let nodes = &shown["stages"][1]["nodes"];
         assert_eq!(
-            shown["stages"][1]["nodes"][0]["keywords"],
+            nodes[0]["keywords"],
             json!([
+                ["not", "x2"],
                 ["any of", r#"any(is("a"), is("é\n"))"#],
                 ["string", "minlen(1)"],
                 ["string", "maxlen(2)"],
                 ["string", r#""^a""#],
                 ["string", "format date"],
             ])
+        );
+        assert_eq!(nodes[2]["keywords"], json!([["string", r#""b$""#]]));
+        // A format that is modelled in part: what it accepts, or what it leaves open
+        // together with a leaf. Inside a term a language is named as it is in a row.
+        let time = json!({"format": "time"});
+        let shown = self::shown(&time, &json!(true), u64::MAX);
+        assert_eq!(
+            shown["stages"][1]["nodes"][0]["keywords"],
+            json!([[
+                "any of",
+                r#"any(patt(format time), all(patt(format time, where it is open), ?[format "time" where it is open]))"#
+            ]])
         );
     }
 

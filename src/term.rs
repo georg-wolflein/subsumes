@@ -418,14 +418,23 @@ impl Terms {
         &mut self.variables[id.index()]
     }
 
-    /// A term as text, for tests and for the viewer.
+    /// A term as text, for tests. A language is named by its id, as in `patt(l2)`.
+    #[cfg(test)]
     pub fn show(&self, id: TermId) -> String {
         let mut text = String::new();
-        self.write(id, &mut text);
+        self.write(id, &mut text, &|language| format!("l{}", language.index()));
         text
     }
 
-    fn write(&self, id: TermId, text: &mut String) {
+    /// A term as text for the viewer, with each language as the store of the check shows
+    /// it: the pattern, or the name of the format.
+    pub fn show_with(&self, id: TermId, languages: &Languages) -> String {
+        let mut text = String::new();
+        self.write(id, &mut text, &|language| languages.show(language));
+        text
+    }
+
+    fn write(&self, id: TermId, text: &mut String, named: &dyn Fn(LanguageId) -> String) {
         // The work left: a term to write, or text that follows what was written.
         enum Step {
             Term(TermId),
@@ -469,9 +478,8 @@ impl Terms {
                 Term::StrConst(word) => {
                     write!(text, "is({word:?})").expect("a string takes any text");
                 }
-                // Which language it is, the store of the check says.
                 Term::Patt(language) => {
-                    write!(text, "patt(l{})", language.index()).expect("a string takes any text");
+                    write!(text, "patt({})", named(*language)).expect("a string takes any text");
                 }
                 Term::MinLen(least) => {
                     write!(text, "minlen({least})").expect("a string takes any text");

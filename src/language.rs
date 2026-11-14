@@ -34,6 +34,7 @@ use crate::context::{Budget, Exhausted};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct LanguageId(u32);
 
+#[cfg(test)]
 impl LanguageId {
     pub fn index(self) -> usize {
         self.0 as usize
