@@ -3,11 +3,12 @@
 //! `all[B, not A]` is taken apart into *branches*. A branch is a conjunction of what the
 //! engine knows how to combine: the types an instance may still have, the booleans it may
 //! still be, the leaves that must hold and those that must not, and the variables taken for
-//! true or for false. A disjunction splits a branch in as many as it has alternatives.
+//! true or for false. What it says about numbers is one value, which knows whether a number
+//! is left. A disjunction splits a branch in as many as it has alternatives.
 //!
 //! - A branch that contradicts itself is *refuted*. If every branch is, A subsumes B.
 //! - A branch that is not refuted and has a type that no leaf is about gives an instance of
-//!   that type: a counterexample.
+//!   that type: a counterexample. A number is one only if a JSON value holds it.
 //! - Any other branch that is not refuted depends on a leaf, and the answer is unknown.
 //!
 //! A leaf never refutes a branch, except together with its own negation.
@@ -19,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde_json::Value;
 
+use crate::canonical::number::{Numbers, Says};
 use crate::context::{Context, Exhausted};
 use crate::generate;
 use crate::term::{InstanceType, LeafId, Term, TermId, Terms, TypeSet, VarId};
@@ -70,10 +72,10 @@ pub(crate) fn decide(context: &mut Context, a: VarId, b: VarId) -> Result<Outcom
         }
         let Some(choice) = branch.choices.pop_front() else {
             // Nothing is left to take in, and the branch stands.
-            match branch.instance() {
+            match engine.instance(&branch)? {
                 Some(instance) => return Ok(Outcome::No(instance)),
                 None => {
-                    let leaf = branch.leaf(&engine.context.terms);
+                    let leaf = engine.leaf(&branch);
                     engine.depends_on.get_or_insert(leaf);
                 }
             }
@@ -130,6 +132,10 @@ struct Branch {
     covered: TypeSet,
     /// The leaves that must not hold.
     fails: BTreeSet<LeafId>,
+    /// What an instance must satisfy if it is a number, and the unfolding out of which the
+    /// first term about numbers came. The type is left only while a number is.
+    number: Numbers,
+    number_from: Option<usize>,
     /// The variables taken for true, with `false`, and those taken for false, with `true`.
     /// Each is unfolded once in a branch, and this is its unfolding.
     taken: BTreeMap<(VarId, bool), usize>,
@@ -152,6 +158,8 @@ impl Default for Branch {
             holds: BTreeSet::new(),
             covered: TypeSet::NONE,
             fails: BTreeSet::new(),
+            number: Numbers::default(),
+            number_from: None,
             taken: BTreeMap::new(),
             met: BTreeSet::new(),
             todo: VecDeque::new(),
@@ -161,13 +169,14 @@ impl Default for Branch {
 }
 
 const BOOLEAN: TypeSet = TypeSet::of(InstanceType::Boolean);
+const NUMBER: TypeSet = TypeSet::of(InstanceType::Number);
 
 impl Branch {
     /// How much there is to copy when the branch splits.
     fn weight(&self) -> u64 {
         let leaves = self.holds.len() + self.fails.len();
         let variables = self.taken.len() + self.met.len();
-        (leaves + variables + self.choices.len()) as u64
+        (leaves + variables + self.choices.len()) as u64 + self.number.weight()
     }
 
     /// Keeps only instances of these types. Returns whether any are left.
@@ -185,8 +194,9 @@ impl Branch {
         true
     }
 
-    /// The types that the branch says nothing about beyond the type: no leaf that must hold
-    /// is about them. A leaf that must not hold is about every type that is left.
+    /// The types of which the branch does not ask what the engine does not model: no leaf
+    /// that must hold is about them. A leaf that must not hold is about every type that is
+    /// left.
     fn free(&self) -> TypeSet {
         if self.fails.is_empty() {
             self.types.intersection(self.covered.complement())
@@ -195,21 +205,15 @@ impl Branch {
         }
     }
 
-    /// An instance that the branch accepts, if it is known to accept one.
-    fn instance(&self) -> Option<Value> {
-        let kind = self.free().iter().next()?;
-        Some(generate::instance(kind, self.booleans[1]))
-    }
-
-    /// A leaf that stands between the branch and an instance.
-    fn leaf(&self, terms: &Terms) -> LeafId {
+    /// A leaf that stands between the branch and an instance, if one does.
+    fn leaf(&self, terms: &Terms) -> Option<LeafId> {
         let about_what_is_left = |leaf: &&LeafId| {
             let about = terms.leaf(**leaf).domain;
             !about.intersection(self.types).is_empty()
         };
         let must_not_hold = self.fails.first();
         let leaf = must_not_hold.or_else(|| self.holds.iter().find(about_what_is_left));
-        *leaf.expect("a branch without an instance depends on a leaf")
+        leaf.copied()
     }
 }
 
@@ -227,6 +231,59 @@ impl Engine<'_> {
     /// comes out of the branch cannot give one either.
     fn is_hopeless(&self, branch: &Branch) -> bool {
         self.depends_on.is_some() && branch.free().is_empty()
+    }
+
+    /// An instance that a branch accepts, if it is known to accept one that a JSON value
+    /// holds.
+    fn instance(&mut self, branch: &Branch) -> Result<Option<Value>, Exhausted> {
+        let Context { terms, budget } = &mut *self.context;
+        let may_be_true = branch.booleans[1];
+        generate::instance(
+            branch.free(),
+            may_be_true,
+            &branch.number,
+            &terms.rationals,
+            budget,
+        )
+    }
+
+    /// A leaf that stands between a branch and an instance.
+    fn leaf(&mut self, branch: &Branch) -> LeafId {
+        if let Some(leaf) = branch.leaf(&self.context.terms) {
+            return leaf;
+        }
+        // No leaf is in the way, so the branch accepts numbers, and none that JSON holds. The
+        // leaf for that names a schema that says something about numbers.
+        let from = branch.number_from;
+        let from = from.expect("a branch that says nothing about numbers accepts zero");
+        let schema = self.unfoldings[from].variable;
+        let schema = self.context.terms.variable(schema).node;
+        self.context.terms.beyond_json(schema)
+    }
+
+    /// Takes in what a term says about numbers. Returns whether the branch still stands.
+    ///
+    /// Such a term holds for whatever is no number. So its negation, which `says` is if the
+    /// item is negated, holds for numbers only.
+    fn constrain(
+        &mut self,
+        branch: &mut Branch,
+        item: Item,
+        says: Says,
+    ) -> Result<bool, Exhausted> {
+        if item.negated && !branch.restrict(NUMBER) {
+            return Ok(false);
+        }
+        if !branch.types.contains(InstanceType::Number) {
+            return Ok(true);
+        }
+        let Context { terms, budget } = &mut *self.context;
+        branch.number.take(&mut terms.rationals, says);
+        branch.number_from = branch.number_from.or(item.within);
+        if branch.number.is_empty(&terms.rationals, budget)? {
+            return Ok(branch.restrict(NUMBER.complement()));
+        }
+        Ok(true)
     }
 
     /// Takes in everything that needs no split. Returns whether the branch still stands.
@@ -257,6 +314,25 @@ impl Engine<'_> {
             (Term::TypeIs(types), true) => branch.restrict(types.complement()),
             (Term::BoolConst(value), false) => branch.restrict(BOOLEAN) && branch.exclude(!*value),
             (Term::BoolConst(value), true) => branch.exclude(*value),
+            // The negation of "at least" is "below", and so on.
+            (Term::Min(at), false) | (Term::ExMax(at), true) => {
+                return self.constrain(branch, item, Says::AtLeast(*at));
+            }
+            (Term::ExMin(at), false) | (Term::Max(at), true) => {
+                return self.constrain(branch, item, Says::Above(*at));
+            }
+            (Term::Max(at), false) | (Term::ExMin(at), true) => {
+                return self.constrain(branch, item, Says::AtMost(*at));
+            }
+            (Term::ExMax(at), false) | (Term::Min(at), true) => {
+                return self.constrain(branch, item, Says::Below(*at));
+            }
+            (Term::Mof(of), false) => {
+                return self.constrain(branch, item, Says::MultipleOf(*of));
+            }
+            (Term::Mof(of), true) => {
+                return self.constrain(branch, item, Says::NoMultipleOf(*of));
+            }
             (Term::Unknown(leaf), false) => {
                 branch.holds.insert(*leaf);
                 branch.covered = branch.covered.union(self.context.terms.leaf(*leaf).domain);
@@ -604,15 +680,9 @@ mod tests {
             &json!({"minimum": 3}),
             &json!({"type": "string", "minLength": 1}),
         );
-        let integer = json!({"type": "integer"});
-        yes(&json!({"type": "number"}), &integer);
-        assert_eq!(
-            depends_on(&integer, &json!({"type": "number"})),
-            (Side::A, "#/type".to_owned())
-        );
-        // A string satisfies the leaf for an integer, so a string is an instance.
-        let either = json!({"type": ["integer", "string"]});
-        assert_eq!(counterexample(&json!({"type": "null"}), &either), json!(""));
+        // An array satisfies a leaf about strings, so an array is an instance.
+        let either = json!({"type": ["string", "array"], "minLength": 1});
+        assert_eq!(counterexample(&json!({"type": "null"}), &either), json!([]));
         assert_eq!(
             depends_on(
                 &json!({"type": "string", "minLength": 3}),
@@ -634,6 +704,148 @@ mod tests {
             depends_on(&json!({"const": "a"}), &json!({"type": "string"})),
             (Side::A, "#/const".to_owned())
         );
+    }
+
+    #[test]
+    fn the_ends_of_an_interval_are_compared_exactly() {
+        let at_least = |number: f64| json!({"minimum": number});
+        yes(&at_least(0.0), &at_least(1.0));
+        yes(&at_least(0.0), &at_least(0.0));
+        yes(&at_least(0.1), &at_least(0.1));
+        assert_eq!(counterexample(&at_least(1.0), &at_least(0.0)), json!(0));
+        assert_eq!(counterexample(&at_least(0.11), &at_least(0.1)), json!(0.1));
+        // An open end is the closed one without the number itself.
+        let (above, below) = (
+            json!({"exclusiveMinimum": 0}),
+            json!({"exclusiveMaximum": 9}),
+        );
+        yes(&at_least(0.0), &above);
+        assert_eq!(counterexample(&above, &at_least(0.0)), json!(0));
+        yes(&json!({"maximum": 9}), &below);
+        assert_eq!(counterexample(&below, &json!({"maximum": 9})), json!(9));
+        yes(
+            &json!({"not": {"exclusiveMaximum": 0}}),
+            &json!({"type": "number", "minimum": 0}),
+        );
+
+        // The ends of several schemas are one interval.
+        let digit = json!({"allOf": [at_least(0.0), below], "type": "number"});
+        yes(&json!({"minimum": -1, "maximum": 9}), &digit);
+        assert_eq!(counterexample(&json!({"maximum": 5}), &digit), json!(6));
+        assert_eq!(
+            counterexample(&json!({"exclusiveMaximum": 8.99}), &digit),
+            json!(8.99)
+        );
+        // An interval that holds no number accepts no number.
+        let none = json!({"type": "number", "minimum": 1, "exclusiveMaximum": 1});
+        yes(&json!(false), &none);
+        // A number in one of two intervals.
+        let outside = json!({"anyOf": [{"exclusiveMaximum": 0}, {"minimum": 9}]});
+        yes(&outside, &json!({"not": digit}));
+        assert_eq!(counterexample(&outside, &at_least(-1.0)), json!(0));
+
+        // What is no number satisfies each of these keywords.
+        yes(&at_least(0.0), &json!({"type": "string"}));
+        assert_eq!(
+            counterexample(&json!({"type": "number"}), &at_least(0.0)),
+            json!(null)
+        );
+        // And their negations accept numbers only.
+        yes(&json!({"type": "number"}), &json!({"not": at_least(0.0)}));
+    }
+
+    #[test]
+    fn a_multiple_is_one_of_the_number_that_was_written() {
+        let multiple = |of: f64| json!({"multipleOf": of});
+        // As floats, the one is no multiple of the other.
+        yes(&multiple(0.0001), &multiple(0.0075));
+        assert_eq!(
+            counterexample(&multiple(0.0075), &multiple(0.0001)),
+            json!(0.0001)
+        );
+        let (number, integer) = (json!({"type": "number"}), json!({"type": "integer"}));
+        yes(&number, &integer);
+        assert_eq!(counterexample(&integer, &number), json!(0.1));
+        yes(&integer, &json!({"type": "number", "multipleOf": 3}));
+        yes(&multiple(0.5), &integer);
+        yes(
+            &json!({"type": ["integer", "null"]}),
+            &json!({"type": "null"}),
+        );
+
+        // A multiple of several is a multiple of the least that all of them divide.
+        let both = json!({"allOf": [multiple(4.0), multiple(6.0)]});
+        yes(&multiple(12.0), &both);
+        yes(&both, &multiple(24.0));
+        assert_eq!(counterexample(&multiple(24.0), &both), json!(12));
+
+        // An odd integer is no multiple of four, and it may be one of three.
+        let odd = json!({"type": "integer", "not": multiple(2.0)});
+        yes(&json!({"not": multiple(4.0)}), &odd);
+        assert_eq!(
+            counterexample(&json!({"not": multiple(3.0)}), &odd),
+            json!(3)
+        );
+        assert_eq!(counterexample(&multiple(3.0), &odd), json!(1));
+        yes(&odd, &json!({"type": "integer", "not": multiple(2.0)}));
+        // The multiples in an interval.
+        let teens = json!({"type": "integer", "minimum": 13, "maximum": 19});
+        yes(&json!({"not": multiple(10.0)}), &teens);
+        assert_eq!(
+            counterexample(&json!({"not": multiple(7.0)}), &teens),
+            json!(14)
+        );
+        let between = json!({"type": "integer", "exclusiveMinimum": 0, "exclusiveMaximum": 1});
+        yes(&json!(false), &between);
+    }
+
+    #[test]
+    fn a_constant_number_is_an_interval_of_one() {
+        let one_to_three = json!({"type": "integer", "minimum": 1, "maximum": 3});
+        let listed = json!({"enum": [3, 1.0, 2]});
+        yes(&listed, &one_to_three);
+        yes(&one_to_three, &listed);
+        yes(&json!({"const": 1.0}), &json!({"const": 1}));
+        yes(&json!({"type": "integer"}), &json!({"const": 3}));
+        assert_eq!(
+            counterexample(&listed, &json!({"type": "integer", "minimum": 0})),
+            json!(0)
+        );
+        assert_eq!(
+            counterexample(&listed, &json!({"type": "number", "minimum": 1})),
+            json!(1.1)
+        );
+        // A number that is not the constant is below it or above it.
+        let other = json!({"type": "number", "not": {"const": 0.5}});
+        assert_eq!(counterexample(&json!({"minimum": 0.5}), &other), json!(0));
+        assert_eq!(counterexample(&json!({"maximum": 0.5}), &other), json!(0.6));
+        yes(&json!({"not": {"enum": [0.5, "a"]}}), &other);
+        assert_eq!(
+            counterexample(&json!({"const": 0.1}), &json!({"enum": [0.1, 0.2]})),
+            json!(0.2)
+        );
+    }
+
+    #[test]
+    fn a_number_that_json_does_not_hold_is_no_counterexample() {
+        // Two floats that are next to each other. Every number between them has more digits
+        // than a float holds, so the check knows of an instance and cannot write it.
+        let between = json!({
+            "exclusiveMinimum": 1e30,
+            "exclusiveMaximum": 1.000_000_000_000_000_2e30,
+        });
+        let mut narrow = between.clone();
+        narrow["type"] = json!("number");
+        let string = json!({"type": "string"});
+        assert_eq!(depends_on(&string, &narrow), (Side::B, "#".to_owned()));
+        // The numbers still count where nothing has to be written.
+        yes(&json!({"minimum": 1e30}), &narrow);
+        yes(&narrow, &narrow.clone());
+        // An instance of another type is given where there is one.
+        assert_eq!(counterexample(&string, &between), json!(null));
+        // So is a number with few digits where the interval is wide.
+        let wide = json!({"type": "integer", "exclusiveMinimum": 1e30});
+        assert_eq!(counterexample(&string, &wide), json!(2e30));
     }
 
     #[test]

@@ -30,7 +30,9 @@ pub enum Reason {
         /// Where the construct is: a URI reference whose fragment is a JSON Pointer, such as
         /// `#/properties/tags/uniqueItems`. `#` alone is the schema as a whole. For a schema
         /// that refers to itself in a way that is not modelled, it is the subschema in which
-        /// the cycle closes.
+        /// the cycle closes. Where the two schemas are told apart only by numbers that a
+        /// JSON value does not hold, such as an integer of thirty digits that does not end in
+        /// zeros, it is a subschema that says something about numbers.
         location: String,
     },
     /// The check ran out of its work budget.

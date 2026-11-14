@@ -4,7 +4,7 @@
 
 The [README](README.md) states the goals, the verdicts and what is unsupported. This document is the plan for the implementation.
 
-**Status:** the API, the benchmark harness, the load stage and the skeleton of the engine exist. The engine models the types, `null`, the booleans, the connectives and `$ref`, and answers `Unknown` where the answer depends on another keyword. The rest of the [pipeline](#pipeline) is still to be built, in the [order of work](#order-of-work) below.
+**Status:** the API, the benchmark harness, the load stage and the skeleton of the engine exist. The engine models the types, `null`, the booleans, numbers, the connectives and `$ref`, and answers `Unknown` where the answer depends on another keyword. The rest of the [pipeline](#pipeline) is still to be built, in the [order of work](#order-of-work) below.
 
 ## Method
 
@@ -75,22 +75,23 @@ The engine works on *terms*, not keywords:
 | --- | --- |
 | any | `True`, `False`, `TypeIs`, `AllOf`, `AnyOf`, `OneOf`, `Not`, `Ref`, `Unknown` |
 | boolean | `BoolConst` |
-| number | `Min`, `Max`, `ExMin`, `ExMax`, `Mof`, `NotMof` |
+| number | `Min`, `Max`, `ExMin`, `ExMax`, `Mof` |
 | string | `Patt` over a regular language, `MinLen`, `MaxLen` |
 | object | `PProp`, `PReq`, `PNames`, `MinProps`, `MaxProps` |
 | array | `Item`, `AddIts`, `Contains`, `MaxContains`, `MinIts`, `MaxIts` |
 
 - **Variables.** Every nested subschema (a property, an item, a `contains`) is a *c-reference*: a set of variables that denotes their conjunction, never an inline term. This keeps canonical forms flat and lets results be shared.
 - **Every schema that is reached in place has a variable:** the two roots, and what a connective or a `$ref` leads to. The term of the variable is the conjunction of what its keywords say. Schemas of one [class](#data-layout) share a variable.
-- **What is modelled so far** is the types, `null`, the booleans, the connectives and `$ref`. Every other keyword is an `Unknown` leaf, which keeps the place where it stands, until its step of the order of work makes it a term.
-- **A leaf is about the instances its keyword is about.** `minLength` says something about strings only, so a number satisfies its leaf and no number satisfies the negation. `const` and `enum` with another value than `null` or a boolean are the type of the value and a leaf about that type.
+- **What is modelled so far** is the types, `null`, the booleans, numbers, the connectives and `$ref`. Every other keyword is an `Unknown` leaf, which keeps the place where it stands, until its step of the order of work makes it a term.
+- **A leaf is about the instances its keyword is about.** `minLength` says something about strings only, so a number satisfies its leaf and no number satisfies the negation. `const` and `enum` with another value than `null`, a boolean or a number are the type of the value and a leaf about that type.
+- **A term about one type is about that type only,** as its keyword is: a string satisfies `Min(q)`. Its negation holds for that type alone, so `not(Min(q))` is a number below `q` and `not(Mof(q))` is a number that is no multiple of `q`. No term says either. The branch takes the negation as what it says about numbers.
 - **Two leaves are one when they must hold for the same instances:** the same keyword with the same value, or with subschemas of the same class. Keywords that depend on each other are one leaf: `items` with `prefixItems`, `additionalProperties` with `properties` and `patternProperties`, `contains` with its bounds. `unevaluatedProperties` and `unevaluatedItems` depend on the whole schema around them, so their leaf is one of that schema's class. A `$dynamicRef`, and a count that was too large to keep, are like no other.
-- **Negation moves one level at a time.** `not(PProp(p, x))` is `PReq(p, ¬x)` and `not(Min(q))` is `ExMax(q)`. A negated c-reference `¬x` is a fresh variable whose body is `not(x)`.
+- **Negation moves one level at a time.** `not(PProp(p, x))` is `PReq(p, ¬x)`. A negated c-reference `¬x` is a fresh variable whose body is `not(x)`.
 - **`$ref` and `$dynamicRef`** targets are variables. A `$dynamicRef` variable is keyed by its target and the dynamic scope it was reached in, which models the dynamic scope without unfolding. That is step 7; until then a check does not get as far as the terms if A or B leads to a `$dynamicRef`, see [left for later](#left-for-later).
 - **Rewrites.**
   - `prefixItems` and `items` become `Item` and `AddIts`; `contains`, `minContains` and `maxContains` become `Contains` and `MaxContains`.
   - `integer` is `number` with `multipleOf: 1`.
-  - `const` and `enum` become the structural terms that denote exactly those values.
+  - `const` and `enum` become the structural terms that denote exactly those values. A number is `Min` and `Max` of itself.
   - `if`/`then`/`else`, `dependentRequired` and `dependentSchemas` become combinations of `AnyOf`, `AllOf` and `Not`. `oneOf` stays one term, `OneOf`, because written out it takes the square of its length; the engine writes out only what it gets to.
   - `propertyNames` becomes `PNames(x)`, whose language is the string language of `x`.
 - **`unevaluatedProperties` and `unevaluatedItems`** are expanded by *scenarios*: every combination of branches of the in-place applicators (`allOf`, `anyOf`, `oneOf`, `if`/`then`/`else`, `$ref`, `dependentSchemas`) that can hold, with the names or positions it evaluates. A scenario is the conjunction of the branches it takes, the negation of those it does not, and `additionalProperties` or `items` over what it leaves unevaluated. Scenarios that evaluate the same set are merged.
@@ -98,11 +99,11 @@ The engine works on *terms*, not keywords:
 ### Normalize
 
 - **Canonical conjunctions**, one per type:
-  - `CNum`: an interval, the multiple and the excluded multiples.
+  - `CNum`: an interval, the multiple and the excluded multiples. Several multiples are one, the least number that all of them divide. Whether a number is left is asked each time a term comes in, and the type goes when none is. With excluded multiples that is a search, which charges the budget: `k·m` is a multiple of an excluded `n` exactly when the denominator of `m/n` divides `k`, so the search looks for a whole `k` in the interval that none of these denominators divides. It ends at the end of the interval or after a few numbers, since the denominators cannot divide many numbers in a row.
   - `CStr`: one language, the intersection of every pattern and format, plus length bounds.
   - `CObj`: the *fragment map*, a partition of all names into pattern fragments, each with the c-reference that every member satisfies and those that some member must satisfy, plus bounds on the property count.
   - `CArr`: a head of positional c-references, a tail, the `Contains` and `MaxContains` constraints and length bounds.
-- **A branch is a conjunction in the making.** `all[B, not A]` is taken apart into branches. A branch holds what the engine knows how to combine: the types and booleans an instance may still have, the leaves that must hold and those that must not, and the variables taken for true or for false. The canonical conjunctions of numbers, strings, objects and arrays join it with their steps.
+- **A branch is a conjunction in the making.** `all[B, not A]` is taken apart into branches. A branch holds what the engine knows how to combine: the types and booleans an instance may still have, the leaves that must hold and those that must not, and the variables taken for true or for false. That of numbers is part of it; the canonical conjunctions of strings, objects and arrays join it with their steps.
 - **What a term unfolds to waits its turn.** Terms are taken in the order in which they come up, so a variable meets its own negation, and a leaf its own, before either is opened.
 - **A split is made one alternative at a time.** Each alternative is followed to its end before the next is made. So an instance is found without the alternatives after it, and a long `oneOf`, which has the square of its length in alternatives, is never written out.
 - **Lazy negation.** `not(S)` is pushed one level and the result inserted. Before a refutable `AnyOf` is expanded, each branch is tried in *fast mode*, which gives up instead of splitting; a branch refuted that way is dropped unexpanded.
@@ -112,10 +113,12 @@ The engine works on *terms*, not keywords:
 
 ### Generate
 
-- So far an instance comes from a branch that stands and has a type that no leaf is about: `null`, a boolean that is still allowed, `0`, `""`, `[]` or `{}`.
+- So far an instance comes from a branch that stands and has a type that no leaf is about: `null`, a boolean that is still allowed, a number that is left, `""`, `[]` or `{}`.
 - The normal form of B is computed first. Each of its conjunctions is conjoined with `not A` and searched for a counterexample before the next is touched, so a `No` usually comes long before the whole normal form exists.
 - Generation is bottom-up and memoized per c-reference. A reference in progress has no counterexample, which is the same least fixed point.
-- Numbers search the interval for a multiple that is none of the excluded ones. Strings take the shortest word within the length bounds. Objects choose members per fragment, arrays choose which positions satisfy which `contains`.
+- Numbers search the interval for a multiple that is none of the excluded ones, on a coarse grid first: the multiple, or one where there is none, times a power of ten. So the number has few digits: `20` for an integer from 17 on, `0.1` for a number that is no integer.
+- A number is written only if a `serde_json` value holds it: an integer of 64 bits, or a float whose shortest decimal it is. A branch whose numbers are all beyond that, such as those between two floats that are next to each other, gives no instance and depends on a leaf, which names a schema that says something about numbers.
+- Strings take the shortest word within the length bounds. Objects choose members per fragment, arrays choose which positions satisfy which `contains`.
 
 ## String languages
 
@@ -169,10 +172,11 @@ src/
   schema.rs       load: nodes, typed keywords, locations (exists)
   schema/         its two steps: parse, and link for the references (exists)
   term.rs         terms, variables, c-references, one-level negation (exists)
+  rational.rs     exact numbers: read from JSON, kept once each, written back (exists)
   lower.rs        schema graph to terms: classes, rewrites and scenarios (exists)
   inspect.rs      the stages of a check as pictures for the viewer (exists)
   normalize.rs    the engine (exists)
-  canonical/      numbers, strings, objects, arrays
+  canonical/      numbers (exists), strings, objects, arrays
   language/       string languages: automata over scalar ranges, word sets
   formats.rs      the format table
   meta_schemas.rs the meta-schema of draft 2020-12 and those of its vocabularies (exists)
@@ -186,7 +190,7 @@ Each step goes through all four stages for the keywords it adds, and lands as it
 
 1. **Schema graph:** nodes, locations, errors, references. Done.
 2. **Engine skeleton:** context, budget, terms, variables, lazy negation and fast mode; `type`, booleans, `null`, the connectives, `$ref` with recursion. First `Yes` and `No`. Done.
-3. **Numbers.**
+3. **Numbers:** exact rationals, the interval with its multiples, `const` and `enum` of numbers. Done.
 4. **Strings:** the `language` module, then patterns, formats and lengths in the engine.
 5. **Objects.**
 6. **Arrays.** `const` and `enum` are complete from here.
@@ -200,7 +204,8 @@ What a step left open, with the step that takes it up:
 - **`$dynamicRef`, for step 7.** A check ends in `Unknown` and names the `$dynamicRef` if A or B leads to one, wherever it is. What a `$dynamicRef` accepts depends on the schemas that led to it, and a term says the same wherever it stands. With one leaf for each `$dynamicRef`, a schema that is reached in two ways cancelled against its own negation, which gave a wrong `Yes`.
 - **Deeply nested values of `const` and `enum`, for step 6.** The lowering writes such a value out to compare it with others, and that recurses, as does the viewer. A value that is nested many thousand levels deep overflows the stack and aborts the process. Only a value built in code can be that deep, because JSON text ends at 128 levels. When `const` and `enum` become structural terms, the lowering walks the values itself and counts the depth.
 - **The negation of a cycle, for no step yet.** A branch that asks for the negation of a schema while it unfolds that same negation depends on a leaf. Under the least fixed point the negation holds there, so the reference could be passed over like any other that meets a variable taken before. It waits for a check that needs it.
-- **The test against every kind of instance, for steps 3 to 6.** Its schemas hold no schema inside a leaf and no constant that is an array or an object, because the engine does not look into either yet. The step that makes such a keyword a term adds it to the schemas of the test and to the evaluator.
+- **The test against every kind of instance, for steps 4 to 6.** Its schemas hold no schema inside a leaf and no constant that is an array or an object, because the engine does not look into either yet. The step that makes such a keyword a term adds it to the schemas of the test and to the evaluator, as the step for numbers did.
+- **A number that is none of many, for step 8.** "Not this number" is two intervals, below it and above it, so the negation of an `enum` of numbers splits the branch once for each. The steps grow with the square of their count at least: 74,000 for an `enum` of 160 numbers in no order against the integers of the same range, and 15,000 for two schemas that list the same 16 numbers, one with `oneOf` and one with `anyOf`. A set of excluded numbers in `CNum` would need no split.
 - **Two searches for one cycle, for step 8.** When a reference meets a variable that the branch has taken for true before, the engine looks for a way back twice: first by way of variables that are all taken for true, which refutes the branch, then by way of any, which makes the branch depend on a leaf. One search could answer both. It costs steps and never a verdict: for two schemas that need each other, 6 of the engine's 16 steps are such looks, and 4 would do.
 - **How the validator reads formats, for step 4.** The check of counterexamples asserts a format as the `jsonschema` crate implements it, and the library will by its own table of patterns. Where the two differ, a right counterexample counts as wrong, or a wrong one passes. No counterexample is a string that a format is about yet. The crate takes a function for a format in place of its own, so the step for strings can hand it the table of the library, or list the differences that stay.
 - **The validator's own option for patterns, for step 4 or the release that has it.** The `jsonschema` crate is getting an option that hands each pattern to the engine as it is written ([issue 1895](https://github.com/Stranger6667/jsonschema/issues/1895), [pull request 1897](https://github.com/Stranger6667/jsonschema/pull/1897)), which no release has yet. With it the harness writes no pattern anew: the `patterns` module and its two dependencies go, and the limits of the rewrite with them. Tried on the pull request, every verdict of the corpus stays, and the validator agrees with the `regex` crate on every pattern of the corpus. One thing changes: the validator refuses a schema with a pattern that the `regex` crate does not take, where today it reads the pattern as ECMA 262 if it can. That leaves 2 of the 1,912 counterexamples unchecked, both in cases that the corpus marks as having no meaning in the dialect.

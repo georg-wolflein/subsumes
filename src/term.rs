@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
+use crate::rational::{RationalId, Rationals, shown};
 use crate::schema::{Graph, NodeId};
 
 /// One of the six types that an instance has. `integer` is none of them: an integer is a
@@ -117,6 +118,16 @@ pub(crate) enum Term {
     TypeIs(TypeSet),
     /// The instance is this boolean.
     BoolConst(bool),
+    /// The instance is no number, or a number that is at least this one.
+    Min(RationalId),
+    /// No number, or a number that is at most this one.
+    Max(RationalId),
+    /// No number, or a number that is greater than this one.
+    ExMin(RationalId),
+    /// No number, or a number that is less than this one.
+    ExMax(RationalId),
+    /// No number, or a multiple of this one.
+    Mof(RationalId),
     /// The instance satisfies a predicate that the engine does not model.
     Unknown(LeafId),
     AllOf(Box<[TermId]>),
@@ -166,9 +177,10 @@ pub(crate) struct Variable {
     pub body: TermId,
 }
 
-/// Every term, leaf and variable of a check.
+/// Every term, leaf and variable of a check, and every number in them.
 #[derive(Debug, Default)]
 pub(crate) struct Terms {
+    pub rationals: Rationals,
     terms: Vec<Term>,
     ids: HashMap<Term, TermId>,
     leaves: Vec<Leaf>,
@@ -223,6 +235,26 @@ impl Terms {
 
     pub fn bool_const(&mut self, value: bool) -> TermId {
         self.intern(Term::BoolConst(value))
+    }
+
+    pub fn min(&mut self, number: RationalId) -> TermId {
+        self.intern(Term::Min(number))
+    }
+
+    pub fn max(&mut self, number: RationalId) -> TermId {
+        self.intern(Term::Max(number))
+    }
+
+    pub fn ex_min(&mut self, number: RationalId) -> TermId {
+        self.intern(Term::ExMin(number))
+    }
+
+    pub fn ex_max(&mut self, number: RationalId) -> TermId {
+        self.intern(Term::ExMax(number))
+    }
+
+    pub fn mof(&mut self, number: RationalId) -> TermId {
+        self.intern(Term::Mof(number))
     }
 
     /// The term of a predicate that the engine does not model. `key` tells it from every
@@ -328,6 +360,13 @@ impl Terms {
         self.leaf_of(TypeSet::ALL, key, node, None)
     }
 
+    /// The leaf for numbers that tell two schemas apart and that no JSON value holds. `node`
+    /// is a schema that says something about numbers.
+    pub fn beyond_json(&mut self, node: NodeId) -> LeafId {
+        let key = format!("a number that JSON holds @{}", node.index());
+        self.leaf_of(TypeSet::of(InstanceType::Number), key, node, None)
+    }
+
     /// A new variable for a schema. Its term is given later, because the term may refer to
     /// the variable.
     pub fn new_variable(&mut self, node: NodeId) -> VarId {
@@ -377,6 +416,10 @@ impl Terms {
                 }
                 name
             };
+            let numbered = |name: &str, number: RationalId, text: &mut String| {
+                let number = shown(self.rationals.get(number));
+                write!(text, "{name}({number})").expect("a string takes any text");
+            };
             match self.term(id) {
                 Term::True => text.push_str("true"),
                 Term::False => text.push_str("false"),
@@ -387,6 +430,11 @@ impl Terms {
                 Term::BoolConst(value) => {
                     write!(text, "is({value})").expect("a string takes any text");
                 }
+                Term::Min(number) => numbered("min", *number, text),
+                Term::Max(number) => numbered("max", *number, text),
+                Term::ExMin(number) => numbered("exmin", *number, text),
+                Term::ExMax(number) => numbered("exmax", *number, text),
+                Term::Mof(number) => numbered("mof", *number, text),
                 Term::Unknown(leaf) => {
                     write!(text, "?[{}]", self.leaf(*leaf).key).expect("a string takes any text");
                 }

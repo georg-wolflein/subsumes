@@ -5,6 +5,7 @@
 
 use serde_json::{Value, json};
 
+use crate::rational::shown;
 use crate::schema::Graph;
 use crate::term::{Term, TermId, Terms, VarId};
 
@@ -73,6 +74,11 @@ fn row(graph: &Graph, terms: &Terms, part: TermId) -> Value {
             json!(["type", names.join(", ")])
         }
         Term::BoolConst(value) => json!(["is", value.to_string()]),
+        Term::Min(number) => json!(["at least", shown(terms.rationals.get(*number))]),
+        Term::Max(number) => json!(["at most", shown(terms.rationals.get(*number))]),
+        Term::ExMin(number) => json!(["above", shown(terms.rationals.get(*number))]),
+        Term::ExMax(number) => json!(["below", shown(terms.rationals.get(*number))]),
+        Term::Mof(number) => json!(["multiple of", shown(terms.rationals.get(*number))]),
         Term::Unknown(leaf) => {
             let leaf = terms.leaf(*leaf);
             let about: Vec<&str> = leaf.domain.iter().map(|kind| kind.name()).collect();
@@ -119,6 +125,7 @@ fn referred(terms: &Terms, term: TermId) -> Vec<(VarId, &'static str)> {
                 pending.push((*inner, how));
             }
             Term::True | Term::False | Term::TypeIs(_) | Term::BoolConst(_) | Term::Unknown(_) => {}
+            Term::Min(_) | Term::Max(_) | Term::ExMin(_) | Term::ExMax(_) | Term::Mof(_) => {}
         }
     }
     found
@@ -193,6 +200,21 @@ mod tests {
                 {"kind": "applies", "from": 0, "to": 3, "keyword": ""},
                 {"kind": "applies", "from": 1, "to": 2, "keyword": ""},
                 {"kind": "applies", "from": 1, "to": 3, "keyword": "not"},
+            ])
+        );
+    }
+
+    #[test]
+    fn a_term_about_numbers_is_a_row_with_the_number() {
+        let schema = json!({"type": "integer", "minimum": 0.5, "exclusiveMaximum": 1e3});
+        let shown = shown(&schema, &json!(true), u64::MAX);
+        assert_eq!(
+            shown["stages"][1]["nodes"][0]["keywords"],
+            json!([
+                ["type", "number"],
+                ["multiple of", "1"],
+                ["at least", "0.5"],
+                ["below", "1000"],
             ])
         );
     }

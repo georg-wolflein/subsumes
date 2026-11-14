@@ -154,15 +154,15 @@ mod tests {
         let counterexample = json!(null);
         assert_eq!(check.verdict, Verdict::No { counterexample });
 
-        // The engine does not model numbers yet, and says which keyword stands in the way.
-        let (integer, number) = (json!({"type": "integer"}), json!({"type": "number"}));
-        let check = checker.check(&integer, &number).unwrap();
+        // The engine does not model strings yet, and says which keyword stands in the way.
+        let short = json!({"type": "string", "maxLength": 3});
+        let check = checker.check(&short, &text).unwrap();
         assert_eq!(
             check.verdict,
             Verdict::Unknown {
                 reason: Reason::Unsupported {
                     schema: Side::A,
-                    location: "#/type".to_owned(),
+                    location: "#/maxLength".to_owned(),
                 },
             }
         );

@@ -20,7 +20,7 @@ Each check returns one of three verdicts:
 
 ## Status
 
-The engine is being built keyword by keyword. So far it models the types, `null`, the booleans, `allOf`, `anyOf`, `oneOf`, `not`, `if`/`then`/`else` and `$ref`. A check whose answer depends on any other keyword returns `Unknown` and names the keyword. So does every check of a schema that uses a `$dynamicRef`, until the engine models it.
+The engine is being built keyword by keyword. So far it models the types, `null`, the booleans, numbers, `allOf`, `anyOf`, `oneOf`, `not`, `if`/`then`/`else` and `$ref`. A check whose answer depends on any other keyword returns `Unknown` and names the keyword. So does every check of a schema that uses a `$dynamicRef`, until the engine models it.
 
 Two schemas that share such a keyword with the same value can still be decided, because what both say cancels. That is enough to decide about three in ten checks of the benchmark corpus.
 
@@ -30,6 +30,12 @@ Two schemas that share such a keyword with the same value can still be decided, 
 - **Support JSON Schema draft 2020-12** (including [`format`](https://json-schema.org/understanding-json-schema/reference/type#format), which is asserted rather than treated as an annotation), with the exceptions listed under [Unsupported constructs](#unsupported-constructs).
 - **Fast and efficient.** A check should be cheap enough to run on every save/commit.
 - **Correctness and performance** are benchmarked on a large corpus of schema pairs with known answers, and a validator checks every counterexample.
+
+## Numbers
+
+A number is the decimal that was written, not the float next to it. So `0.0075` is a multiple of `0.0001`, and `multipleOf: 0.0001` subsumes `multipleOf: 0.0075`, although the two floats are not multiples of each other.
+
+`integer` is a number that is a multiple of one, so `1.0` is an integer, as the specification says.
 
 ## Regular expressions
 
