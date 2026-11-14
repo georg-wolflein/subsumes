@@ -30,17 +30,13 @@ pub enum Reason {
         /// Where the construct is: a URI reference whose fragment is a JSON Pointer, such as
         /// `#/properties/tags/uniqueItems`. `#` alone is the schema as a whole. For a schema
         /// that refers to itself in a way that is not modelled, it is the subschema in which
-        /// the cycle closes. A keyword about numbers is such a construct when its number is
-        /// outside the range that the library models, as `maximum: 1e30` is.
+        /// the cycle closes.
         location: String,
     },
-    /// A number may be valid under B and invalid under A, but the library found no such
-    /// number that it can give. Every such number may be beyond the range that the library
-    /// models, as every number above 2^64 - 1 is. Or it may be one that no JSON value holds
-    /// exactly: a number between two floats that are next to each other has more digits than
-    /// a float keeps. Whether there is such a number at all, the library does not always
-    /// know: where two `multipleOf` have a least common multiple beyond the range, there may
-    /// be none, and A may subsume B.
+    /// A number is valid under B and invalid under A, but the library found no such number
+    /// that a JSON value holds exactly. A number between two floats that are next to each
+    /// other has more digits than a float keeps, for one. So A does not subsume B, and
+    /// there is no counterexample to give.
     Unrepresentable,
     /// The check ran out of its work budget.
     Budget,
@@ -53,8 +49,7 @@ impl fmt::Display for Reason {
                 write!(f, "{location} in schema {schema} is not supported")
             }
             Self::Unrepresentable => f.write_str(
-                "the schemas may differ in a number, but only in one that is beyond the range \
-                 of the library or that a JSON value does not hold exactly",
+                "the schemas differ in a number that a JSON value does not hold exactly",
             ),
             Self::Budget => f.write_str("the check ran out of its work budget"),
         }

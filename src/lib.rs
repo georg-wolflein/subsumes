@@ -28,20 +28,18 @@
 //! else it says.
 //!
 //! Numbers are compared exactly: a number stands for the decimal that it is written as, so
-//! `0.0075` is a multiple of `0.0001`, which the two floats are not. The library models the
-//! numbers whose size is below 2^64 and that have at most sixteen decimal places. A keyword
-//! with any other number, such as `maximum: 1e30`, is one of those that it does not model.
+//! `0.0075` is a multiple of `0.0001`, which the two floats are not.
 
 mod canonical;
 mod checker;
 mod context;
-mod decimal;
 mod error;
 mod generate;
 mod inspect;
 mod lower;
 mod meta_schemas;
 mod normalize;
+mod rational;
 mod schema;
 mod term;
 #[cfg(test)]

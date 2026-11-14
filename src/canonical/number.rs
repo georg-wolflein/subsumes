@@ -10,15 +10,15 @@
 //! interval that is more than one point always holds a number, because the excluded ones lie
 //! apart. With one, the multiples in the interval are looked at one by one from zero
 //! outwards, and the first that is in the set ends the search.
-//!
-//! Everything that is asked is a number of the range that the engine models, and the search
-//! counts in whole multiples, so it is exact also where it leaves the range. A number that it
-//! finds there is none that the library can give.
 
 use std::collections::BTreeSet;
 
+use num_bigint::BigInt;
+use num_integer::Integer;
+use num_traits::{One, Signed, Zero};
+
 use crate::context::{Budget, Exhausted};
-use crate::decimal::Decimal;
+use crate::rational::{Rational, common_multiple, is_multiple};
 use crate::term::Term;
 
 /// The numbers that a branch still accepts.
@@ -28,21 +28,18 @@ pub(crate) struct Numbers {
     lower: Option<End>,
     upper: Option<End>,
     /// What every number is a multiple of: the least common multiple of all that were asked.
-    multiple: Option<Decimal>,
+    multiple: Option<Rational>,
     /// What no number is a multiple of.
-    excluded: BTreeSet<Decimal>,
+    excluded: BTreeSet<Rational>,
     /// The numbers that are not in the set, whatever else lets them be: "not this number"
     /// takes one number out and leaves the rest as it is.
-    removed: BTreeSet<Decimal>,
-    /// Whether a number to be a multiple of was too large to keep. Then the set holds more
-    /// numbers than were asked for.
-    beyond: bool,
+    removed: BTreeSet<Rational>,
 }
 
 /// One end of an interval.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct End {
-    at: Decimal,
+    at: Rational,
     /// Whether the end itself is outside the interval.
     open: bool,
 }
@@ -52,54 +49,56 @@ impl Numbers {
     /// negation of "at least" is "less than", and so on.
     pub fn take(&mut self, term: &Term, negated: bool) {
         match (term, negated) {
-            (Term::Min(at), false) | (Term::ExMax(at), true) => self.at_least(*at, false),
-            (Term::ExMin(at), false) | (Term::Max(at), true) => self.at_least(*at, true),
-            (Term::Max(at), false) | (Term::ExMin(at), true) => self.at_most(*at, false),
-            (Term::ExMax(at), false) | (Term::Min(at), true) => self.at_most(*at, true),
+            (Term::Min(at), false) | (Term::ExMax(at), true) => self.at_least(at, false),
+            (Term::ExMin(at), false) | (Term::Max(at), true) => self.at_least(at, true),
+            (Term::Max(at), false) | (Term::ExMin(at), true) => self.at_most(at, false),
+            (Term::ExMax(at), false) | (Term::Min(at), true) => self.at_most(at, true),
             (Term::Mof(step), false) => {
-                let common = match self.multiple {
-                    Some(multiple) => multiple.common_multiple(*step),
-                    None => Some(*step),
-                };
-                // The least number that is a multiple of both may be beyond the range. Then
-                // the set keeps the multiple that it has.
-                match common {
-                    Some(common) => self.multiple = Some(common),
-                    None => self.beyond = true,
-                }
+                self.multiple = Some(match &self.multiple {
+                    Some(multiple) => common_multiple(multiple, step),
+                    None => step.clone(),
+                });
             }
             (Term::Mof(step), true) => {
-                self.excluded.insert(*step);
+                self.excluded.insert(step.clone());
             }
             (Term::NumConst(number), false) => {
-                self.at_least(*number, false);
-                self.at_most(*number, false);
+                self.at_least(number, false);
+                self.at_most(number, false);
             }
             (Term::NumConst(number), true) => {
-                self.removed.insert(*number);
+                self.removed.insert(number.clone());
             }
             (other, _) => unreachable!("{other:?} is not about numbers"),
         }
     }
 
     /// Keeps the numbers from `at` on, without `at` itself if `open`.
-    fn at_least(&mut self, at: Decimal, open: bool) {
-        let asks_more = self.lower.is_none_or(|lower| match at.cmp(&lower.at) {
-            std::cmp::Ordering::Equal => open && !lower.open,
-            order => order.is_gt(),
-        });
+    fn at_least(&mut self, at: &Rational, open: bool) {
+        let asks_more = self
+            .lower
+            .as_ref()
+            .is_none_or(|lower| match at.cmp(&lower.at) {
+                std::cmp::Ordering::Equal => open && !lower.open,
+                order => order.is_gt(),
+            });
         if asks_more {
+            let at = at.clone();
             self.lower = Some(End { at, open });
         }
     }
 
     /// Keeps the numbers up to `at`, without `at` itself if `open`.
-    fn at_most(&mut self, at: Decimal, open: bool) {
-        let asks_more = self.upper.is_none_or(|upper| match at.cmp(&upper.at) {
-            std::cmp::Ordering::Equal => open && !upper.open,
-            order => order.is_lt(),
-        });
+    fn at_most(&mut self, at: &Rational, open: bool) {
+        let asks_more = self
+            .upper
+            .as_ref()
+            .is_none_or(|upper| match at.cmp(&upper.at) {
+                std::cmp::Ordering::Equal => open && !upper.open,
+                order => order.is_lt(),
+            });
         if asks_more {
+            let at = at.clone();
             self.upper = Some(End { at, open });
         }
     }
@@ -110,21 +109,15 @@ impl Numbers {
     }
 
     /// What every number of the set is a multiple of, if anything was asked.
-    pub fn multiple(&self) -> Option<Decimal> {
-        self.multiple
-    }
-
-    /// Whether the set holds more numbers than were asked for: all that it knows of them is
-    /// that every number that was asked for is in it.
-    pub fn is_beyond(&self) -> bool {
-        self.beyond
+    pub fn multiple(&self) -> Option<&Rational> {
+        self.multiple.as_ref()
     }
 
     /// The one number of the interval, if the interval is one point.
-    pub fn point(&self) -> Option<Decimal> {
-        match (self.lower, self.upper) {
+    pub fn point(&self) -> Option<&Rational> {
+        match (&self.lower, &self.upper) {
             (Some(lower), Some(upper)) if lower.at == upper.at && !lower.open && !upper.open => {
-                Some(lower.at)
+                Some(&lower.at)
             }
             _ => None,
         }
@@ -132,7 +125,7 @@ impl Numbers {
 
     /// Whether the interval holds no number at all, whatever else is asked.
     fn interval_is_empty(&self) -> bool {
-        match (self.lower, self.upper) {
+        match (&self.lower, &self.upper) {
             (Some(lower), Some(upper)) => match lower.at.cmp(&upper.at) {
                 std::cmp::Ordering::Equal => lower.open || upper.open,
                 order => order.is_gt(),
@@ -142,16 +135,17 @@ impl Numbers {
     }
 
     /// Whether a number is in the set.
-    pub fn contains(&self, number: Decimal) -> bool {
-        let (lower, upper) = (self.lower, self.upper);
-        lower.is_none_or(|lower| number > lower.at || (number == lower.at && !lower.open))
-            && upper.is_none_or(|upper| number < upper.at || (number == upper.at && !upper.open))
-            && (self.multiple.iter()).all(|multiple| number.is_multiple_of(*multiple))
-            && !(self.excluded.iter()).any(|excluded| number.is_multiple_of(*excluded))
-            && !self.removed.contains(&number)
+    pub fn contains(&self, number: &Rational) -> bool {
+        let lower = self.lower.as_ref();
+        let upper = self.upper.as_ref();
+        lower.is_none_or(|lower| *number > lower.at || (*number == lower.at && !lower.open))
+            && upper.is_none_or(|upper| *number < upper.at || (*number == upper.at && !upper.open))
+            && (self.multiple.iter()).all(|multiple| is_multiple(number, multiple))
+            && !(self.excluded.iter()).any(|excluded| is_multiple(number, excluded))
+            && !self.removed.contains(number)
     }
 
-    /// Whether no number is in the set, within the range or beyond it.
+    /// Whether no number is in the set.
     ///
     /// # Errors
     ///
@@ -160,8 +154,8 @@ impl Numbers {
         if self.interval_is_empty() {
             return Ok(true);
         }
-        match (self.multiple, self.point()) {
-            (Some(multiple), _) => Ok(self.first(multiple, budget)?.is_none()),
+        match (&self.multiple, self.point()) {
+            (Some(multiple), _) => Ok(self.nearest_zero(multiple, budget)?.is_none()),
             (None, Some(only)) => Ok(!self.contains(only)),
             // The multiples of the excluded numbers lie apart, and the numbers that were
             // removed are few. Between any two of them the interval has a number.
@@ -170,81 +164,82 @@ impl Numbers {
     }
 
     /// The number of the set that is a multiple of `step` and nearest to zero, if the set
-    /// has a multiple of `step` within the range. Of two that are equally near, it is the
-    /// one above zero.
+    /// has a multiple of `step`. Of two that are equally near, it is the one above zero.
+    ///
+    /// Every candidate costs a step. The search ends at the first that is in the set, or at
+    /// the ends of the interval. Among the multiples of a number, those of an excluded one
+    /// come at an even pace, so unless they are all excluded, one that is not is never far.
+    /// The numbers that were removed are passed over one by one.
     ///
     /// # Errors
     ///
     /// When the budget does not cover the candidates.
     pub fn nearest_zero(
         &self,
-        step: Decimal,
+        step: &Rational,
         budget: &mut Budget,
-    ) -> Result<Option<Decimal>, Exhausted> {
-        let step = match self.multiple {
-            None => step,
-            Some(multiple) => match multiple.common_multiple(step) {
-                Some(step) => step,
-                // Of the multiples of both, only zero is within the range.
-                None => return Ok(self.contains(Decimal::ZERO).then_some(Decimal::ZERO)),
-            },
+    ) -> Result<Option<Rational>, Exhausted> {
+        let step = match &self.multiple {
+            Some(multiple) => common_multiple(multiple, step),
+            None => step.clone(),
         };
-        // What is nearest zero may be beyond the range, and then so is everything else.
-        let nearest = self.first(step, budget)?;
-        Ok(nearest.and_then(|times| step.times(times)))
-    }
-
-    /// How many times `step` the number of the set is that is a multiple of `step` and
-    /// nearest to zero, if the set has a multiple of `step`. Every number of the set is a
-    /// multiple of the step already, or of something that the step is a multiple of.
-    ///
-    /// Every candidate costs a step of the budget. The search ends at the first that is in
-    /// the set, or at the ends of the interval. Among the multiples of a number, those of an
-    /// excluded one come at an even pace, so unless they are all excluded, one that is not
-    /// is never far. The numbers that were removed are passed over one by one.
-    fn first(&self, step: Decimal, budget: &mut Budget) -> Result<Option<i128>, Exhausted> {
         // The multiples of the step in the interval: from `low` times the step to `high`
         // times. An open end that is a multiple itself is one further out.
-        let low = self.lower.map(|lower| {
-            let below = lower.at.units().div_euclid(step.units());
-            let is_multiple = lower.at.is_multiple_of(step);
-            below + i128::from(!is_multiple || lower.open)
+        let low = self.lower.as_ref().map(|lower| {
+            let times = &lower.at / &step;
+            let whole = times.ceil().to_integer();
+            if lower.open && times.is_integer() {
+                whole + 1
+            } else {
+                whole
+            }
         });
-        let high = self.upper.map(|upper| {
-            let below = upper.at.units().div_euclid(step.units());
-            below - i128::from(upper.at.is_multiple_of(step) && upper.open)
+        let high = self.upper.as_ref().map(|upper| {
+            let times = &upper.at / &step;
+            let whole = times.floor().to_integer();
+            if upper.open && times.is_integer() {
+                whole - 1
+            } else {
+                whole
+            }
         });
-        let within = |times: i128| {
-            low.is_none_or(|low| times >= low) && high.is_none_or(|high| times <= high)
+        let within = |times: &BigInt| {
+            low.as_ref().is_none_or(|low| times >= low)
+                && high.as_ref().is_none_or(|high| times <= high)
         };
         // Of the multiples of the step, every so many is a multiple of an excluded number.
-        let every = |excluded: &Decimal| excluded.units() / step.common_divisor(*excluded).units();
-        let every: Vec<i128> = self.excluded.iter().map(every).collect();
-        if every.contains(&1) {
+        let every: Vec<BigInt> = (self.excluded.iter())
+            .map(|excluded| (common_multiple(&step, excluded) / &step).to_integer())
+            .collect();
+        if every.iter().any(One::is_one) {
             return Ok(None);
         }
 
-        let nearest = match (low, high) {
-            (Some(low), _) if low > 0 => low,
-            (_, Some(high)) if high < 0 => high,
-            _ => 0,
+        let nearest = match (&low, &high) {
+            (Some(low), _) if low.is_positive() => low.clone(),
+            (_, Some(high)) if high.is_negative() => high.clone(),
+            _ => BigInt::zero(),
         };
-        let mut distance = 0;
+        let mut distance = BigInt::zero();
         loop {
-            let both = [nearest + distance, nearest - distance];
+            let both = [&nearest + &distance, &nearest - &distance];
             // At no distance the two are one.
-            let candidates = if distance == 0 { &both[..1] } else { &both[..] };
+            let candidates = if distance.is_zero() {
+                &both[..1]
+            } else {
+                &both[..]
+            };
             let mut any = false;
-            for &times in candidates.iter().filter(|times| within(**times)) {
+            for times in candidates.iter().filter(|times| within(times)) {
                 any = true;
                 // A candidate is held against every excluded number, so a set with many of
                 // them costs more for each.
                 budget.charge(1 + every.len() as u64)?;
-                // A number beyond the range is none that was removed.
-                let found = step.times(times);
-                let is_removed = found.is_some_and(|found| self.removed.contains(&found));
-                if every.iter().all(|every| times % every != 0) && !is_removed {
-                    return Ok(Some(times));
+                if every.iter().all(|every| !times.is_multiple_of(every)) {
+                    let found = Rational::from_integer(times.clone()) * &step;
+                    if !self.removed.contains(&found) {
+                        return Ok(Some(found));
+                    }
                 }
             }
             // The interval lies on one side of where the search began, or around it, so
@@ -260,7 +255,7 @@ impl Numbers {
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
-    use crate::decimal::testing::number;
+    use crate::rational::testing::number;
     use crate::term::Terms;
     use crate::testing::Random;
 
@@ -396,7 +391,7 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::{Asked, QUARTERS, numbers};
     use super::*;
-    use crate::decimal::testing::number;
+    use crate::rational::testing::number;
     use crate::term::Terms;
     use crate::testing::Random;
 
@@ -406,13 +401,8 @@ mod tests {
 
     /// The multiple of `step` in the set that is nearest zero, as text.
     fn nearest(asked: &[&str], step: &str) -> Option<String> {
-        let found = numbers(asked).nearest_zero(number(step), &mut Budget::new(u64::MAX));
+        let found = numbers(asked).nearest_zero(&number(step), &mut Budget::new(u64::MAX));
         found.unwrap().map(|found| found.to_string())
-    }
-
-    /// A number of this many quarters.
-    fn quarters(quarters: i64) -> Decimal {
-        Decimal::of_units(i128::from(quarters) * Decimal::ONE.units() / 4).unwrap()
     }
 
     fn some(text: &str) -> Option<String> {
@@ -449,9 +439,9 @@ mod tests {
         for (term, at, keeps_end, keeps_above) in cases {
             let mut numbers = Numbers::default();
             numbers.take(terms.term(term), true);
-            assert_eq!(numbers.contains(number(at)), keeps_end);
-            assert_eq!(numbers.contains(number("2")), keeps_above);
-            assert_eq!(numbers.contains(number("0")), !keeps_above);
+            assert_eq!(numbers.contains(&number(at)), keeps_end);
+            assert_eq!(numbers.contains(&number("2")), keeps_above);
+            assert_eq!(numbers.contains(&number("0")), !keeps_above);
         }
     }
 
@@ -475,7 +465,7 @@ mod tests {
         assert_eq!(nearest(&["< -4"], "2"), some("-6"));
         assert_eq!(nearest(&[">= -5", "<= 5"], "2"), some("0"));
         assert_eq!(nearest(&[], "2"), some("0"));
-        assert_eq!(nearest(&["> 0", "< 1"], "0.1"), some("0.1"));
+        assert_eq!(nearest(&["> 0", "< 1"], "0.1"), some("1/10"));
         assert_eq!(nearest(&["> 0", "< 1"], "1"), None);
         // The step is taken together with what the set is a multiple of already.
         assert_eq!(nearest(&["mof 3", "> 0"], "2"), some("6"));
@@ -508,10 +498,10 @@ mod tests {
             "<= 5"
         ]));
         // Below and above zero by turns, the one above first.
-        assert_eq!(nearest(&["not mof 1", ">= -1", "<= 1"], "0.5"), some("0.5"));
+        assert_eq!(nearest(&["not mof 1", ">= -1", "<= 1"], "0.5"), some("1/2"));
         assert_eq!(
             nearest(&["not mof 1", ">= -1", "< 0.5"], "0.5"),
-            some("-0.5")
+            some("-1/2")
         );
 
         // Without a number to be a multiple of, only a single point can be excluded.
@@ -549,7 +539,7 @@ mod tests {
         assert_eq!(nearest(&["!= 0", "not mof 2", "!= 1"], "1"), some("-1"));
         assert_eq!(
             nearest(&[">= 1", "<= 3", "!= 1", "!= 2"], "0.5"),
-            some("1.5")
+            some("3/2")
         );
     }
 
@@ -573,47 +563,9 @@ mod tests {
         assert_eq!(search(&asked, 4), (Ok(false), 4));
         // Where every multiple is excluded, none is looked at.
         assert_eq!(search(&["mof 4", "not mof 2"], 0), (Ok(true), 0));
-        // The largest numbers of the range and the smallest are numbers like any other.
-        let far = ["mof 1e-16", ">= 1e19", "not mof 1e19"];
+        // Very large numbers and very small ones are numbers like any other.
+        let far = ["mof 1e-300", ">= 1e300", "not mof 1e300"];
         assert_eq!(search(&far, 4), (Ok(false), 4));
-    }
-
-    #[test]
-    fn a_search_that_leaves_the_range_is_exact_and_gives_no_number() {
-        let (most, prime) = ("18446744073709551615", "18446744073709551557");
-        // Above the largest number of the range there are numbers, and none to give.
-        let above = [format!("> {most}")];
-        let above: Vec<&str> = above.iter().map(String::as_str).collect();
-        assert!(!is_empty(&above));
-        assert_eq!(nearest(&above, "1"), None);
-        assert_eq!(nearest(&above, "0.1"), some("18446744073709551615.1"));
-        // The second multiple of a number may be beyond the range, where nothing was removed.
-        let (mof, not_it) = (format!("mof {prime}"), format!("!= {prime}"));
-        assert_eq!(nearest(&[&mof, ">= 1"], prime), some(prime));
-        assert!(!is_empty(&[&mof, ">= 1", &not_it]));
-        assert_eq!(nearest(&[&mof, ">= 1", &not_it], prime), None);
-        assert!(is_empty(&[&mof, ">= 1", &format!("<= {most}"), &not_it]));
-        // Of the multiples of two numbers whose least common multiple is beyond the range,
-        // only zero is within it.
-        assert_eq!(nearest(&[&mof], "2"), some("0"));
-        assert_eq!(nearest(&[&mof, "> 0"], "2"), None);
-        assert_eq!(nearest(&[&mof, "!= 0"], "2"), None);
-    }
-
-    #[test]
-    fn a_multiple_that_is_too_large_to_keep_leaves_the_set_wider() {
-        let prime = format!("mof {}", "18446744073709551557");
-        let kept = numbers(&[&prime, "mof 1"]);
-        assert!(!kept.is_beyond());
-        assert_eq!(kept.multiple(), Some(number("18446744073709551557")));
-        let wider = numbers(&[&prime, "mof 3", ">= 1"]);
-        assert!(wider.is_beyond());
-        // What is left is a multiple of the first, and that is all that is known of it.
-        assert_eq!(wider.multiple(), Some(number("18446744073709551557")));
-        assert!(!wider.is_empty(&mut Budget::new(u64::MAX)).unwrap());
-        // No number was asked for where the wider set has none.
-        let none = numbers(&[&prime, "mof 3", ">= 1", "<= 2"]);
-        assert!(none.is_beyond() && none.is_empty(&mut Budget::new(u64::MAX)).unwrap());
     }
 
     #[test]
@@ -626,11 +578,12 @@ mod tests {
             let members: Vec<i64> = QUARTERS
                 .filter(|quarters| asked.holds(*quarters as f64 / 4.0))
                 .collect();
-            for at in QUARTERS {
+            for quarters in QUARTERS {
+                let exact = Rational::new(quarters.into(), 4.into());
                 assert_eq!(
-                    numbers.contains(quarters(at)),
-                    members.contains(&at),
-                    "{at} quarters in {numbers:?}"
+                    numbers.contains(&exact),
+                    members.contains(&quarters),
+                    "{quarters} quarters in {numbers:?}"
                 );
             }
             let is_empty = numbers.is_empty(&mut Budget::new(1000)).unwrap();
@@ -644,7 +597,7 @@ mod tests {
                 let nearest = members
                     .iter()
                     .min_by_key(|quarters| (quarters.abs(), **quarters < 0));
-                let nearest = nearest.map(|at| quarters(*at));
+                let nearest = nearest.map(|quarters| Rational::new((*quarters).into(), 4.into()));
                 assert_eq!(found.unwrap(), nearest, "{numbers:?}");
                 searched += 1;
             }

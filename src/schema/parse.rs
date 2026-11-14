@@ -8,7 +8,7 @@ use serde_json::{Map, Number, Value};
 use super::{
     Count, Keywords, Node, NodeId, Origin, Part, Schema, Type, Types, location, push_token,
 };
-use crate::decimal::is_positive;
+use crate::rational::is_positive;
 use crate::{Error, Side};
 
 const DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";

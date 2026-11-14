@@ -1,16 +1,17 @@
 //! Counterexamples: an instance for a branch that the engine could not refute.
 
+use num_traits::One;
 use serde_json::{Number, Value, json};
 
 use crate::canonical::number::Numbers;
 use crate::context::{Budget, Exhausted};
-use crate::decimal::{Decimal, written};
+use crate::rational::{Rational, written};
 use crate::term::InstanceType;
 
 /// An instance of a type about which a branch says nothing else, except which booleans and
 /// which numbers it may be.
 ///
-/// `None` for a number when the branch leaves only numbers that the library cannot give.
+/// `None` for a number when the branch leaves only numbers that no JSON number stands for.
 ///
 /// # Errors
 ///
@@ -31,48 +32,70 @@ pub(crate) fn instance(
     }))
 }
 
-/// A number of the set, the plainest there is: the whole number nearest zero. A set without
-/// a whole number gives its multiple nearest zero, or if it is a multiple of nothing, its
-/// decimal with the fewest places.
+/// A number of the set, the plainest that the search comes by: the whole number nearest
+/// zero. A set without a whole number gives its multiple nearest zero, or if it is a
+/// multiple of nothing, its decimal with the fewest places.
 ///
-/// `None` if the set is empty, and for a number that the library cannot give: one beyond the
-/// range that the engine models, or one that no JSON number stands for.
+/// `None` if the set is empty, or if no JSON number stands for the number that was found
+/// and for none of the rounder ones that are tried in its place. The search is not all
+/// there could be: a set may hold a number that could be written and that is not found.
 fn number(numbers: &Numbers, budget: &mut Budget) -> Result<Option<Number>, Exhausted> {
-    if numbers.is_beyond() {
-        // Of a set that holds more than was asked for, zero is known to be asked for: it is
-        // a multiple of whatever was too large to keep.
-        let zero = numbers.contains(Decimal::ZERO).then_some(Decimal::ZERO);
-        return Ok(zero.and_then(written));
-    }
-    let found = match numbers.nearest_zero(Decimal::ONE, budget)? {
-        Some(whole) => Some(whole),
-        None => match (numbers.multiple(), numbers.point()) {
+    let Some(whole) = numbers.nearest_zero(&Rational::one(), budget)? else {
+        let found = match (numbers.multiple(), numbers.point()) {
             (Some(multiple), _) => numbers.nearest_zero(multiple, budget)?,
-            (None, Some(only)) => numbers.contains(only).then_some(only),
+            (None, Some(only)) => numbers.contains(only).then(|| only.clone()),
             (None, None) => shortest(numbers, budget)?,
-        },
+        };
+        // A number with more places has more digits, not fewer, so no other is tried.
+        return Ok(found.as_ref().and_then(written));
     };
-    Ok(found.and_then(written))
+    match written(&whole) {
+        Some(written) => Ok(Some(written)),
+        None => rounder(numbers, budget),
+    }
+}
+
+/// A whole number of the set that ends in zeros: the multiple of ten nearest zero, or else
+/// that of a hundred, and so on, until one is found that a JSON number stands for.
+///
+/// This is for a set whose whole number nearest zero has more digits than a float keeps,
+/// as the one after 2^64 has. A float is printed with seventeen digits at most, so of the
+/// numbers this large only one with zeros at its end can be written.
+fn rounder(numbers: &Numbers, budget: &mut Budget) -> Result<Option<Number>, Exhausted> {
+    let ten = Rational::from_integer(10.into());
+    let mut step = Rational::one();
+    // No float is as large as the power of ten after these.
+    for _ in 0..f64::MAX_10_EXP {
+        step *= &ten;
+        // The multiples of a power of ten are among those of the power before, so where
+        // one has none in the set, neither has the next.
+        let Some(found) = numbers.nearest_zero(&step, budget)? else {
+            break;
+        };
+        if let Some(written) = written(&found) {
+            return Ok(Some(written));
+        }
+    }
+    Ok(None)
 }
 
 /// The decimal with the fewest places in a set that is a multiple of nothing and whose
 /// interval is more than a point, and of those the one nearest zero.
-fn shortest(numbers: &Numbers, budget: &mut Budget) -> Result<Option<Decimal>, Exhausted> {
+fn shortest(numbers: &Numbers, budget: &mut Budget) -> Result<Option<Rational>, Exhausted> {
     if numbers.is_empty(budget)? {
         return Ok(None);
     }
-    // A unit has a place more than any number that was asked. So among the numbers with
-    // that many places, the interval holds one that is no multiple of an excluded number
-    // and that was not removed.
-    for place in 1..=Decimal::PLACES {
+    let tenth = Rational::new(1.into(), 10.into());
+    let mut step = Rational::one();
+    // With enough places a decimal is in the interval. The excluded numbers lie apart, so
+    // with a place more there is one that is not excluded.
+    loop {
         budget.charge(1)?;
-        let found = numbers.nearest_zero(Decimal::place(place), budget)?;
-        if found.is_some() {
-            return Ok(found);
+        step *= &tenth;
+        if let Some(found) = numbers.nearest_zero(&step, budget)? {
+            return Ok(Some(found));
         }
     }
-    // The last place has one, so this is not reached.
-    Ok(None)
 }
 
 #[cfg(test)]
@@ -115,8 +138,8 @@ mod tests {
         assert_eq!(given(&["mof 1.5", ">= 1"]), some("3"));
         assert_eq!(given(&["mof 7", "not mof 2", ">= 1"]), some("7"));
         assert_eq!(given(&["not mof 2"]), some("1"));
-        // The largest whole numbers of the range are integers of 64 bits.
-        assert_eq!(given(&[">= 1e19"]), some("10000000000000000000"));
+        // A number of thirty digits is a float, and one of twenty an integer.
+        assert_eq!(given(&[">= 1e30"]), some("1e+30"));
         assert_eq!(
             given(&["> 18446744073709551614"]),
             some("18446744073709551615")
@@ -146,10 +169,6 @@ mod tests {
         // One point is that point, also where it is far from whole.
         assert_eq!(given(&[">= 2.5", "<= 2.5"]), some("2.5"));
         assert_eq!(given(&[">= 0.0075", "<= 0.0075"]), some("0.0075"));
-        // Between two numbers with as many places as a schema may give them lies one with
-        // a place more.
-        assert_eq!(given(&["> 0", "< 1e-16"]), some("1e-17"));
-        assert_eq!(given(&["not mof 1e-16", "> 0", "< 1e-15"]), some("1e-17"));
     }
 
     #[test]
@@ -161,33 +180,34 @@ mod tests {
     }
 
     #[test]
-    fn a_number_that_the_library_cannot_give_is_not_given() {
-        // Beyond the range: every number above the largest that it holds.
-        assert_eq!(given(&["> 18446744073709551615"]), None);
-        assert_eq!(
-            given(&["mof 18446744073709551557", "> 18446744073709551557"]),
-            None
-        );
-        // Between two floats that are next to each other. The floats of this size are whole.
-        assert_eq!(given(&["> 9007199254740991", "< 9007199254740992"]), None);
-        assert_eq!(
-            given(&["mof 0.5", "not mof 1", ">= 9007199254740991"]),
-            None
-        );
-        // A whole number below the least `i64` is given if a float holds it. The search
-        // does not go on to one where the nearest is none.
-        assert_eq!(given(&["<= -1e19"]), some("-1e+19"));
-        assert_eq!(given(&["< -9223372036854775808"]), None);
+    fn a_number_that_no_json_number_stands_for_is_not_given() {
+        // Between two floats that are next to each other.
+        assert_eq!(given(&["> 0.1", "< 0.10000000000000002"]), None);
+        // Above the largest float, and the few whole numbers after one of thirty digits.
+        assert_eq!(given(&["> 1.7976931348623157e308"]), None);
+        assert_eq!(given(&["> 1e30", "< 1.0000000000000001e30"]), None);
     }
 
     #[test]
-    fn of_a_set_that_is_wider_than_was_asked_only_zero_is_given() {
-        let asked = ["mof 18446744073709551557", "mof 3"];
-        assert_eq!(given(&asked), some("0"));
-        assert_eq!(given(&[asked[0], asked[1], ">= -5"]), some("0"));
-        assert_eq!(given(&[asked[0], asked[1], "> 0"]), None);
-        assert_eq!(given(&[asked[0], asked[1], "!= 0"]), None);
-        assert_eq!(given(&[asked[0], asked[1], "not mof 7"]), None);
+    fn a_whole_number_with_too_many_digits_gives_way_to_a_rounder_one() {
+        // The whole number after 2^64 - 1 has twenty digits, and a float keeps seventeen.
+        // The first multiple of a thousand after it is a float as it is printed.
+        assert_eq!(
+            given(&["> 18446744073709551615"]),
+            some("1.8446744073709552e+19")
+        );
+        // After a number of thirty-one digits, the first that is written has sixteen.
+        assert_eq!(given(&["> 1e30"]), some("1.000000000000001e+30"));
+        assert_eq!(given(&["< -1e30"]), some("-1.000000000000001e+30"));
+        // What else is asked holds for the rounder number too.
+        assert_eq!(given(&["> 1e30", "mof 3"]), some("1.0000000000000002e+30"));
+        assert_eq!(
+            given(&[">= 1e30", "not mof 1e30", "not mof 7"]),
+            some("1.000000000000002e+30")
+        );
+        // Every float of this size is printed as a multiple of 1e14.
+        assert_eq!(given(&["> 1e30", "not mof 1e14"]), None);
+        assert_eq!(given(&["mof 0.01", "> 1e16", "< 10000000000000001"]), None);
     }
 
     #[test]
@@ -207,10 +227,6 @@ mod tests {
         // Two places without a decimal in the interval, and the third has one.
         assert_eq!(search(&["> 0.001", "< 0.01"], 4), (Ok(some("0.002")), 4));
         assert_eq!(search(&["> 0.001", "< 0.01"], 3), (Err(Exhausted), 3));
-        // No number has more places than a unit, so the search is never long.
-        let (found, spent) = search(&["> 0", "< 1e-16"], u64::MAX);
-        assert_eq!(found, Ok(some("1e-17")));
-        assert!(spent <= 2 * u64::from(Decimal::PLACES), "{spent}");
     }
 
     #[test]
