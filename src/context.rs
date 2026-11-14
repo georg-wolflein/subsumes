@@ -1,12 +1,15 @@
 //! The state of one check. Nothing in it outlives the check or is shared with another.
 
+use crate::language::Languages;
 use crate::term::Terms;
 
-/// Everything that a check builds on its way: the terms, and the work it may still do.
+/// Everything that a check builds on its way: the terms, the languages of strings, and the
+/// work it may still do.
 #[derive(Debug)]
 pub(crate) struct Context {
     pub budget: Budget,
     pub terms: Terms,
+    pub languages: Languages,
 }
 
 impl Context {
@@ -14,6 +17,7 @@ impl Context {
         Self {
             budget: Budget::new(budget),
             terms: Terms::default(),
+            languages: Languages::default(),
         }
     }
 }

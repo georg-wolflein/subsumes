@@ -114,7 +114,7 @@ impl Checker {
         let mut context = Context::new(self.budget);
         // Without the budget for them there are no terms to show.
         let roots = lower::lower(&graph, &mut context).ok();
-        Ok(inspect::stages(&graph, &context.terms, roots))
+        Ok(inspect::stages(&graph, &context, roots))
     }
 }
 
@@ -157,15 +157,18 @@ mod tests {
         let counterexample = json!(null);
         assert_eq!(check.verdict, Verdict::No { counterexample });
 
-        // The engine does not model strings yet, and says which keyword stands in the way.
-        let named = json!({"type": "string", "minLength": 1});
-        let check = checker.check(&named, &text).unwrap();
+        // The engine does not model arrays yet, and says which keyword stands in the way.
+        let (list, filled) = (
+            json!({"type": "array"}),
+            json!({"type": "array", "minItems": 1}),
+        );
+        let check = checker.check(&filled, &list).unwrap();
         assert_eq!(
             check.verdict,
             Verdict::Unknown {
                 reason: Reason::Unsupported {
                     schema: Side::A,
-                    location: "#/minLength".to_owned(),
+                    location: "#/minItems".to_owned(),
                 },
             }
         );

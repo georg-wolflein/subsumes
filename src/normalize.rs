@@ -1,10 +1,10 @@
 //! The engine: is there an instance that B accepts and A does not?
 //!
 //! `all[B, not A]` is taken apart into *branches*. A branch is a conjunction of what the
-//! engine knows how to combine: the types an instance may still have, the booleans it may
-//! still be, the numbers it may still be, the leaves that must hold and those that must not,
-//! and the variables taken for true or for false. A disjunction splits a branch in as many
-//! as it has alternatives.
+//! engine knows how to combine: the types an instance may still have, the booleans, the
+//! numbers and the strings it may still be, the leaves that must hold and those that must
+//! not, and the variables taken for true or for false. A disjunction splits a branch in as
+//! many as it has alternatives.
 //!
 //! - A branch that contradicts itself is *refuted*. If every branch is, A subsumes B.
 //! - A branch that is not refuted and has a type that no leaf is about gives an instance of
@@ -12,8 +12,9 @@
 //! - Any other branch that is not refuted depends on a leaf, and the answer is unknown.
 //!
 //! A leaf never refutes a branch, except together with its own negation. What a branch says
-//! about numbers is exact: when no number satisfies it, the branch has no number among its
-//! instances, and when one does, that number is an instance.
+//! about numbers and about strings is exact: when no number satisfies it, the branch has no
+//! number among its instances, and when one does, that number is an instance. So it is with
+//! strings.
 
 #[cfg(test)]
 mod exhaustive;
@@ -23,6 +24,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use serde_json::Value;
 
 use crate::canonical::number::Numbers;
+use crate::canonical::string::Strings;
 use crate::context::{Context, Exhausted};
 use crate::generate;
 use crate::term::{InstanceType, LeafId, Term, TermId, Terms, TypeSet, VarId};
@@ -142,6 +144,9 @@ struct Branch {
     /// since it was last seen that there are some.
     numbers: Numbers,
     numbers_asked: bool,
+    /// The same for the strings.
+    strings: Strings,
+    strings_asked: bool,
     /// The leaves that must hold, and the types that they are about.
     holds: BTreeSet<LeafId>,
     covered: TypeSet,
@@ -168,6 +173,8 @@ impl Default for Branch {
             booleans: [true; 2],
             numbers: Numbers::default(),
             numbers_asked: false,
+            strings: Strings::default(),
+            strings_asked: false,
             holds: BTreeSet::new(),
             covered: TypeSet::NONE,
             fails: BTreeSet::new(),
@@ -181,13 +188,15 @@ impl Default for Branch {
 
 const BOOLEAN: TypeSet = TypeSet::of(InstanceType::Boolean);
 const NUMBER: TypeSet = TypeSet::of(InstanceType::Number);
+const STRING: TypeSet = TypeSet::of(InstanceType::String);
 
 impl Branch {
     /// How much there is to copy when the branch splits.
     fn weight(&self) -> u64 {
         let leaves = self.holds.len() + self.fails.len();
         let variables = self.taken.len() + self.met.len();
-        (leaves + variables + self.choices.len()) as u64 + self.numbers.weight()
+        let copied = (leaves + variables + self.choices.len()) as u64;
+        copied + self.numbers.weight() + self.strings.weight()
     }
 
     /// Keeps only instances of these types. Returns whether any are left.
@@ -255,12 +264,22 @@ impl Engine<'_> {
             }
         }
         // What was asked of numbers may have left none. Then the branch has no number among
-        // its instances, and stands by what else it accepts.
+        // its instances, and stands by what else it accepts. So it is with strings.
         if std::mem::take(&mut branch.numbers_asked)
             && branch.types.contains(InstanceType::Number)
             && branch.numbers.is_empty(&mut self.context.budget)?
+            && !branch.restrict(NUMBER.complement())
         {
-            return Ok(branch.restrict(NUMBER.complement()));
+            return Ok(false);
+        }
+        let Context {
+            languages, budget, ..
+        } = &mut *self.context;
+        if std::mem::take(&mut branch.strings_asked)
+            && branch.types.contains(InstanceType::String)
+            && branch.strings.is_empty(languages, budget)?
+        {
+            return Ok(branch.restrict(STRING.complement()));
         }
         Ok(true)
     }
@@ -268,10 +287,16 @@ impl Engine<'_> {
     /// An instance that the branch accepts, if it is known to accept one that can be given:
     /// one of the first type that no leaf is about and that has one.
     fn instance(&mut self, branch: &Branch) -> Result<Option<Value>, Exhausted> {
-        let may_be_true = branch.booleans[1];
+        let Context {
+            languages, budget, ..
+        } = &mut *self.context;
+        let of = generate::Left {
+            may_be_true: branch.booleans[1],
+            numbers: &branch.numbers,
+            strings: &branch.strings,
+        };
         for kind in branch.free().iter() {
-            let budget = &mut self.context.budget;
-            let instance = generate::instance(kind, may_be_true, &branch.numbers, budget)?;
+            let instance = generate::instance(kind, &of, languages, budget)?;
             if instance.is_some() {
                 return Ok(instance);
             }
@@ -313,6 +338,18 @@ impl Engine<'_> {
                 if stands && branch.types.contains(InstanceType::Number) {
                     branch.numbers.take(found, negated);
                     branch.numbers_asked = true;
+                }
+                stands
+            }
+            // The same for strings: only a string is a certain string, and only a string
+            // fails another term about strings.
+            (Term::StrConst(_) | Term::Patt(_) | Term::MinLen(_) | Term::MaxLen(_), _) => {
+                let of_strings_only = negated != matches!(found, Term::StrConst(_));
+                let stands = !of_strings_only || branch.restrict(STRING);
+                if stands && branch.types.contains(InstanceType::String) {
+                    let languages = &mut self.context.languages;
+                    branch.strings.take(found, negated, languages);
+                    branch.strings_asked = true;
                 }
                 stands
             }
@@ -643,12 +680,12 @@ mod tests {
 
     #[test]
     fn a_leaf_and_its_negation_refute_a_branch() {
-        let long = json!({"minLength": 3});
-        let long_string = json!({"type": "string", "minLength": 3});
+        let long = json!({"minItems": 3});
+        let long_list = json!({"type": "array", "minItems": 3});
         yes(&long, &long);
-        yes(&long, &long_string);
-        // The other way, an instance that is no string tells them apart.
-        assert_eq!(counterexample(&long_string, &long), json!(null));
+        yes(&long, &long_list);
+        // The other way, an instance that is no array tells them apart.
+        assert_eq!(counterexample(&long_list, &long), json!(null));
         // Subschemas of one class make one leaf.
         let person = json!({"type": "object", "properties": {"name": {"type": "string"}}});
         let named = json!({
@@ -665,23 +702,161 @@ mod tests {
 
     #[test]
     fn a_leaf_is_about_one_type_only() {
-        // No number is too short, and no string is too small.
-        yes(&json!({"minLength": 3}), &json!({"type": "integer"}));
+        // No number is too short a list, and no list is too small a number.
+        yes(&json!({"minItems": 3}), &json!({"type": "integer"}));
         yes(
             &json!({"minimum": 3}),
-            &json!({"type": "string", "minLength": 1}),
+            &json!({"type": "array", "minItems": 1}),
         );
-        // An array satisfies the leaf about strings, so an array is an instance.
-        let either = json!({"type": ["string", "array"], "minLength": 3});
-        assert_eq!(counterexample(&json!({"type": "null"}), &either), json!([]));
+        // An object satisfies the leaf about arrays, so an object is an instance.
+        let either = json!({"type": ["array", "object"], "minItems": 3});
+        assert_eq!(counterexample(&json!({"type": "null"}), &either), json!({}));
         assert_eq!(
             depends_on(
-                &json!({"type": "string", "minLength": 3}),
-                &json!({"type": "string"})
+                &json!({"type": "array", "minItems": 3}),
+                &json!({"type": "array"})
             ),
-            (Side::A, "#/minLength".to_owned())
+            (Side::A, "#/minItems".to_owned())
         );
         // A constant is of the type of its value.
+        yes(&json!({"type": "array"}), &json!({"const": [1]}));
+        yes(
+            &json!({"enum": [[1], 1, null]}),
+            &json!({"enum": [null, [1]]}),
+        );
+        assert_eq!(
+            counterexample(&json!({"const": [1]}), &json!({"type": "number"})),
+            json!(0)
+        );
+        assert_eq!(
+            depends_on(&json!({"const": [1]}), &json!({"type": "array"})),
+            (Side::A, "#/const".to_owned())
+        );
+    }
+
+    #[test]
+    fn lengths_are_compared_as_counts_of_characters() {
+        yes(&json!({"minLength": 1}), &json!({"minLength": 2}));
+        assert_eq!(
+            counterexample(&json!({"minLength": 2}), &json!({"minLength": 1})),
+            json!("a")
+        );
+        yes(&json!({"maxLength": 3}), &json!({"maxLength": 2}));
+        assert_eq!(
+            counterexample(&json!({"maxLength": 2}), &json!({"maxLength": 3})),
+            json!("aaa")
+        );
+        yes(
+            &json!({"minLength": 2, "maxLength": 4}),
+            &json!({"type": "string", "minLength": 3, "maxLength": 3}),
+        );
+        // What is no string satisfies every bound.
+        assert_eq!(
+            counterexample(&json!({"type": "string"}), &json!({"minLength": 2})),
+            json!(null)
+        );
+        yes(&json!({"minLength": 2}), &json!({"type": "number"}));
+        // A schema that no string satisfies still accepts what is no string.
+        let none = json!({"minLength": 3, "maxLength": 2});
+        let no_string = json!({"not": {"type": "string"}});
+        yes(&none, &no_string);
+        yes(&no_string, &none);
+        assert_eq!(counterexample(&json!(false), &none), json!(null));
+        yes(
+            &json!(false),
+            &json!({"type": "string", "minLength": 3, "maxLength": 2}),
+        );
+        // A negated bound is a bound on strings only.
+        let short = json!({"not": {"minLength": 2}});
+        yes(&short, &json!({"type": "string", "maxLength": 1}));
+        yes(&json!({"type": "string", "maxLength": 1}), &short);
+        assert_eq!(
+            counterexample(&short, &json!({"type": "string"})),
+            json!("aa")
+        );
+        assert_eq!(
+            counterexample(&short, &json!({"type": "null"})),
+            json!(null)
+        );
+        // A character is counted once, however many bytes it takes.
+        yes(&json!({"maxLength": 1}), &json!({"enum": ["é", "𝄞", ""]}));
+        assert_eq!(
+            counterexample(&json!({"maxLength": 1}), &json!({"const": "e\u{301}"})),
+            json!("e\u{301}")
+        );
+    }
+
+    #[test]
+    fn a_pattern_is_compared_as_the_language_that_it_is() {
+        let (lower, letters) = (
+            json!({"pattern": "^[a-z]+$"}),
+            json!({"pattern": "^[a-zA-Z]+$"}),
+        );
+        yes(&letters, &lower);
+        assert_eq!(counterexample(&lower, &letters), json!("A"));
+        // A pattern matches anywhere in the string.
+        yes(&json!({"pattern": "a"}), &json!({"pattern": "^a"}));
+        assert_eq!(
+            counterexample(&json!({"pattern": "^a"}), &json!({"pattern": "a"})),
+            json!("ba")
+        );
+        // Two patterns that are written differently and say the same.
+        let (one, other) = (
+            json!({"pattern": "^(a|b)c*$"}),
+            json!({"pattern": "^[ab](?:c+)?$"}),
+        );
+        yes(&one, &other);
+        yes(&other, &one);
+        // To the `regex` crate a digit is any digit of Unicode.
+        let (digits, ascii) = (json!({"pattern": r"^\d+$"}), json!({"pattern": "^[0-9]+$"}));
+        yes(&digits, &ascii);
+        assert_eq!(counterexample(&ascii, &digits), json!("٠"));
+        // What is no string satisfies every pattern.
+        assert_eq!(
+            counterexample(&json!({"type": "string"}), &lower),
+            json!(null)
+        );
+        yes(&lower, &json!({"type": "number"}));
+        // A pattern and the bounds on the length that say the same.
+        let counted = json!({"type": "string", "pattern": "^[a-z]{2,4}$"});
+        let bounded =
+            json!({"type": "string", "pattern": "^[a-z]*$", "minLength": 2, "maxLength": 4});
+        yes(&counted, &bounded);
+        yes(&bounded, &counted);
+        assert_eq!(
+            counterexample(&counted, &json!({"pattern": "^[a-z]*$", "maxLength": 4})),
+            json!(null)
+        );
+        assert_eq!(
+            counterexample(
+                &counted,
+                &json!({"type": "string", "pattern": "^[a-z]*$", "maxLength": 5})
+            ),
+            json!("")
+        );
+        // A negated pattern is a string that the pattern does not match.
+        let other = json!({"not": {"pattern": "a"}});
+        yes(&other, &json!({"type": "string", "pattern": "^[b-z]*$"}));
+        assert_eq!(
+            counterexample(&other, &json!({"type": "string"})),
+            json!("a")
+        );
+        assert_eq!(
+            counterexample(&other, &json!({"type": "null"})),
+            json!(null)
+        );
+        // The connectives take patterns apart too.
+        let either = json!({"anyOf": [{"pattern": "^a"}, {"pattern": "^b"}]});
+        yes(&either, &json!({"pattern": "^[ab]"}));
+        yes(&json!({"pattern": "^[ab]"}), &either);
+        assert_eq!(
+            counterexample(&either, &json!({"pattern": "^[a-c]"})),
+            json!("c")
+        );
+    }
+
+    #[test]
+    fn a_constant_is_one_string() {
         yes(&json!({"type": "string"}), &json!({"const": "a"}));
         yes(
             &json!({"enum": ["a", 1, null]}),
@@ -692,9 +867,144 @@ mod tests {
             json!(0)
         );
         assert_eq!(
-            depends_on(&json!({"const": "a"}), &json!({"type": "string"})),
+            counterexample(&json!({"const": "a"}), &json!({"enum": ["a", "b"]})),
+            json!("b")
+        );
+        assert_eq!(
+            counterexample(&json!({"const": "a"}), &json!({"type": "string"})),
+            json!("")
+        );
+        assert_eq!(
+            counterexample(&json!({"enum": ["", "a"]}), &json!({"type": "string"})),
+            json!("b")
+        );
+        // A few strings, and the pattern that matches just these.
+        let few = json!({"enum": ["a", "b"]});
+        yes(&few, &json!({"type": "string", "pattern": "^[ab]$"}));
+        yes(&json!({"pattern": "^[ab]$"}), &few);
+        assert_eq!(
+            counterexample(&few, &json!({"type": "string", "pattern": "^[a-c]$"})),
+            json!("c")
+        );
+        assert_eq!(
+            counterexample(
+                &json!({"pattern": "^a"}),
+                &json!({"enum": ["a", "ba", "ab"]})
+            ),
+            json!("ba")
+        );
+        yes(&json!({"minLength": 1}), &few);
+        assert_eq!(
+            counterexample(&json!({"minLength": 2}), &json!({"enum": ["ab", "é", 1]})),
+            json!("é")
+        );
+        // Every string but one.
+        let not_a = json!({"not": {"const": "a"}});
+        assert_eq!(
+            counterexample(&not_a, &json!({"type": "string"})),
+            json!("a")
+        );
+        yes(&not_a, &json!({"type": "string", "minLength": 2}));
+        yes(&not_a, &json!({"type": "number"}));
+        yes(&not_a, &json!({"pattern": "^b"}));
+        yes(
+            &json!({"type": "string", "not": {"enum": ["a", "b"]}}),
+            &json!({"type": "string", "not": {"pattern": "^[ab]$"}}),
+        );
+        // A string in a constant of another type is not looked at yet.
+        assert_eq!(
+            depends_on(&json!({"const": ["a"]}), &json!({"const": ["b"]})),
             (Side::A, "#/const".to_owned())
         );
+    }
+
+    #[test]
+    fn a_format_is_the_language_of_its_pattern() {
+        let (date, text) = (json!({"format": "date"}), json!({"type": "string"}));
+        yes(&text, &json!({"type": "string", "format": "date"}));
+        assert_eq!(counterexample(&date, &text), json!(""));
+        assert_eq!(counterexample(&text, &date), json!(null));
+        yes(&date, &json!({"const": "2024-02-29"}));
+        assert_eq!(
+            counterexample(&date, &json!({"const": "2023-02-29"})),
+            json!("2023-02-29")
+        );
+        yes(&json!({"maxLength": 10, "minLength": 10}), &date);
+        yes(&json!({"pattern": "^[0-9]{4}-[01]"}), &date);
+        assert_eq!(
+            counterexample(&json!({"pattern": "^[0-9]{4}-0"}), &date),
+            json!("0000-10-01")
+        );
+        // A date-time begins with a date, and a URI is a reference.
+        let begins_with_a_date = json!({"if": {"type": "string"}, "then": {"pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt]"}});
+        yes(&begins_with_a_date, &json!({"format": "date-time"}));
+        yes(
+            &json!({"format": "uri-reference"}),
+            &json!({"format": "uri"}),
+        );
+        assert_eq!(
+            counterexample(
+                &json!({"format": "uri"}),
+                &json!({"format": "uri-reference"})
+            ),
+            json!("")
+        );
+        // Whether a time with the second 60 is one is left open, and nothing else is.
+        let time = json!({"format": "time"});
+        yes(&time, &time.clone());
+        yes(
+            &time,
+            &json!({"enum": ["12:00:00Z", "23:59:59.5+01:00", 1]}),
+        );
+        assert_eq!(
+            counterexample(&time, &json!({"enum": ["12:00:00Z", "23:59:61Z"]})),
+            json!("23:59:61Z")
+        );
+        assert_eq!(
+            depends_on(&time, &json!({"enum": ["12:00:00Z", "23:59:60Z"]})),
+            (Side::A, "#/format".to_owned())
+        );
+        // What holds for every time, with whichever second, holds.
+        yes(&json!({"pattern": "^[0-9]{2}:[0-9]{2}:"}), &time);
+        yes(
+            &json!({"type": "string", "minLength": 9}),
+            &json!({"type": "string", "format": "time"}),
+        );
+        assert_eq!(
+            counterexample(&json!({"maxLength": 9}), &time),
+            json!("00:00:00.0z")
+        );
+        // A format that is not modelled is a leaf, and so is a pattern that is not.
+        let host = json!({"format": "hostname"});
+        yes(&host, &host.clone());
+        yes(&text, &json!({"type": "string", "format": "hostname"}));
+        assert_eq!(depends_on(&host, &text), (Side::A, "#/format".to_owned()));
+        let word = json!({"pattern": r"\bword\b"});
+        yes(&word, &word.clone());
+        assert_eq!(depends_on(&word, &text), (Side::A, "#/pattern".to_owned()));
+    }
+
+    #[test]
+    fn what_two_schemas_share_about_strings_costs_no_automaton() {
+        // The pattern takes thousands of steps to become an automaton.
+        let pattern = "^(?:[a-f]{50}[0-9]{50}){20}$";
+        let (a, b) = (
+            json!({"pattern": pattern}),
+            json!({"pattern": pattern, "minLength": 1}),
+        );
+        let checker = Checker::new().budget(100);
+        let check = checker.check(&a, &b).unwrap();
+        assert_eq!(check.verdict, Verdict::Yes);
+        assert!(check.steps < 20, "{}", check.steps);
+        // The other way the automaton has to say that the pattern does not match the
+        // empty string.
+        let unknown = Verdict::Unknown {
+            reason: Reason::Budget,
+        };
+        assert_eq!(checker.check(&b, &a).unwrap().verdict, unknown);
+        let check = Checker::new().check(&b, &a).unwrap();
+        assert_eq!(check.verdict, Verdict::Yes);
+        assert!(check.steps > 4_000, "{}", check.steps);
     }
 
     #[test]
@@ -949,11 +1259,11 @@ mod tests {
         // Another instance is given where there is one, and a leaf is named where there is one.
         let or_null = json!({"type": ["number", "null"], "exclusiveMinimum": f64::MAX});
         assert_eq!(counterexample(&json!(false), &or_null), json!(null));
-        let or_string =
-            json!({"type": ["number", "string"], "exclusiveMinimum": f64::MAX, "minLength": 1});
+        let or_list =
+            json!({"type": ["number", "array"], "exclusiveMinimum": f64::MAX, "minItems": 1});
         assert_eq!(
-            depends_on(&json!(false), &or_string),
-            (Side::B, "#/minLength".to_owned())
+            depends_on(&json!(false), &or_list),
+            (Side::B, "#/minItems".to_owned())
         );
     }
 
@@ -1197,11 +1507,11 @@ mod tests {
 
     #[test]
     fn branches_that_cannot_give_an_instance_are_left_alone() {
-        // Twenty choices between two leaves about strings: a million branches, none of which
+        // Twenty choices between two leaves about arrays: a million branches, none of which
         // is refuted and none of which gives an instance. The first one settles the answer.
-        let choice = |n: u32| json!({"anyOf": [{"minLength": n}, {"maxLength": n + 100}]});
-        let b = json!({"type": "string", "allOf": (0..20).map(choice).collect::<Vec<_>>()});
-        let a = json!({"type": "string", "pattern": "^a"});
+        let choice = |n: u32| json!({"anyOf": [{"minItems": n}, {"maxItems": n + 100}]});
+        let b = json!({"type": "array", "allOf": (0..20).map(choice).collect::<Vec<_>>()});
+        let a = json!({"type": "array", "uniqueItems": true});
         let check = Checker::new().check(&a, &b).unwrap();
         assert!(matches!(
             check.verdict,

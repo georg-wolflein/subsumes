@@ -1,9 +1,10 @@
 //! A test that holds the engine against every instance there could be.
 //!
-//! To the engine an instance matters only by its type, by which boolean or which number it
-//! is, and by which of the leaves about its type it satisfies. A leaf may come out either
-//! way, since the engine knows nothing of what it means. So the kinds of instance can all be
-//! listed: a type, a boolean or a number, and an answer for each leaf.
+//! To the engine an instance matters only by its type, by which boolean, which number or
+//! which string it is, and by which of the leaves about its type it satisfies. A leaf may
+//! come out either way, since the engine knows nothing of what it means. So the kinds of
+//! instance can all be listed: a type, a boolean, a number or a string, and an answer for
+//! each leaf.
 //!
 //! A small evaluator here says for each kind whether a schema accepts it. It reads the JSON
 //! and knows nothing of terms or branches, and it states again which keywords are about which
@@ -11,7 +12,8 @@
 //!
 //! - `Yes` exactly when every kind that B accepts, A accepts.
 //! - `No` only with an instance of which every kind is accepted by B and not by A.
-//! - `Unknown` only when some kind is accepted by B and not by A, and no number is.
+//! - `Unknown` only when some kind is accepted by B and not by A, and no number and no
+//!   string is.
 //!
 //! The schemas are made at random from the keywords that hold no schema inside a leaf.
 //!
@@ -30,6 +32,18 @@
 //!
 //! A number that the engine gives may be any number, and is evaluated as it is.
 //!
+//! # Strings
+//!
+//! No leaf is about strings either, and the evaluator works out what a keyword about them
+//! means: it counts the characters, and asks the `regex` crate whether a pattern matches. The
+//! schemas here ask little of a string: to begin with an `a`, to end with a `b`, to hold a
+//! `b`, to be made of the letters `a` and `b` only, to be shorter or longer than one, two or
+//! three characters, or to be one of a few strings of up to two characters. To such a schema
+//! every string is like one of up to three of the letters `a`, `b` and `c`, where `c` is as
+//! good as any other character. So those strings hold one of every kind.
+//!
+//! A string that the engine gives is evaluated as it is too.
+//!
 //! # Schemas that refer to themselves
 //!
 //! A definition that refers to itself, or to one that refers back, accepts what it can be
@@ -43,7 +57,7 @@
 //! "Accepted by B and not by A" above is then: surely accepted by B, and not possibly by A.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde_json::{Value, json};
 
@@ -51,12 +65,13 @@ use crate::testing::Random;
 use crate::{Checker, Reason, Verdict};
 
 /// One kind of instance: its type, which boolean it is if it is one, which number if it is
-/// one, and the leaves that it satisfies. A leaf that was not given an answer is asked for
-/// and noted.
+/// one, which string if it is one, and the leaves that it satisfies. A leaf that was not
+/// given an answer is asked for and noted.
 struct Kind<'k> {
     of_type: &'static str,
     boolean: bool,
     number: f64,
+    string: &'k str,
     satisfies: &'k BTreeMap<String, bool>,
     asked: &'k RefCell<Vec<String>>,
 }
@@ -80,11 +95,14 @@ impl Kind<'_> {
             Value::Null => self.of_type == "null",
             Value::Bool(value) => self.of_type == "boolean" && self.boolean == *value,
             Value::Number(value) => self.of_type == "number" && value.as_f64() == Some(self.number),
-            Value::String(_) => {
-                self.of_type == "string" && self.leaf("string", format!("const {value}"))
-            }
+            Value::String(value) => self.of_type == "string" && self.string == value,
             other => panic!("no schema here has the constant {other}"),
         }
+    }
+
+    /// Whether the instance is no string, or a string of which this holds.
+    fn string(&self, holds: impl Fn(&str) -> bool) -> bool {
+        self.of_type != "string" || holds(self.string)
     }
 
     /// Whether the instance is no number, or a number of which this holds.
@@ -115,6 +133,7 @@ impl Kind<'_> {
         };
         // The number that a keyword about numbers holds.
         let at = |value: &Value| value.as_f64().expect("the keyword holds a number");
+        let count = |value: &Value| value.as_u64().expect("the keyword holds a count") as usize;
         let mut accepted = true;
         for (keyword, value) in keywords {
             accepted &= match keyword.as_str() {
@@ -165,7 +184,9 @@ impl Kind<'_> {
                     let (then, otherwise) = (part("then"), part("else"));
                     (rejects(value) | then) & (accepts(value) | otherwise)
                 }
-                "minLength" | "maxLength" => self.leaf("string", format!("{keyword} {value}")),
+                "minLength" => self.string(|string| string.chars().count() >= count(value)),
+                "maxLength" => self.string(|string| string.chars().count() <= count(value)),
+                "pattern" => self.string(|string| matches(value.as_str().unwrap(), string)),
                 "minimum" => self.number(|number| number >= at(value)),
                 "maximum" => self.number(|number| number <= at(value)),
                 "exclusiveMinimum" => self.number(|number| number > at(value)),
@@ -277,32 +298,69 @@ impl<'d> Document<'d> {
     }
 }
 
-/// An instance apart from its leaves: its type, which boolean it is, and which number.
-type Instance = (&'static str, bool, f64);
+/// Whether a pattern matches a string, by the `regex` crate.
+fn matches(pattern: &str, string: &str) -> bool {
+    thread_local! {
+        static READ: RefCell<HashMap<String, regex::Regex>> = RefCell::default();
+    }
+    READ.with_borrow_mut(|read| {
+        if !read.contains_key(pattern) {
+            let parsed = regex::Regex::new(pattern).expect("the pattern is one of the crate");
+            read.insert(pattern.to_owned(), parsed);
+        }
+        read[pattern].is_match(string)
+    })
+}
+
+/// An instance apart from its leaves: its type, which boolean it is, which number, and which
+/// string.
+type Instance = (&'static str, bool, f64, String);
 
 /// The quarters that hold a number of every kind: from -8 to 9. The bounds and constants of
 /// the schemas here are from -1.5 to 2.5, and the least number that 0.5, 1, 1.5 and 2 all
 /// divide is 6.
 const QUARTERS: std::ops::RangeInclusive<i16> = -32..=36;
 
-/// The types, with both booleans and with a number of every kind.
-fn instances() -> Vec<Instance> {
-    let others = ["null", "string", "array", "object"].map(|of_type| (of_type, false, 0.0));
-    let booleans = [true, false].map(|boolean| ("boolean", boolean, 0.0));
-    let numbers = QUARTERS.map(|quarters| ("number", false, f64::from(quarters) / 4.0));
-    others.into_iter().chain(booleans).chain(numbers).collect()
+/// The strings that hold one of every kind: those of up to three of the letters `a`, `b`
+/// and `c`.
+fn strings() -> Vec<String> {
+    let mut strings = vec![String::new()];
+    let mut from = 0;
+    for _ in 0..3 {
+        let end = strings.len();
+        for at in from..end {
+            strings.extend(['a', 'b', 'c'].map(|letter| format!("{}{letter}", strings[at])));
+        }
+        from = end;
+    }
+    strings
 }
 
-/// What a value is apart from its leaves. Of a string, an array and an object, the engine
-/// gives the empty one only.
+/// The types, with both booleans, with a number of every kind and with a string of every
+/// kind.
+fn instances() -> Vec<Instance> {
+    let none = String::new;
+    let others = ["null", "array", "object"].map(|of_type| (of_type, false, 0.0, none()));
+    let booleans = [true, false].map(|boolean| ("boolean", boolean, 0.0, none()));
+    let numbers = QUARTERS.map(|quarters| ("number", false, f64::from(quarters) / 4.0, none()));
+    let strings = strings()
+        .into_iter()
+        .map(|string| ("string", false, 0.0, string));
+    let listed = others.into_iter().chain(booleans).chain(numbers);
+    listed.chain(strings).collect()
+}
+
+/// What a value is apart from its leaves. Of an array and an object, the engine gives the
+/// empty one only.
 fn instance_of(value: &Value) -> Instance {
+    let none = String::new;
     match value {
-        Value::Null => ("null", false, 0.0),
-        Value::Bool(boolean) => ("boolean", *boolean, 0.0),
-        Value::Number(number) => ("number", false, number.as_f64().expect("a float")),
-        Value::String(text) if text.is_empty() => ("string", false, 0.0),
-        Value::Array(items) if items.is_empty() => ("array", false, 0.0),
-        Value::Object(members) if members.is_empty() => ("object", false, 0.0),
+        Value::Null => ("null", false, 0.0, none()),
+        Value::Bool(boolean) => ("boolean", *boolean, 0.0, none()),
+        Value::Number(number) => ("number", false, number.as_f64().expect("a float"), none()),
+        Value::String(text) => ("string", false, 0.0, text.clone()),
+        Value::Array(items) if items.is_empty() => ("array", false, 0.0, none()),
+        Value::Object(members) if members.is_empty() => ("object", false, 0.0, none()),
         other => panic!("the engine does not give {other} yet"),
     }
 }
@@ -318,13 +376,15 @@ struct Found {
 
 /// Asks the evaluator about A and B, for an instance with every way of answering the leaves
 /// about it.
-fn found(a: &Document, b: &Document, (of_type, boolean, number): Instance) -> Found {
+fn found(a: &Document, b: &Document, instance: &Instance) -> Found {
+    let (of_type, boolean, number, string) = (instance.0, instance.1, instance.2, &instance.3);
     let ask = |satisfies: &BTreeMap<String, bool>| {
         let asked = RefCell::new(Vec::new());
         let kind = Kind {
             of_type,
             boolean,
             number,
+            string,
             satisfies,
             asked: &asked,
         };
@@ -332,7 +392,7 @@ fn found(a: &Document, b: &Document, (of_type, boolean, number): Instance) -> Fo
         (b_surely & !a_possibly, asked.into_inner())
     };
     // The first look finds the leaves that there are to answer. Without any, as for every
-    // number, it is the answer.
+    // number and every string, it is the answer.
     let (tells_apart, mut leaves) = ask(&BTreeMap::new());
     if leaves.is_empty() {
         return Found {
@@ -407,9 +467,16 @@ fn plain(random: &mut Random, shape: Shape) -> Value {
         json!({"enum": [1, "a", true]}),
         json!({"const": 1}),
         json!({"const": "a"}),
+        json!({"enum": ["ab", ""]}),
         json!({"minLength": 1}),
         json!({"minLength": 2, "type": "string"}),
+        json!({"minLength": 3}),
         json!({"maxLength": 1}),
+        json!({"maxLength": 2, "minLength": 1}),
+        json!({"pattern": "^a"}),
+        json!({"pattern": "b$", "type": "string"}),
+        json!({"pattern": "b"}),
+        json!({"pattern": "^[ab]*$"}),
         json!({"minimum": 0}),
         json!({"maximum": 0, "type": "number"}),
         json!({"multipleOf": 1}),
@@ -465,6 +532,7 @@ fn schema(random: &mut Random, depth: usize, shape: Shape) -> Value {
         let beside = [
             ("type", json!(["string", "null"])),
             ("minLength", json!(1)),
+            ("pattern", json!("^a")),
             ("required", json!(["a"])),
             ("maximum", json!(1)),
         ];
@@ -504,8 +572,9 @@ fn document(mut schema: Value, definitions: &Value) -> Value {
 struct Tally {
     yes: usize,
     no: usize,
-    /// The checks that ended in `No` with a number.
+    /// The checks that ended in `No` with a number, and those with a string.
     numbers: usize,
+    strings: usize,
     unknown: usize,
     /// The checks that ended in `Unknown` although there was an instance to give.
     missed: usize,
@@ -522,12 +591,14 @@ impl Tally {
         let (of_a, of_b) = (&Document::new(a, &fragments), &Document::new(b, &fragments));
         let instances = instances().into_iter();
         let found: Vec<Found> = instances
-            .map(|instance| found(of_a, of_b, instance))
+            .map(|instance| found(of_a, of_b, &instance))
             .collect();
         let subsumed = found.iter().all(|found| !found.some_tells_apart);
-        // No leaf is about numbers, so a number that tells the two apart is an instance.
-        let mut numbers = found.iter().filter(|found| found.of_type == "number");
-        let a_number_tells_apart = numbers.any(|found| found.some_tells_apart);
+        // No leaf is about numbers or about strings, so one of them that tells the two apart
+        // is an instance.
+        let without_leaves = |found: &&Found| ["number", "string"].contains(&found.of_type);
+        let mut exact = found.iter().filter(without_leaves);
+        let one_tells_apart = exact.any(|found| found.some_tells_apart);
         let verdict = Checker::new().subsumes(a, b).unwrap();
         let context = format!("does {a} subsume {b}? {verdict:?}");
         match &verdict {
@@ -536,16 +607,17 @@ impl Tally {
                 self.yes += 1;
             }
             Verdict::No { counterexample } => {
-                let found = self::found(of_a, of_b, instance_of(counterexample));
+                let found = self::found(of_a, of_b, &instance_of(counterexample));
                 assert!(found.all_tell_apart, "{context}");
                 self.no += 1;
                 self.numbers += usize::from(counterexample.is_number());
+                self.strings += usize::from(counterexample.is_string());
             }
             Verdict::Unknown {
                 reason: Reason::Unsupported { .. },
             } => {
                 assert!(!complete || !subsumed, "{context}");
-                assert!(!complete || !a_number_tells_apart, "{context}");
+                assert!(!complete || !one_tells_apart, "{context}");
                 self.unknown += 1;
                 // There was an instance to give, and the engine did not find a branch for it.
                 self.missed += usize::from(found.iter().any(|found| found.all_tell_apart));
@@ -561,12 +633,13 @@ impl std::fmt::Display for Tally {
             yes,
             no,
             numbers,
+            strings,
             unknown,
             missed,
         } = self;
         write!(
             f,
-            "{yes} Yes, {no} No, {numbers} of them with a number, {unknown} Unknown, {missed} of them with an instance to give"
+            "{yes} Yes, {no} No, {numbers} of them with a number and {strings} with a string, {unknown} Unknown, {missed} of them with an instance to give"
         )
     }
 }
@@ -594,12 +667,13 @@ fn the_engine_agrees_with_every_instance_there_could_be() {
         yes,
         no,
         numbers,
+        strings,
         unknown,
         ..
     } = tally;
     assert!(
-        yes > 500 && no > 500 && numbers > 300 && unknown > 200,
-        "{yes} {no} {numbers} {unknown}"
+        yes > 500 && no > 500 && numbers > 300 && strings > 300 && unknown > 100,
+        "{yes} {no} {numbers} {strings} {unknown}"
     );
 }
 
@@ -634,11 +708,12 @@ fn the_engine_agrees_on_schemas_that_refer_to_themselves() {
         yes,
         no,
         numbers,
+        strings,
         unknown,
         ..
     } = tally;
     assert!(
-        yes > 300 && no > 150 && numbers > 100 && unknown > 100,
-        "{yes} {no} {numbers} {unknown}"
+        yes > 300 && no > 150 && numbers > 100 && strings > 100 && unknown > 100,
+        "{yes} {no} {numbers} {strings} {unknown}"
     );
 }

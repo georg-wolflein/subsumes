@@ -2,3 +2,4 @@
 //! one shape that everything said about that type comes down to.
 
 pub(crate) mod number;
+pub(crate) mod string;
