@@ -90,6 +90,11 @@ fn row(graph: &Graph, terms: &Terms, languages: &Languages, part: TermId) -> Val
         | Term::PNames(_)
         | Term::MinProps(_)
         | Term::MaxProps(_) => json!(["object", terms.show_with(part, languages)]),
+        Term::Item(..)
+        | Term::AddIts(..)
+        | Term::Contains(_)
+        | Term::MinIts(_)
+        | Term::MaxIts(_) => json!(["array", terms.show_with(part, languages)]),
         Term::Unknown(leaf) => {
             let leaf = terms.leaf(*leaf);
             let about: Vec<&str> = leaf.domain.iter().map(|kind| kind.name()).collect();
@@ -110,8 +115,8 @@ fn row(graph: &Graph, terms: &Terms, languages: &Languages, part: TermId) -> Val
 }
 
 /// The variables that a term refers to, each with how: plainly, under a negation, in a
-/// `OneOf`, which takes each of its parts both ways, or for the values or the names of the
-/// properties of an object.
+/// `OneOf`, which takes each of its parts both ways, for the values or the names of the
+/// properties of an object, or for the items of an array.
 fn referred(terms: &Terms, term: TermId) -> Vec<(VarId, &'static str)> {
     let mut found: Vec<(VarId, &'static str)> = Vec::new();
     let mut pending = vec![(term, "")];
@@ -150,6 +155,12 @@ fn referred(terms: &Terms, term: TermId) -> Vec<(VarId, &'static str)> {
                 }
             }
             Term::PReq(_) | Term::MinProps(_) | Term::MaxProps(_) => {}
+            Term::Item(_, variable) | Term::AddIts(_, variable) | Term::Contains(variable) => {
+                if !found.contains(&(*variable, "items")) {
+                    found.push((*variable, "items"));
+                }
+            }
+            Term::MinIts(_) | Term::MaxIts(_) => {}
         }
     }
     found
@@ -169,7 +180,7 @@ mod tests {
 
     #[test]
     fn there_is_a_picture_for_each_stage() {
-        let shared = json!({"type": "array", "minItems": 1});
+        let shared = json!({"type": "array", "uniqueItems": true});
         let a = json!({"anyOf": [shared, {"type": "null"}]});
         let b = json!({"allOf": [shared], "not": {"type": "null"}});
         let shown = shown(&a, &b, u64::MAX);
@@ -204,7 +215,7 @@ mod tests {
                     "location": "#/anyOf/0",
                     "keywords": [
                         ["type", "array"],
-                        ["unknown", "minItems 1, about array, first at #/anyOf/0/minItems in A"],
+                        ["unknown", "uniqueItems, about array, first at #/anyOf/0/uniqueItems in A"],
                     ],
                 },
                 {
@@ -314,6 +325,44 @@ mod tests {
                 (&json!(2), &json!("properties")),
                 (&json!(3), &json!("properties")),
                 (&json!(4), &json!("names")),
+            ]
+        );
+    }
+
+    #[test]
+    fn what_a_term_says_about_arrays_is_a_row_each_with_an_edge_to_each_schema() {
+        let schema = json!({
+            "prefixItems": [{"type": "null"}],
+            "items": false,
+            "contains": {"maxLength": 3},
+            "minItems": 1,
+            "maxItems": 2,
+        });
+        let shown = shown(&schema, &json!(true), u64::MAX);
+        let terms = &shown["stages"][1];
+        assert_eq!(
+            terms["nodes"][0]["keywords"],
+            json!([
+                ["array", "item(0: x2)"],
+                ["array", "addits(1: x3)"],
+                ["array", "contains(x4)"],
+                ["array", "minits(1)"],
+                ["array", "maxits(2)"],
+            ])
+        );
+        let from_a: Vec<(&Value, &Value)> = terms["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|edge| edge["from"] == 0)
+            .map(|edge| (&edge["to"], &edge["keyword"]))
+            .collect();
+        assert_eq!(
+            from_a,
+            [
+                (&json!(2), &json!("items")),
+                (&json!(3), &json!("items")),
+                (&json!(4), &json!("items")),
             ]
         );
     }

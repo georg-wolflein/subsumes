@@ -36,6 +36,7 @@ use std::rc::Rc;
 
 use serde_json::{Map, Value};
 
+use super::{Left, State, state};
 use crate::context::{Budget, Exhausted};
 use crate::language::{LanguageId, Languages, Lengths, Shape};
 use crate::normalize::{Cause, DEEPEST, Found, Witness};
@@ -197,20 +198,6 @@ pub(crate) struct Solver<'s> {
     pub languages: &'s mut Languages,
     pub budget: &'s mut Budget,
     pub partitions: &'s mut Partitions,
-}
-
-/// What is left of the objects of a branch.
-#[derive(Debug)]
-pub(crate) enum Left {
-    /// No object.
-    Nothing,
-    /// An object as far as the engine knows: this stands between it and a value of some
-    /// property.
-    Unknown(Cause),
-    /// An object, which is given if one was asked for.
-    Object(Option<Rc<Witness>>),
-    /// That depends on these c-references, of which the engine knows nothing yet.
-    Needs(Vec<CRefId>),
 }
 
 /// The names of all properties, cut into fragments by a list of languages.
@@ -452,15 +439,6 @@ enum Done {
     Opened,
 }
 
-/// What the engine makes of a c-reference, as the search sees it.
-enum State {
-    Nothing,
-    Possible(Cause),
-    Sure(Rc<Witness>),
-    /// The engine has yet to decide. The search goes on as if there were a value.
-    Wanted,
-}
-
 /// The search for an object: a place for every property that there has to be.
 struct Search<'s> {
     objects: &'s Objects,
@@ -529,7 +507,7 @@ impl Search<'_> {
                 Place::Open(fragment) => (fragment, self.every[fragment as usize]),
             };
             let of = with.terms.both(of, asked);
-            let value = match self.state(of, ask) {
+            let value = match state(of, ask, &mut self.wanted) {
                 State::Nothing => None,
                 State::Possible(_) if self.depends.is_some() => None,
                 State::Possible(cause) => Some(Err(Some(cause))),
@@ -560,20 +538,6 @@ impl Search<'_> {
             Some(cause) => Left::Unknown(cause),
             None => Left::Nothing,
         })
-    }
-
-    fn state(&mut self, of: CRefId, ask: &mut dyn FnMut(CRefId) -> Option<Found>) -> State {
-        match ask(of) {
-            Some(Found::Nothing) => State::Nothing,
-            Some(Found::Unknown(cause)) => State::Possible(cause),
-            Some(Found::Instance(witness)) => State::Sure(witness),
-            None => {
-                if !self.wanted.contains(&of) {
-                    self.wanted.push(of);
-                }
-                State::Wanted
-            }
-        }
     }
 
     /// Where one of the properties that there have to be may go.
@@ -636,7 +600,7 @@ impl Search<'_> {
             }
             with.budget.charge(1)?;
             let taken = spare.min(need - sure);
-            match self.state(self.every[fragment], ask) {
+            match state(self.every[fragment], ask, &mut self.wanted) {
                 State::Nothing => {}
                 State::Possible(why) => {
                     possible = possible.saturating_add(spare);
@@ -676,10 +640,10 @@ impl Search<'_> {
             return Ok(None);
         }
         if !give {
-            return Ok(Some(Left::Object(None)));
+            return Ok(Some(Left::Value(None)));
         }
         let object = self.given(with, &more, deepest + 1)?;
-        Ok(Some(Left::Object(Some(object))))
+        Ok(Some(Left::Value(Some(object))))
     }
 
     /// The object: a name and a value for each slot, and for each property that was added
@@ -894,7 +858,7 @@ mod tests {
         /// The object that is given, or why none is.
         fn given(mut self) -> Result<Value, String> {
             match self.left(&mut Budget::new(u64::MAX)).unwrap() {
-                Left::Object(Some(object)) => Ok(object.value.clone()),
+                Left::Value(Some(object)) => Ok(object.value.clone()),
                 Left::Nothing => Err("nothing".to_owned()),
                 Left::Unknown(cause) => Err(format!("{cause:?}")),
                 other => panic!("{other:?} is no answer"),
@@ -1049,13 +1013,13 @@ mod tests {
         };
         let mut asked = four();
         let mut budget = Budget::new(u64::MAX);
-        assert!(matches!(asked.left(&mut budget), Ok(Left::Object(Some(_)))));
+        assert!(matches!(asked.left(&mut budget), Ok(Left::Value(Some(_)))));
         // One c-reference for the four, asked for in one go.
         assert_eq!((asked.waited, asked.found.len()), (1, 1));
         // The search costs steps, and the partition is made once.
         let spent = budget.spent();
         assert!(spent > 8, "{spent}");
-        assert!(matches!(asked.left(&mut budget), Ok(Left::Object(Some(_)))));
+        assert!(matches!(asked.left(&mut budget), Ok(Left::Value(Some(_)))));
         assert_eq!(asked.partitions.of.len(), 1);
         assert_eq!(four().left(&mut Budget::new(spent)).map(|_| ()), Ok(()));
         assert_eq!(
