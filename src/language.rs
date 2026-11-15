@@ -12,10 +12,12 @@
 //! - As a set of words: these words and no other, or every string but these words.
 //! - As a DFA, a deterministic finite automaton, for anything else.
 //!
-//! A pattern is only parsed when it comes in. Its DFA is built when something is asked
-//! that needs it, so a pattern that cancels against itself before that costs nothing. So it
-//! is with the strings that are in none of a few languages: they are kept as those
-//! languages, and who asks for [the shape](Languages::shape) of the language gets them.
+//! A pattern that is one word between `^` and `$`, such as `^type$`, comes in as the set of
+//! that word, by the id that the word has, and no DFA is built from it. Any other pattern
+//! is only parsed when it comes in. Its DFA is built when something is asked that needs it,
+//! so a pattern that cancels against itself before that costs nothing. So it is with the
+//! strings that are in none of a few languages: they are kept as those languages, and who
+//! asks for [the shape](Languages::shape) of the language gets them.
 
 mod dfa;
 mod pattern;
@@ -154,7 +156,8 @@ impl Languages {
     }
 
     /// The language of every string that holds a match of the pattern, as the `regex` crate
-    /// reads the pattern.
+    /// reads the pattern. For a pattern that is one word between `^` and `$` that is the set
+    /// of this word, by the id that [`Self::words`] gives it.
     ///
     /// # Errors
     ///
@@ -164,6 +167,10 @@ impl Languages {
             return *known;
         }
         let read = pattern::read(pattern).map(|read| {
+            // A word between `^` and `$` is that word, and needs no DFA.
+            if let Some(word) = pattern::one_word(&read) {
+                return self.words([word]);
+            }
             let id = self.add(Language::Pattern(Box::new(read)));
             self.sources.insert(id, format!("{pattern:?}"));
             id
@@ -854,6 +861,24 @@ mod tests {
         // A search and the pattern that spells the search out.
         let (search, spelled) = (store.pattern("b"), store.pattern("(?s)^.*b.*$"));
         assert!(store.includes(search, spelled) && store.includes(spelled, search));
+    }
+
+    #[test]
+    fn a_word_between_the_two_ends_is_that_word_and_no_pattern() {
+        let mut store = Store::new();
+        assert_eq!(store.pattern("^type$"), store.0.words(["type"]));
+        assert_eq!(store.pattern(r"^a\.b$"), store.0.words(["a.b"]));
+        assert_eq!(store.pattern("^é𝄞$"), store.0.words(["é𝄞"]));
+        assert_eq!(store.pattern("^$"), store.0.words([""]));
+        // Anything else between them is a pattern, and so is a word without one of them,
+        // or with something else in the place of one.
+        for pattern in [
+            "^a|b$", "^a", "a$", "a", "^[ab]$", "^a?$", "(?i)^a$", "^a$|^b$", "^ab*", "a*b$",
+            "^a^", "$a$", "^a$b", "^$a",
+        ] {
+            let read = store.pattern(pattern);
+            assert_eq!(store.0.show(read), format!("{pattern:?}"));
+        }
     }
 
     #[test]
