@@ -10,12 +10,12 @@
 //! A language is kept in one of two ways:
 //!
 //! - As a set of words: these words and no other, or every string but these words.
-//! - As an automaton, for anything else.
+//! - As a DFA, a deterministic finite automaton, for anything else.
 //!
-//! A pattern is only parsed when it comes in. Its automaton is built when something is asked
+//! A pattern is only parsed when it comes in. Its DFA is built when something is asked
 //! that needs it, so a pattern that cancels against itself before that costs nothing.
 
-mod automaton;
+mod dfa;
 mod pattern;
 
 use std::collections::hash_map::Entry;
@@ -24,7 +24,7 @@ use std::rc::Rc;
 
 use regex_syntax::hir::Hir;
 
-use self::automaton::{Automaton, CHARACTERS, LAST, character, plainness};
+use self::dfa::{CHARACTERS, Dfa, LAST, character, plainness};
 use crate::context::{Budget, Exhausted};
 
 /// The id of a language in the store of a check.
@@ -71,12 +71,12 @@ enum Language {
         words: Words,
         others: bool,
     },
-    /// A pattern whose automaton nothing has asked for yet.
+    /// A pattern whose DFA nothing has asked for yet.
     Pattern(Box<Hir>),
     /// The pattern of a format, which is not even parsed until something asks for its
-    /// automaton.
+    /// DFA.
     Format(&'static str),
-    Automaton(Rc<Automaton>),
+    Dfa(Rc<Dfa>),
 }
 
 /// The languages of a check.
@@ -88,9 +88,9 @@ pub(crate) struct Languages {
     patterns: HashMap<Box<str>, Result<LanguageId, Unsupported>>,
     formats: HashMap<Box<str>, LanguageId>,
     of_words: HashMap<(Words, bool), LanguageId>,
-    of_automata: HashMap<Rc<Automaton>, LanguageId>,
-    /// The automaton of a set of words, once something has asked for it.
-    as_automata: HashMap<LanguageId, Rc<Automaton>>,
+    of_dfas: HashMap<Rc<Dfa>, LanguageId>,
+    /// The DFA of a set of words, once something has asked for it.
+    as_dfas: HashMap<LanguageId, Rc<Dfa>>,
     intersections: HashMap<(LanguageId, LanguageId), LanguageId>,
     complements: HashMap<LanguageId, LanguageId>,
 }
@@ -103,8 +103,8 @@ impl Default for Languages {
             patterns: HashMap::new(),
             formats: HashMap::new(),
             of_words: HashMap::new(),
-            of_automata: HashMap::new(),
-            as_automata: HashMap::new(),
+            of_dfas: HashMap::new(),
+            as_dfas: HashMap::new(),
             intersections: HashMap::new(),
             complements: HashMap::new(),
         };
@@ -177,56 +177,52 @@ impl Languages {
         id
     }
 
-    /// The id of an automaton that came out of others.
-    fn keep(&mut self, automaton: Automaton) -> LanguageId {
-        if automaton.is_empty() {
+    /// The id of a DFA that came out of others.
+    fn keep(&mut self, dfa: Dfa) -> LanguageId {
+        if dfa.is_empty() {
             return Self::NOTHING;
         }
-        if automaton.is_everything() {
+        if dfa.is_everything() {
             return Self::EVERYTHING;
         }
-        let automaton = Rc::new(automaton);
-        if let Some(known) = self.of_automata.get(&automaton) {
+        let dfa = Rc::new(dfa);
+        if let Some(known) = self.of_dfas.get(&dfa) {
             return *known;
         }
-        let id = self.add(Language::Automaton(Rc::clone(&automaton)));
-        self.of_automata.insert(automaton, id);
+        let id = self.add(Language::Dfa(Rc::clone(&dfa)));
+        self.of_dfas.insert(dfa, id);
         id
     }
 
-    /// The automaton of a language, which is built if it was not before.
-    fn automaton(
-        &mut self,
-        id: LanguageId,
-        budget: &mut Budget,
-    ) -> Result<Rc<Automaton>, Exhausted> {
+    /// The DFA of a language, which is built if it was not before.
+    fn dfa(&mut self, id: LanguageId, budget: &mut Budget) -> Result<Rc<Dfa>, Exhausted> {
         let built = match &self.languages[id.0 as usize] {
-            Language::Automaton(automaton) => return Ok(Rc::clone(automaton)),
-            Language::Pattern(pattern) => pattern::automaton(pattern, budget)?,
+            Language::Dfa(dfa) => return Ok(Rc::clone(dfa)),
+            Language::Pattern(pattern) => pattern::dfa(pattern, budget)?,
             Language::Format(pattern) => {
                 let read = pattern::read(pattern).expect("the pattern of a format is supported");
-                pattern::automaton(&read, budget)?
+                pattern::dfa(&read, budget)?
             }
             Language::Words { words, others } => {
-                if let Some(known) = self.as_automata.get(&id) {
+                if let Some(known) = self.as_dfas.get(&id) {
                     return Ok(Rc::clone(known));
                 }
-                let listed = Automaton::of_words(words.iter().map(AsRef::as_ref), budget)?;
+                let listed = Dfa::of_words(words.iter().map(AsRef::as_ref), budget)?;
                 let built = Rc::new(if *others { listed.complement() } else { listed });
-                self.as_automata.insert(id, Rc::clone(&built));
+                self.as_dfas.insert(id, Rc::clone(&built));
                 return Ok(built);
             }
         };
-        // Two patterns of one language share the automaton.
+        // Two patterns of one language share the DFA.
         let built = Rc::new(built);
-        let shared = match self.of_automata.entry(Rc::clone(&built)) {
+        let shared = match self.of_dfas.entry(Rc::clone(&built)) {
             Entry::Occupied(known) => Rc::clone(known.key()),
             Entry::Vacant(new) => {
                 new.insert(id);
                 built
             }
         };
-        self.languages[id.0 as usize] = Language::Automaton(Rc::clone(&shared));
+        self.languages[id.0 as usize] = Language::Dfa(Rc::clone(&shared));
         Ok(shared)
     }
 
@@ -234,7 +230,7 @@ impl Languages {
     ///
     /// # Errors
     ///
-    /// When the budget does not cover the automaton of a pattern.
+    /// When the budget does not cover the DFA of a pattern.
     pub fn complement(
         &mut self,
         id: LanguageId,
@@ -246,7 +242,7 @@ impl Languages {
         let complement = match &self.languages[id.0 as usize] {
             Language::Words { words, others } => self.set(Rc::clone(words), !others),
             _ => {
-                let complement = self.automaton(id, budget)?.complement();
+                let complement = self.dfa(id, budget)?.complement();
                 self.keep(complement)
             }
         };
@@ -259,7 +255,7 @@ impl Languages {
     ///
     /// # Errors
     ///
-    /// When the budget does not cover the automata.
+    /// When the budget does not cover the DFAs.
     pub fn intersection(
         &mut self,
         a: LanguageId,
@@ -317,7 +313,7 @@ impl Languages {
                 self.held(&words, a, budget)?
             }
             _ => {
-                let (of_a, of_b) = (self.automaton(a, budget)?, self.automaton(b, budget)?);
+                let (of_a, of_b) = (self.dfa(a, budget)?, self.dfa(b, budget)?);
                 let both = of_a.intersection(&of_b, budget)?;
                 self.keep(both)
             }
@@ -333,11 +329,11 @@ impl Languages {
         by: LanguageId,
         budget: &mut Budget,
     ) -> Result<LanguageId, Exhausted> {
-        let automaton = self.automaton(by, budget)?;
+        let dfa = self.dfa(by, budget)?;
         let mut held = BTreeSet::new();
         for word in words.iter() {
             budget.charge(1 + word.len() as u64 / 32)?;
-            if automaton.accepts(word) {
+            if dfa.accepts(word) {
                 held.insert(word.clone());
             }
         }
@@ -348,7 +344,7 @@ impl Languages {
     ///
     /// # Errors
     ///
-    /// When the budget does not cover the automata.
+    /// When the budget does not cover the DFAs.
     // The engine compares languages by their intersections so far. Objects will ask this.
     #[cfg_attr(not(test), expect(dead_code))]
     pub fn includes(
@@ -377,7 +373,7 @@ impl Languages {
             Language::Words { words, others } => {
                 Ok(length_of_a_word(words, *others, lengths).is_none())
             }
-            _ => Ok(!self.automaton(id, budget)?.has_word(lengths, budget)?),
+            _ => Ok(!self.dfa(id, budget)?.has_word(lengths, budget)?),
         }
     }
 
@@ -394,7 +390,7 @@ impl Languages {
         budget: &mut Budget,
     ) -> Result<Option<String>, Exhausted> {
         let Language::Words { words, others } = &self.languages[id.0 as usize] else {
-            return self.automaton(id, budget)?.shortest(lengths, budget);
+            return self.dfa(id, budget)?.shortest(lengths, budget);
         };
         let Some(length) = length_of_a_word(words, *others, lengths) else {
             return Ok(None);
@@ -766,7 +762,7 @@ mod tests {
     }
 
     #[test]
-    fn the_automata_agree_with_the_regex_crate() {
+    fn the_dfas_agree_with_the_regex_crate() {
         let random = &mut Random(2);
         let strings = strings();
         let mut store = Store::new();
@@ -826,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn the_automata_agree_with_regexsolver() {
+    fn the_dfas_agree_with_regexsolver() {
         // That crate matches a pattern against the whole string, so each pattern is held
         // between the two ends here. To it `.` is any character, which `(?s)` says here.
         let random = &mut Random(3);

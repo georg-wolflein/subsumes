@@ -1,12 +1,16 @@
-//! From a pattern to an automaton.
+//! From a pattern to a DFA.
 //!
 //! A pattern is parsed by `regex-syntax`, the parser of the `regex` crate, so it means here
 //! what it means there. It matches a string when it matches anywhere in the string: the
 //! language of a pattern is every string that holds a match. `^` and `$` hold only at the two
 //! ends of the string.
 //!
-//! The way is the usual one. The pattern becomes a machine that may be in several states at
-//! once, and the automaton has a state for each set of them that a string can lead to.
+//! The way is the usual one. The pattern becomes an NFA, a nondeterministic finite automaton,
+//! which may be in several states at once. It is built in the manner of Thompson's
+//! construction: each part of the pattern adds a few states, and where the pattern chooses
+//! or repeats, a state goes on to others without reading a character, by ε-transitions. The
+//! DFA, a deterministic finite automaton, has a state for each set of states of the NFA that
+//! a string can lead to, which is the subset construction.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -14,7 +18,7 @@ use std::collections::hash_map::Entry;
 use regex_syntax::hir::{Class, Hir, HirKind, Look};
 
 use super::Unsupported;
-use super::automaton::{Automaton, Classes, LAST, Place, cost, place};
+use super::dfa::{Classes, Dfa, LAST, Place, cost, place};
 use crate::context::{Budget, Exhausted};
 
 /// Parses a pattern as the `regex` crate does.
@@ -43,18 +47,18 @@ pub(super) fn read(pattern: &str) -> Result<Hir, Unsupported> {
     Ok(read)
 }
 
-/// What a state of the machine does.
+/// A state of the NFA, by what it does.
 #[derive(Debug)]
-enum Step {
-    /// Goes on to each of these states without a character.
-    Free(Vec<u32>),
+enum State {
+    /// Goes on to each of these states without a character: its ε-transitions.
+    Epsilon(Vec<u32>),
     /// Reads a character of a set and goes on.
     Read { set: u32, then: u32 },
     /// Goes on where the string begins.
     Start(u32),
     /// Goes on where the string ends.
     End(u32),
-    /// The pattern has matched.
+    /// The pattern has matched: the accepting state.
     Match,
 }
 
@@ -62,18 +66,18 @@ enum Step {
 type Set = Vec<(Place, Place)>;
 
 #[derive(Debug, Default)]
-struct Machine {
-    steps: Vec<Step>,
-    /// The sets of characters that the steps read. A set is kept once.
+struct Nfa {
+    states: Vec<State>,
+    /// The sets of characters that the states read. A set is kept once.
     sets: Vec<Set>,
     ids: HashMap<Set, u32>,
 }
 
-impl Machine {
-    fn add(&mut self, step: Step, budget: &mut Budget) -> Result<u32, Exhausted> {
+impl Nfa {
+    fn add(&mut self, state: State, budget: &mut Budget) -> Result<u32, Exhausted> {
         budget.charge(1)?;
-        self.steps.push(step);
-        Ok(u32::try_from(self.steps.len() - 1).expect("fewer than 2^32 states"))
+        self.states.push(state);
+        Ok(u32::try_from(self.states.len() - 1).expect("fewer than 2^32 states"))
     }
 
     fn set(&mut self, set: Set) -> u32 {
@@ -97,7 +101,7 @@ impl Machine {
                 for character in text.chars().rev() {
                     let at = place(character);
                     let set = self.set(vec![(at, at)]);
-                    then = self.add(Step::Read { set, then }, budget)?;
+                    then = self.add(State::Read { set, then }, budget)?;
                 }
                 Ok(then)
             }
@@ -117,10 +121,10 @@ impl Machine {
                     }
                 };
                 let set = self.set(set);
-                self.add(Step::Read { set, then }, budget)
+                self.add(State::Read { set, then }, budget)
             }
-            HirKind::Look(Look::Start) => self.add(Step::Start(then), budget),
-            HirKind::Look(Look::End) => self.add(Step::End(then), budget),
+            HirKind::Look(Look::Start) => self.add(State::Start(then), budget),
+            HirKind::Look(Look::End) => self.add(State::End(then), budget),
             HirKind::Look(other) => unreachable!("{other:?} was refused when the pattern was read"),
             HirKind::Capture(capture) => self.build(&capture.sub, then, budget),
             HirKind::Concat(parts) => {
@@ -135,15 +139,15 @@ impl Machine {
                 for part in parts {
                     firsts.push(self.build(part, then, budget)?);
                 }
-                self.add(Step::Free(firsts), budget)
+                self.add(State::Epsilon(firsts), budget)
             }
             HirKind::Repetition(repetition) => {
                 let mut first = match repetition.max {
                     // Any number of times: a state that goes round once more or goes on.
                     None => {
-                        let again = self.add(Step::Free(Vec::new()), budget)?;
+                        let again = self.add(State::Epsilon(Vec::new()), budget)?;
                         let round = self.build(&repetition.sub, again, budget)?;
-                        self.steps[again as usize] = Step::Free(vec![round, then]);
+                        self.states[again as usize] = State::Epsilon(vec![round, then]);
                         again
                     }
                     // Up to so many times more than it must: each time it may go on instead.
@@ -151,7 +155,7 @@ impl Machine {
                         let mut first = then;
                         for _ in repetition.min..max {
                             let once = self.build(&repetition.sub, first, budget)?;
-                            first = self.add(Step::Free(vec![once, then]), budget)?;
+                            first = self.add(State::Epsilon(vec![once, then]), budget)?;
                         }
                         first
                     }
@@ -209,8 +213,8 @@ impl Machine {
         (Classes::new(runs), held)
     }
 
-    /// The states that are reached from some states without a character: those that read
-    /// one, and whether the pattern has matched.
+    /// The states that are reached from some states without a character, which is their
+    /// ε-closure: those of them that read one, and whether the pattern has matched.
     ///
     /// `at_start` says that no character came before. A state that was reached by way of
     /// `$` holds only if no character follows, so it reads none.
@@ -236,16 +240,16 @@ impl Machine {
             if passed.is_multiple_of(8) {
                 budget.charge(1)?;
             }
-            match &self.steps[state as usize] {
-                Step::Free(then) => pending.extend(then.iter().map(|then| (*then, at_end))),
-                Step::Read { .. } if at_end => {}
-                Step::Read { .. } => reached.reading.push(state),
-                Step::Start(then) if at_start => pending.push((*then, at_end)),
-                Step::Start(_) => {}
-                Step::End(then) => pending.push((*then, true)),
-                Step::Match if at_end => reached.matched_at_end = true,
+            match &self.states[state as usize] {
+                State::Epsilon(then) => pending.extend(then.iter().map(|then| (*then, at_end))),
+                State::Read { .. } if at_end => {}
+                State::Read { .. } => reached.reading.push(state),
+                State::Start(then) if at_start => pending.push((*then, at_end)),
+                State::Start(_) => {}
+                State::End(then) => pending.push((*then, true)),
+                State::Match if at_end => reached.matched_at_end = true,
                 // Whatever follows a match, the string holds one.
-                Step::Match => return Ok(Reached::MATCHED),
+                State::Match => return Ok(Reached::MATCHED),
             }
         }
         budget.charge(1)?;
@@ -260,7 +264,7 @@ struct Marks {
     round: u32,
 }
 
-/// The states of the automaton that were found so far, each numbered once.
+/// The states of the DFA that were found so far, each numbered once.
 #[derive(Default)]
 struct Found {
     states: Vec<Reached>,
@@ -288,7 +292,7 @@ impl Found {
     }
 }
 
-/// A state of the automaton: the states that the machine may be in after some string.
+/// A state of the DFA: the states that the NFA may be in after some string.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
 struct Reached {
     /// The states that read a character next.
@@ -307,24 +311,24 @@ impl Reached {
     };
 }
 
-/// The automaton of every string that holds a match of the pattern.
+/// The DFA of every string that holds a match of the pattern.
 ///
 /// # Errors
 ///
-/// When the budget does not cover the states of the machine and of the automaton.
-pub(super) fn automaton(pattern: &Hir, budget: &mut Budget) -> Result<Automaton, Exhausted> {
-    let mut machine = Machine::default();
-    let matched = machine.add(Step::Match, budget)?;
-    let first = machine.build(pattern, matched, budget)?;
-    let (classes, held) = machine.classes();
-    let (next, accepts) = determinized(&machine, first, &classes, &held, budget)?;
-    Ok(Automaton::canonical(&classes, &next, &accepts))
+/// When the budget does not cover the states of the NFA and of the DFA.
+pub(super) fn dfa(pattern: &Hir, budget: &mut Budget) -> Result<Dfa, Exhausted> {
+    let mut nfa = Nfa::default();
+    let matched = nfa.add(State::Match, budget)?;
+    let first = nfa.build(pattern, matched, budget)?;
+    let (classes, held) = nfa.classes();
+    let (next, accepts) = determinized(&nfa, first, &classes, &held, budget)?;
+    Ok(Dfa::canonical(&classes, &next, &accepts))
 }
 
-/// The states of the automaton of a machine: where each class leads from each, and which
-/// accept.
+/// The states of the DFA of an NFA, by the subset construction: where each class leads from
+/// each, and which accept.
 fn determinized(
-    machine: &Machine,
+    nfa: &Nfa,
     first: u32,
     classes: &Classes,
     held: &[Vec<u32>],
@@ -332,12 +336,12 @@ fn determinized(
 ) -> Result<(Vec<u32>, Vec<bool>), Exhausted> {
     let width = classes.count();
     let mut marks = Marks {
-        seen: vec![0; machine.steps.len() * 2],
+        seen: vec![0; nfa.states.len() * 2],
         round: 0,
     };
 
     let mut found = Found::default();
-    let reached = machine.reach(&[first], true, &mut marks, budget)?;
+    let reached = nfa.reach(&[first], true, &mut marks, budget)?;
     found.number(reached, width, budget)?;
     let (mut next, mut accepts) = (Vec::new(), Vec::new());
     let mut at = 0;
@@ -354,7 +358,7 @@ fn determinized(
             continue;
         }
         for from in &reached.reading {
-            let Step::Read { set, then } = &machine.steps[*from as usize] else {
+            let State::Read { set, then } = &nfa.states[*from as usize] else {
                 unreachable!("only a state that reads is kept");
             };
             for class in &held[*set as usize] {
@@ -364,7 +368,7 @@ fn determinized(
         led.clear();
         for then in &mut read {
             let mut reach = |then: &[u32]| {
-                let reached = machine.reach(then, false, &mut marks, budget)?;
+                let reached = nfa.reach(then, false, &mut marks, budget)?;
                 found.number(reached, width, budget)
             };
             // A match may begin at every character, so the first state is always among them.
@@ -396,18 +400,18 @@ fn determinized(
 mod tests {
     use super::*;
 
-    fn of(pattern: &str) -> Automaton {
+    fn of(pattern: &str) -> Dfa {
         let read = read(pattern).unwrap_or_else(|_| panic!("{pattern:?} is not supported"));
-        automaton(&read, &mut Budget::new(u64::MAX)).unwrap()
+        dfa(&read, &mut Budget::new(u64::MAX)).unwrap()
     }
 
-    /// Holds the automaton of each pattern against the `regex` crate on each string.
+    /// Holds the DFA of each pattern against the `regex` crate on each string.
     fn agree(patterns: &[&str], strings: &[&str]) {
         for pattern in patterns {
-            let (automaton, expected) = (of(pattern), regex::Regex::new(pattern).unwrap());
+            let (dfa, expected) = (of(pattern), regex::Regex::new(pattern).unwrap());
             for string in strings {
                 assert_eq!(
-                    automaton.accepts(string),
+                    dfa.accepts(string),
                     expected.is_match(string),
                     "{pattern:?} on {string:?}"
                 );
@@ -546,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    fn patterns_of_one_language_have_one_automaton() {
+    fn patterns_of_one_language_have_one_dfa() {
         let same = [
             ("^a$", "^(?:a)$"),
             ("(?s)a", "(?s)^.*a.*$"),
@@ -574,7 +578,7 @@ mod tests {
     fn the_states_cost_steps() {
         let spent = |pattern: &str| {
             let mut budget = Budget::new(u64::MAX);
-            automaton(&read(pattern).unwrap(), &mut budget).unwrap();
+            dfa(&read(pattern).unwrap(), &mut budget).unwrap();
             budget.spent()
         };
         assert!(spent("^a{100}$") > 200);
@@ -582,6 +586,6 @@ mod tests {
         // Each repetition in a repetition multiplies the states, and the budget ends that.
         let nested = read("^((a{100}){100}){100}$").unwrap();
         let mut budget = Budget::new(100_000);
-        assert_eq!(automaton(&nested, &mut budget), Err(Exhausted));
+        assert_eq!(dfa(&nested, &mut budget), Err(Exhausted));
     }
 }

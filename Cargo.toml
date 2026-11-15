@@ -15,7 +15,7 @@ regex-syntax = "0.8"
 serde_json = "1"
 
 [dev-dependencies]
-# The automata are held against it: which strings a pattern matches.
+# The DFAs are held against it: which strings a pattern matches.
 regex = "1"
 # And against this one: intersection, complement and inclusion.
 regexsolver = { version = "1", default-features = false }

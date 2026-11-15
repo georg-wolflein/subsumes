@@ -1,10 +1,9 @@
-//! Automata that read a string character by character.
+//! DFAs: deterministic finite automata, which read a string character by character.
 //!
-//! An automaton is deterministic and complete: every state says where each character leads.
-//! It is kept in one shape only, the least there is for its language, with its states and its
-//! classes of characters numbered in one fixed way. So two automata are equal exactly when
-//! their languages are, and the complement of one is the same automaton with the other states
-//! accepting.
+//! A DFA here is complete: every state says where each character leads. It is kept in one
+//! shape only, the minimal DFA of its language, with its states and its classes of characters
+//! numbered in one fixed way. So two DFAs are equal exactly when their languages are, and the
+//! complement of one is the same DFA with the other states accepting.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
@@ -51,12 +50,12 @@ pub(super) fn plainness(character: char) -> u32 {
 
 /// The steps that a new state costs: one, and more where it has much to write down. A state
 /// is written down as where each class of characters leads, and that is worked out from its
-/// members where it stands for several states of a machine.
+/// members where it stands for several states of an NFA.
 pub(super) fn cost(members: usize, classes: usize) -> u64 {
     1 + ((members + classes) / 4) as u64
 }
 
-/// The characters in classes: those of one class are alike to an automaton, which says where
+/// The characters in classes: those of one class are alike to a DFA, which says where
 /// each class leads and not where each character does.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct Classes {
@@ -123,9 +122,9 @@ impl Classes {
     }
 }
 
-/// A deterministic automaton in its one shape; see the top of this file.
+/// A DFA in its one shape; see the top of this file.
 #[derive(Debug, PartialEq, Eq, Hash)]
-pub(super) struct Automaton {
+pub(super) struct Dfa {
     classes: Classes,
     /// Where each class leads from each state: the classes of state 0, then those of state
     /// 1, and so on. A word is read from state 0.
@@ -137,9 +136,9 @@ pub(super) struct Automaton {
     shown: Vec<char>,
 }
 
-impl Automaton {
-    /// The automaton in its one shape, for one that is given in any: `next` and `accepts` as
-    /// in the automaton itself, with every state reached from state 0.
+impl Dfa {
+    /// The DFA in its one shape, for one that is given in any: `next` and `accepts` as
+    /// in the DFA itself, with every state reached from state 0.
     pub fn canonical(classes: &Classes, next: &[u32], accepts: &[bool]) -> Self {
         let width = classes.count();
         let blocks = blocks(width, next, accepts);
@@ -215,7 +214,7 @@ impl Automaton {
         }
     }
 
-    /// The automaton of a few words: it accepts these and no other.
+    /// The DFA of a few words: it accepts these and no other.
     ///
     /// # Errors
     ///
@@ -273,7 +272,7 @@ impl Automaton {
         Ok(Self::canonical(&classes, &next, &accepts))
     }
 
-    /// The automaton of every string that this one does not accept.
+    /// The DFA of every string that this one does not accept.
     pub fn complement(&self) -> Self {
         let accepts: Vec<bool> = self.accepts.iter().map(|accepts| !accepts).collect();
         // It has the same states, which the same words tell apart, so it is in its one
@@ -287,7 +286,7 @@ impl Automaton {
         }
     }
 
-    /// The automaton of the strings that both accept.
+    /// The DFA of the strings that both accept, by the product construction.
     ///
     /// # Errors
     ///
@@ -683,8 +682,8 @@ mod tests {
         Budget::new(u64::MAX)
     }
 
-    fn of(words: &[&str]) -> Automaton {
-        Automaton::of_words(words.iter().copied(), &mut unlimited()).unwrap()
+    fn of(words: &[&str]) -> Dfa {
+        Dfa::of_words(words.iter().copied(), &mut unlimited()).unwrap()
     }
 
     const ANY: Lengths = Lengths { min: 0, max: None };
@@ -707,14 +706,14 @@ mod tests {
     }
 
     #[test]
-    fn an_automaton_of_words_accepts_them_and_no_other() {
+    fn a_dfa_of_words_accepts_them_and_no_other() {
         let words = ["", "a", "ab", "b\u{10ffff}", "\0"];
-        let automaton = of(&words);
+        let dfa = of(&words);
         for word in words {
-            assert!(automaton.accepts(word), "{word:?}");
+            assert!(dfa.accepts(word), "{word:?}");
         }
         for other in ["b", "aa", "abc", "\u{10ffff}", "\u{1}", "é"] {
-            assert!(!automaton.accepts(other), "{other:?}");
+            assert!(!dfa.accepts(other), "{other:?}");
         }
         assert!(of(&[]).is_empty());
         assert!(!of(&[""]).is_empty());
@@ -722,7 +721,7 @@ mod tests {
     }
 
     #[test]
-    fn two_automata_of_one_language_are_equal() {
+    fn two_dfas_of_one_language_are_equal() {
         assert_eq!(of(&["a", "b"]), of(&["b", "a", "a"]));
         assert_ne!(of(&["a", "b"]), of(&["a"]));
         let both = of(&["a", "b", "c"])
@@ -735,26 +734,20 @@ mod tests {
     }
 
     #[test]
-    fn the_complement_accepts_what_the_automaton_does_not() {
-        let automaton = of(&["a", "ab"]);
-        let complement = automaton.complement();
+    fn the_complement_accepts_what_the_dfa_does_not() {
+        let dfa = of(&["a", "ab"]);
+        let complement = dfa.complement();
         for word in ["", "a", "ab", "abc", "b", "é"] {
-            assert_ne!(
-                automaton.accepts(word),
-                complement.accepts(word),
-                "{word:?}"
-            );
+            assert_ne!(dfa.accepts(word), complement.accepts(word), "{word:?}");
         }
-        let nothing = automaton
-            .intersection(&complement, &mut unlimited())
-            .unwrap();
+        let nothing = dfa.intersection(&complement, &mut unlimited()).unwrap();
         assert!(nothing.is_empty());
     }
 
     #[test]
     fn the_shortest_word_is_within_the_lengths() {
-        let automaton = of(&["abc", "ab", "abcde"]);
-        let shortest = |lengths| automaton.shortest(lengths, &mut unlimited()).unwrap();
+        let dfa = of(&["abc", "ab", "abcde"]);
+        let shortest = |lengths| dfa.shortest(lengths, &mut unlimited()).unwrap();
         assert_eq!(shortest(ANY), Some("ab".to_owned()));
         assert_eq!(shortest(between(3, 9)), Some("abc".to_owned()));
         assert_eq!(shortest(between(4, 9)), Some("abcde".to_owned()));
@@ -801,10 +794,10 @@ mod tests {
     fn the_states_cost_steps() {
         // Three states after the first, each with four classes of characters to lead on.
         let mut budget = Budget::new(6);
-        assert!(Automaton::of_words(["abc"], &mut budget).is_ok());
+        assert!(Dfa::of_words(["abc"], &mut budget).is_ok());
         assert_eq!(budget.spent(), 6);
         let mut budget = Budget::new(5);
-        assert!(Automaton::of_words(["abc"], &mut budget).is_err());
+        assert!(Dfa::of_words(["abc"], &mut budget).is_err());
         let (a, b) = (of(&["ab", "cd"]), of(&["ab", "ef"]));
         let mut budget = Budget::new(1);
         assert!(a.intersection(&b, &mut budget).is_err());

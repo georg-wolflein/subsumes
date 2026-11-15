@@ -985,8 +985,8 @@ mod tests {
     }
 
     #[test]
-    fn a_pattern_that_is_asked_for_and_against_costs_no_automaton() {
-        // The pattern takes thousands of steps to become an automaton.
+    fn a_pattern_that_is_asked_for_and_against_costs_no_dfa() {
+        // The pattern takes thousands of steps to become a DFA.
         let pattern = "^(?:[a-f]{50}[0-9]{50}){20}$";
         let (a, b) = (
             json!({"pattern": pattern}),
@@ -996,7 +996,7 @@ mod tests {
         let check = checker.check(&a, &b).unwrap();
         assert_eq!(check.verdict, Verdict::Yes);
         assert!(check.steps < 20, "{}", check.steps);
-        // The other way the automaton has to say that the pattern does not match the
+        // The other way the DFA has to say that the pattern does not match the
         // empty string.
         let unknown = Verdict::Unknown {
             reason: Reason::Budget,
@@ -1007,7 +1007,7 @@ mod tests {
         assert!(check.steps > 4_000, "{}", check.steps);
         // With a type next to the pattern, the negation of A is a split. The branch asks
         // whether a string is left before it splits, and by then the pattern is an
-        // automaton, although the split then cancels it.
+        // DFA, although the split then cancels it.
         let typed = |schema: &Value| {
             let mut schema = schema.clone();
             schema["type"] = json!("string");

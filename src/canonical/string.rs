@@ -9,7 +9,7 @@
 //!
 //! The languages are put together when the branch asks whether a string is left, and not
 //! when a term comes in. A language that is asked for and asked against leaves no string,
-//! and that is seen without an automaton.
+//! and that is seen without a DFA.
 
 use std::collections::BTreeSet;
 
@@ -101,13 +101,13 @@ impl Strings {
         budget: &mut Budget,
     ) -> Result<LanguageId, Exhausted> {
         // What came in since the last time is put together first, and of that the single
-        // strings first. They make one set of words, however many they are, so an automaton
+        // strings first. They make one set of words, however many they are, so a DFA
         // takes them in at once and not one by one.
         let mut fresh = Languages::EVERYTHING;
         for one_string in [true, false] {
             let of_a_kind = self.fresh.iter().filter(|asked| asked.2 == one_string);
             for (language, negated, _) in of_a_kind {
-                // Once no string is left, the rest is not worth an automaton.
+                // Once no string is left, the rest is not worth a DFA.
                 if fresh == Languages::NOTHING {
                     return Ok(fresh);
                 }
@@ -126,7 +126,7 @@ impl Strings {
     ///
     /// # Errors
     ///
-    /// When the budget does not cover the automata.
+    /// When the budget does not cover the DFAs.
     pub fn is_empty(
         &mut self,
         languages: &mut Languages,
@@ -145,7 +145,7 @@ impl Strings {
     ///
     /// # Errors
     ///
-    /// When the budget does not cover the automata or the characters of the string.
+    /// When the budget does not cover the DFAs or the characters of the string.
     pub fn shortest(
         &self,
         languages: &mut Languages,
@@ -250,14 +250,14 @@ mod tests {
     }
 
     #[test]
-    fn what_is_asked_for_and_against_leaves_nothing_without_an_automaton() {
+    fn what_is_asked_for_and_against_leaves_nothing_without_a_dfa() {
         assert_eq!(
             shortest(&["in ^(a|b)*c{3,9}$", "not in ^(a|b)*c{3,9}$"]),
             (None, 0)
         );
         assert_eq!(shortest(&["not in a", ">= 2", "in a"]), (None, 0));
         assert_eq!(shortest(&["= a", "!= a"]), (None, 0));
-        // Two patterns of one language are told to be one by their automata.
+        // Two patterns of one language are told to be one by their DFAs.
         let (found, spent) = shortest(&["in ^a+$", "not in ^aa*$"]);
         assert_eq!(found, None);
         assert!(spent > 0);
