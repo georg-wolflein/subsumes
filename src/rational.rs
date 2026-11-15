@@ -5,21 +5,36 @@
 //! multiple of `0.0001`, which the two floats themselves are not. Every such decimal is a
 //! ratio of two integers, and the integers are of any size: nothing is rounded and nothing
 //! overflows.
+//!
+//! A float from 2^53 on is read as the whole number that it holds. It holds one, with more
+//! digits than it is printed with: `9.223372036854776e18` is 2^63, which ends in 808. And
+//! between two such floats lie whole numbers that a JSON value holds as integers, so the
+//! decimal that the float is printed as would put it on the wrong side of some of them.
 
 use num_bigint::BigInt;
 use num_integer::Integer;
 use num_rational::BigRational;
-use num_traits::{One, ToPrimitive};
+use num_traits::{FromPrimitive, One, ToPrimitive};
 use serde_json::Number;
 
 /// A number, as the ratio of two integers.
 pub(crate) type Rational = BigRational;
 
+/// The first float that is not next to the whole numbers on both its sides: 2^53. From here
+/// on every float is a whole number.
+const WHOLE_FROM: f64 = 9_007_199_254_740_992.0;
+
 /// The number that a JSON number stands for.
 ///
 /// A `Number` holds a `u64`, an `i64` or a finite float, and prints each as a decimal with
-/// an exponent at most.
+/// an exponent at most. A float from 2^53 on is the whole number that it holds, and every
+/// other number is the decimal that it is printed as.
 pub(crate) fn exact(number: &Number) -> Rational {
+    let float = number.as_f64().filter(|_| number.is_f64());
+    let large = float.filter(|float| float.is_finite() && float.abs() >= WHOLE_FROM);
+    if let Some(whole) = large.and_then(BigInt::from_f64) {
+        return Rational::from_integer(whole);
+    }
     let text = number.to_string();
     let (digits, exponent) = match text.split_once(['e', 'E']) {
         Some((digits, exponent)) => (digits, exponent.parse().expect("an exponent is whole")),
@@ -54,11 +69,10 @@ fn names_positive(text: &str) -> bool {
 }
 
 /// The JSON number that stands for exactly this number, if there is one: an integer that an
-/// `i64` or a `u64` holds, or else a float that is printed as this number.
+/// `i64` or a `u64` holds, or else a float that is read as this number.
 ///
-/// There is none for a number with more digits than a float keeps, such as a whole number of
-/// thirty digits that does not end in zeros, or one that lies between two floats next to
-/// each other.
+/// There is none for a number that lies between two floats next to each other, as most
+/// whole numbers of thirty digits do.
 pub(crate) fn written(number: &Rational) -> Option<Number> {
     if number.is_integer() {
         let whole = number.numer();
@@ -165,6 +179,34 @@ mod tests {
     }
 
     #[test]
+    fn a_float_from_two_to_the_53_on_is_the_whole_number_that_it_holds() {
+        let held = |value: serde_json::Value| of(&value).to_string();
+        // 2^63, which is printed as a number that ends in zeros.
+        assert_eq!(held(json!(9.223_372_036_854_776e18)), "9223372036854775808");
+        assert_eq!(of(&json!(-9.223_372_036_854_776e18)), of(&json!(i64::MIN)));
+        // The float nearest to 10^23 is a little less.
+        assert_eq!(held(json!(1e23)), "99999999999999991611392");
+        // 2^53 itself, and the float before it, which is the decimal that it is printed as
+        // like every float below.
+        assert_eq!(held(json!(9_007_199_254_740_992.0)), "9007199254740992");
+        assert_eq!(held(json!(9_007_199_254_740_991.0)), "9007199254740991");
+        assert_eq!(
+            of(&json!(4_503_599_627_370_495.5)),
+            ratio(9_007_199_254_740_991, 2)
+        );
+        // So a whole number that lies between the float and what it is printed as is on the
+        // side of the float that it is on. 2^60 + 256 is printed as one that ends in 200.
+        let float = of(&json!(1.152_921_504_606_847_2e18));
+        assert!(of(&json!(1_152_921_504_606_847_210_u64)) < float);
+        assert_eq!(float, of(&json!(1_152_921_504_606_847_232_u64)));
+        // An integer that is too large for an integer of a JSON value is read as a float.
+        assert_eq!(
+            number("18446744073709551617"),
+            number("18446744073709551616")
+        );
+    }
+
+    #[test]
     fn a_number_is_more_than_zero_by_its_text() {
         for value in [
             json!(1),
@@ -209,14 +251,15 @@ mod tests {
 
         // A third has no decimal that ends.
         assert_eq!(text(&ratio(1, 3)), None);
-        // One more than the largest `u64`: the float nearest to it is printed with zeros
-        // where it has other digits.
+        // One more than the largest `u64` is 2^64, which a float holds. The float is
+        // printed with zeros where the number has other digits.
         let beyond = of(&json!(u64::MAX)) + ratio(1, 1);
-        assert_eq!(text(&beyond), None);
-        assert_eq!(
-            text(&number("18446744073709552000")),
-            some("1.8446744073709552e+19")
-        );
+        assert_eq!(text(&beyond), some("1.8446744073709552e+19"));
+        // One more again lies between two floats, and so does the number that the float is
+        // printed as.
+        assert_eq!(text(&(&beyond + ratio(1, 1))), None);
+        let printed: BigInt = "18446744073709552000".parse().unwrap();
+        assert_eq!(text(&Rational::from_integer(printed)), None);
         // Between a tenth and the next float, and above the largest float.
         assert_eq!(text(&(ratio(1, 10) + number("1e-17"))), None);
         assert_eq!(

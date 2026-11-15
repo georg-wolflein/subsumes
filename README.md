@@ -67,6 +67,8 @@ Numbers are compared exactly, not as floats. A number in a schema stands for the
 
 A schema is a `serde_json` value, which keeps a number as a 64-bit integer or as a float. A number that was written with more digits than a float keeps, about 15, may have been rounded before the library sees it.
 
+A float from 2^53 on, which is about 9e15, stands for the whole number that the float holds, as it does to a validator. That number has more digits than the float is printed with: `9.223372036854776e18` is 9223372036854775808.
+
 A `Yes` holds for every number, however many digits it has. The counterexample of a `No` is a number that a `serde_json` value holds exactly. Where the library finds only numbers with more digits to tell two schemas apart, such as those between two floats that are next to each other, the verdict is `Unknown`.
 
 ## References

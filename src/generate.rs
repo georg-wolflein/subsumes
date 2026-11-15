@@ -1,5 +1,6 @@
 //! Counterexamples: an instance for a branch that the engine could not refute.
 
+use num_bigint::BigInt;
 use num_traits::One;
 use serde_json::{Number, Value, json};
 
@@ -66,23 +67,34 @@ fn number(numbers: &Numbers, budget: &mut Budget) -> Result<Option<Number>, Exha
     };
     match written(&whole) {
         Some(written) => Ok(Some(written)),
-        None => rounder(numbers, budget),
+        None => rounder(numbers, &whole, budget),
     }
 }
 
-/// A whole number of the set that ends in zeros: the multiple of ten nearest zero, or else
-/// that of a hundred, and so on, until one is found that a JSON number stands for.
+/// A whole number of the set that a float holds: the multiple of a power of two that is
+/// nearest zero, for the least power that gives one which a JSON number stands for.
 ///
-/// This is for a set whose whole number nearest zero has more digits than a float keeps,
-/// as the one after 2^64 has. A float is printed with seventeen digits at most, so of the
-/// numbers this large only one with zeros at its end can be written.
-fn rounder(numbers: &Numbers, budget: &mut Budget) -> Result<Option<Number>, Exhausted> {
-    let ten = Rational::from_integer(10.into());
-    let mut step = Rational::one();
-    // No float is as large as the power of ten after these.
-    for _ in 0..f64::MAX_10_EXP {
-        step *= &ten;
-        // The multiples of a power of ten are among those of the power before, so where
+/// This is for a set whose whole number nearest zero is none that an integer or a float
+/// holds, as the one after 2^64 is. A float this large holds 53 digits in base two and zeros
+/// after them, so the search begins with as many zeros as such a number has.
+fn rounder(
+    numbers: &Numbers,
+    whole: &Rational,
+    budget: &mut Budget,
+) -> Result<Option<Number>, Exhausted> {
+    let spare = whole
+        .numer()
+        .bits()
+        .saturating_sub(u64::from(f64::MANTISSA_DIGITS));
+    let Ok(spare) = u32::try_from(spare) else {
+        return Ok(None);
+    };
+    let two = Rational::from_integer(2.into());
+    let mut step = Rational::from_integer(BigInt::from(2).pow(spare));
+    // No float is as large as the power of two after these.
+    for _ in spare..=f64::MAX_EXP.unsigned_abs() {
+        budget.charge(1)?;
+        // The multiples of a power of two are among those of the power before, so where
         // one has none in the set, neither has the next.
         let Some(found) = numbers.nearest_zero(&step, budget)? else {
             break;
@@ -90,6 +102,7 @@ fn rounder(numbers: &Numbers, budget: &mut Budget) -> Result<Option<Number>, Exh
         if let Some(written) = written(&found) {
             return Ok(Some(written));
         }
+        step *= &two;
     }
     Ok(None)
 }
@@ -205,30 +218,36 @@ mod tests {
     fn a_number_that_no_json_number_stands_for_is_not_given() {
         // Between two floats that are next to each other.
         assert_eq!(given(&["> 0.1", "< 0.10000000000000002"]), None);
-        // Above the largest float, and the few whole numbers after one of thirty digits.
+        // Above the largest float, and between two floats of thirty-one digits that are
+        // next to each other.
         assert_eq!(given(&["> 1.7976931348623157e308"]), None);
-        assert_eq!(given(&["> 1e30", "< 1.0000000000000001e30"]), None);
+        assert_eq!(given(&["> 1e30", "< 1.0000000000000002e30"]), None);
     }
 
     #[test]
-    fn a_whole_number_with_too_many_digits_gives_way_to_a_rounder_one() {
-        // The whole number after 2^64 - 1 has twenty digits, and a float keeps seventeen.
-        // The first multiple of a thousand after it is a float as it is printed.
+    fn a_whole_number_that_no_float_holds_gives_way_to_one_that_a_float_holds() {
+        // The whole number after 2^64 - 1 is 2^64, which a float holds.
         assert_eq!(
             given(&["> 18446744073709551615"]),
             some("1.8446744073709552e+19")
         );
-        // After a number of thirty-one digits, the first that is written has sixteen.
-        assert_eq!(given(&["> 1e30"]), some("1.000000000000001e+30"));
-        assert_eq!(given(&["< -1e30"]), some("-1.000000000000001e+30"));
-        // What else is asked holds for the rounder number too.
-        assert_eq!(given(&["> 1e30", "mof 3"]), some("1.0000000000000002e+30"));
+        // The one after that is between two floats, and the next float is 4096 further.
         assert_eq!(
-            given(&[">= 1e30", "not mof 1e30", "not mof 7"]),
-            some("1.000000000000002e+30")
+            given(&["> 18446744073709551616"]),
+            some("1.8446744073709556e+19")
         );
-        // Every float of this size is printed as a multiple of 1e14.
-        assert_eq!(given(&["> 1e30", "not mof 1e14"]), None);
+        // After a float of thirty-one digits, the first number that is written is the next
+        // float, which is 2^47 further.
+        assert_eq!(given(&["> 1e30"]), some("1.0000000000000002e+30"));
+        assert_eq!(given(&["< -1e30"]), some("-1.0000000000000002e+30"));
+        // What else is asked holds for that number too.
+        assert_eq!(given(&["> 1e30", "mof 7"]), some("1.0000000000000006e+30"));
+        assert_eq!(
+            given(&[">= 1e30", "not mof 1e30", "not mof 3"]),
+            some("1.0000000000000003e+30")
+        );
+        // Every float of this size is a multiple of 2^47.
+        assert_eq!(given(&["> 1e30", "not mof 140737488355328"]), None);
         assert_eq!(given(&["mof 0.01", "> 1e16", "< 10000000000000001"]), None);
     }
 
