@@ -7,8 +7,12 @@
 //!
 //! The validator reads the schemas as the library does: as draft 2020-12, with `format`
 //! asserted, and with every pattern in the dialect of the `regex` crate, which the
-//! [`patterns`] module sees to. One thing it still reads in its own way, which matters once a
-//! counterexample is a string that a format is about: it has its own idea of each format.
+//! [`patterns`] module sees to.
+//!
+//! What a format accepts, the validator works out with code of its own, and the library with
+//! a pattern for each format that it models. So a counterexample that is a string holds the
+//! two against each other. No string is known on which they differ. Whether a time with the
+//! second 60 is one, the library leaves open and gives no such string.
 
 use jsonschema::{Draft, PatternOptions, Validator};
 use serde::{Deserialize, Serialize};
@@ -145,6 +149,58 @@ mod tests {
             confirmation(&anything, &date, &json!(0)),
             Confirmation::Confirmed
         );
+    }
+
+    #[test]
+    fn the_validator_reads_a_format_as_the_library_does() {
+        let formats = [
+            "date",
+            "time",
+            "date-time",
+            "duration",
+            "uuid",
+            "ipv4",
+            "ipv6",
+            "uri",
+            "uri-reference",
+            "json-pointer",
+            "relative-json-pointer",
+        ];
+        let nothing = json!(false);
+        let mut of_the_format = 0;
+        for format in formats {
+            for least in [0, 1, 2, 5, 9, 10, 11, 20, 21, 36, 37, 45, 60] {
+                // The shortest string of the format that is this long, if the format has one:
+                // the validator must take it for one too.
+                let narrow = json!({"type": "string", "format": format, "minLength": least});
+                let verdict = subsumes::subsumes(&nothing, &narrow).unwrap();
+                if let subsumes::Verdict::No { counterexample } = verdict {
+                    assert_eq!(
+                        confirmation(&nothing, &narrow, &counterexample),
+                        Confirmation::Confirmed,
+                        "{counterexample} for {format}"
+                    );
+                    of_the_format += 1;
+                }
+                // And a string this long that is not of the format.
+                let (wide, narrow) = (
+                    json!({"format": format}),
+                    json!({"type": "string", "minLength": least}),
+                );
+                let subsumes::Verdict::No { counterexample } =
+                    subsumes::subsumes(&wide, &narrow).unwrap()
+                else {
+                    panic!("every string of {least} characters is of the format {format}");
+                };
+                assert_eq!(
+                    confirmation(&wide, &narrow, &counterexample),
+                    Confirmation::Confirmed,
+                    "{counterexample} against {format}"
+                );
+            }
+        }
+        // Most formats have a string of most of these lengths.
+        assert!(of_the_format > 80, "{of_the_format}");
     }
 
     #[test]

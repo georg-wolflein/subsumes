@@ -5,15 +5,17 @@
 
 use serde_json::{Value, json};
 
+use crate::context::Context;
+use crate::language::Languages;
 use crate::rational::shown;
 use crate::schema::Graph;
 use crate::term::{Term, TermId, Terms, VarId};
 
 /// The stages of a check: the schema graph, and the terms if the two schemas were lowered.
-pub(crate) fn stages(graph: &Graph, terms: &Terms, roots: Option<(VarId, VarId)>) -> Value {
+pub(crate) fn stages(graph: &Graph, context: &Context, roots: Option<(VarId, VarId)>) -> Value {
     let mut stages = vec![named("Schema graph", graph.to_json())];
     if let Some((a, b)) = roots {
-        stages.push(named("Terms", lowered(graph, terms, a, b)));
+        stages.push(named("Terms", lowered(graph, context, a, b)));
     }
     json!({ "stages": stages })
 }
@@ -25,7 +27,8 @@ fn named(name: &str, mut stage: Value) -> Value {
 
 /// The terms: one node for each variable, with a row for each part of its term, and an edge
 /// to each variable that the term refers to.
-fn lowered(graph: &Graph, terms: &Terms, a: VarId, b: VarId) -> Value {
+fn lowered(graph: &Graph, context: &Context, a: VarId, b: VarId) -> Value {
+    let (terms, languages) = (&context.terms, &context.languages);
     let (mut nodes, mut edges) = (Vec::new(), Vec::new());
     for (id, variable) in terms.variables() {
         let side = match variable.sides {
@@ -37,7 +40,8 @@ fn lowered(graph: &Graph, terms: &Terms, a: VarId, b: VarId) -> Value {
             Term::AllOf(parts) => parts.to_vec(),
             _ => vec![variable.body],
         };
-        let rows: Vec<Value> = parts.iter().map(|part| row(graph, terms, *part)).collect();
+        let row = |part: &TermId| row(graph, terms, languages, *part);
+        let rows: Vec<Value> = parts.iter().map(row).collect();
         nodes.push(json!({
             "id": id.index(),
             "name": format!("x{}", id.index()),
@@ -65,7 +69,7 @@ fn lowered(graph: &Graph, terms: &Terms, a: VarId, b: VarId) -> Value {
 }
 
 /// One part of the term of a variable: what kind of term it is, and the term.
-fn row(graph: &Graph, terms: &Terms, part: TermId) -> Value {
+fn row(graph: &Graph, terms: &Terms, languages: &Languages, part: TermId) -> Value {
     match terms.term(part) {
         Term::True => json!(["accepts", "everything"]),
         Term::False => json!(["accepts", "nothing"]),
@@ -76,8 +80,11 @@ fn row(graph: &Graph, terms: &Terms, part: TermId) -> Value {
         Term::BoolConst(value) => json!(["is", value.to_string()]),
         Term::NumConst(number) => json!(["is", shown(number)]),
         Term::Min(_) | Term::ExMin(_) | Term::Max(_) | Term::ExMax(_) | Term::Mof(_) => {
-            json!(["number", terms.show(part)])
+            json!(["number", terms.show_with(part, languages)])
         }
+        Term::StrConst(word) => json!(["is", format!("{word:?}")]),
+        Term::Patt(language) => json!(["string", languages.show(*language)]),
+        Term::MinLen(_) | Term::MaxLen(_) => json!(["string", terms.show_with(part, languages)]),
         Term::Unknown(leaf) => {
             let leaf = terms.leaf(*leaf);
             let about: Vec<&str> = leaf.domain.iter().map(|kind| kind.name()).collect();
@@ -89,11 +96,11 @@ fn row(graph: &Graph, terms: &Terms, part: TermId) -> Value {
                 format!("{key}, about {about}, first at {place} in {side}")
             ])
         }
-        Term::AllOf(_) => json!(["all of", terms.show(part)]),
-        Term::AnyOf(_) => json!(["any of", terms.show(part)]),
-        Term::OneOf(_) => json!(["one of", terms.show(part)]),
-        Term::Not(inner) => json!(["not", terms.show(*inner)]),
-        Term::Ref(_) => json!(["also", terms.show(part)]),
+        Term::AllOf(_) => json!(["all of", terms.show_with(part, languages)]),
+        Term::AnyOf(_) => json!(["any of", terms.show_with(part, languages)]),
+        Term::OneOf(_) => json!(["one of", terms.show_with(part, languages)]),
+        Term::Not(inner) => json!(["not", terms.show_with(*inner, languages)]),
+        Term::Ref(_) => json!(["also", terms.show_with(part, languages)]),
     }
 }
 
@@ -126,6 +133,7 @@ fn referred(terms: &Terms, term: TermId) -> Vec<(VarId, &'static str)> {
             Term::True | Term::False | Term::TypeIs(_) | Term::BoolConst(_) | Term::Unknown(_) => {}
             Term::NumConst(_) => {}
             Term::Min(_) | Term::ExMin(_) | Term::Max(_) | Term::ExMax(_) | Term::Mof(_) => {}
+            Term::StrConst(_) | Term::Patt(_) | Term::MinLen(_) | Term::MaxLen(_) => {}
         }
     }
     found
@@ -134,19 +142,18 @@ fn referred(terms: &Terms, term: TermId) -> Vec<(VarId, &'static str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::Context;
     use crate::{lower, schema};
 
     fn shown(a: &Value, b: &Value, budget: u64) -> Value {
         let graph = schema::parse(a, b).unwrap().link().unwrap();
         let mut context = Context::new(budget);
         let roots = lower::lower(&graph, &mut context).ok();
-        stages(&graph, &context.terms, roots)
+        stages(&graph, &context, roots)
     }
 
     #[test]
     fn there_is_a_picture_for_each_stage() {
-        let shared = json!({"type": "string", "minLength": 1});
+        let shared = json!({"type": "array", "minItems": 1});
         let a = json!({"anyOf": [shared, {"type": "null"}]});
         let b = json!({"allOf": [shared], "not": {"type": "null"}});
         let shown = shown(&a, &b, u64::MAX);
@@ -180,8 +187,8 @@ mod tests {
                     "side": "A and B",
                     "location": "#/anyOf/0",
                     "keywords": [
-                        ["type", "string"],
-                        ["unknown", "minLength 1, about string, first at #/anyOf/0/minLength in A"],
+                        ["type", "array"],
+                        ["unknown", "minItems 1, about array, first at #/anyOf/0/minItems in A"],
                     ],
                 },
                 {
@@ -217,6 +224,43 @@ mod tests {
                 ["number", "min(0)"],
                 ["number", "mof(0.5)"],
             ])
+        );
+    }
+
+    #[test]
+    fn what_a_term_says_about_strings_is_a_row_each() {
+        let schema = json!({
+            "enum": ["a", "é\n"],
+            "minLength": 1,
+            "maxLength": 2,
+            "pattern": "^a",
+            "format": "date",
+            "not": {"pattern": "b$"},
+        });
+        let shown = shown(&schema, &json!(true), u64::MAX);
+        let nodes = &shown["stages"][1]["nodes"];
+        assert_eq!(
+            nodes[0]["keywords"],
+            json!([
+                ["not", "x2"],
+                ["any of", r#"any(is("a"), is("é\n"))"#],
+                ["string", "minlen(1)"],
+                ["string", "maxlen(2)"],
+                ["string", r#""^a""#],
+                ["string", "format date"],
+            ])
+        );
+        assert_eq!(nodes[2]["keywords"], json!([["string", r#""b$""#]]));
+        // A format that is modelled in part: what it accepts, or what it leaves open
+        // together with a leaf. Inside a term a language is named as it is in a row.
+        let time = json!({"format": "time"});
+        let shown = self::shown(&time, &json!(true), u64::MAX);
+        assert_eq!(
+            shown["stages"][1]["nodes"][0]["keywords"],
+            json!([[
+                "any of",
+                r#"any(patt(format time), all(patt(format time, where it is open), ?[format "time" where it is open]))"#
+            ]])
         );
     }
 

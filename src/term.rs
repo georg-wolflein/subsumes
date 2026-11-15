@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
+use crate::language::{LanguageId, Languages};
 use crate::rational::{Rational, shown};
 use crate::schema::{Graph, NodeId};
 
@@ -130,6 +131,15 @@ pub(crate) enum Term {
     ExMax(Rational),
     /// The instance is no number, or a multiple of this, which is more than zero.
     Mof(Rational),
+    /// The instance is this string.
+    StrConst(Box<str>),
+    /// The instance is no string, or a string of this language.
+    Patt(LanguageId),
+    /// The instance is no string, or a string of at least so many characters, which is
+    /// more than none.
+    MinLen(u64),
+    /// The instance is no string, or a string of at most so many characters.
+    MaxLen(u64),
     /// The instance satisfies a predicate that the engine does not model.
     Unknown(LeafId),
     AllOf(Box<[TermId]>),
@@ -263,6 +273,31 @@ impl Terms {
         self.intern(Term::Mof(step))
     }
 
+    pub fn str_const(&mut self, word: &str) -> TermId {
+        self.intern(Term::StrConst(word.into()))
+    }
+
+    /// The term for "no string, or a string of this language".
+    pub fn patt(&mut self, language: LanguageId) -> TermId {
+        self.intern(match language {
+            Languages::EVERYTHING => Term::True,
+            _ => Term::Patt(language),
+        })
+    }
+
+    /// The term for "no string, or a string of at least so many characters".
+    pub fn min_len(&mut self, least: u64) -> TermId {
+        self.intern(match least {
+            0 => Term::True,
+            _ => Term::MinLen(least),
+        })
+    }
+
+    /// The term for "no string, or a string of at most so many characters".
+    pub fn max_len(&mut self, most: u64) -> TermId {
+        self.intern(Term::MaxLen(most))
+    }
+
     /// The term of a predicate that the engine does not model. `key` tells it from every
     /// other predicate over the same types; `node` and `keyword` say where it stands.
     pub fn unknown(
@@ -383,14 +418,23 @@ impl Terms {
         &mut self.variables[id.index()]
     }
 
-    /// A term as text, for tests and for the viewer.
+    /// A term as text, for tests. A language is named by its id, as in `patt(l2)`.
+    #[cfg(test)]
     pub fn show(&self, id: TermId) -> String {
         let mut text = String::new();
-        self.write(id, &mut text);
+        self.write(id, &mut text, &|language| format!("l{}", language.index()));
         text
     }
 
-    fn write(&self, id: TermId, text: &mut String) {
+    /// A term as text for the viewer, with each language as the store of the check shows
+    /// it: the pattern, or the name of the format.
+    pub fn show_with(&self, id: TermId, languages: &Languages) -> String {
+        let mut text = String::new();
+        self.write(id, &mut text, &|language| languages.show(language));
+        text
+    }
+
+    fn write(&self, id: TermId, text: &mut String, named: &dyn Fn(LanguageId) -> String) {
         // The work left: a term to write, or text that follows what was written.
         enum Step {
             Term(TermId),
@@ -431,6 +475,18 @@ impl Terms {
                 Term::Max(at) => write_number(text, "max", at),
                 Term::ExMax(at) => write_number(text, "exmax", at),
                 Term::Mof(step) => write_number(text, "mof", step),
+                Term::StrConst(word) => {
+                    write!(text, "is({word:?})").expect("a string takes any text");
+                }
+                Term::Patt(language) => {
+                    write!(text, "patt({})", named(*language)).expect("a string takes any text");
+                }
+                Term::MinLen(least) => {
+                    write!(text, "minlen({least})").expect("a string takes any text");
+                }
+                Term::MaxLen(most) => {
+                    write!(text, "maxlen({most})").expect("a string takes any text");
+                }
                 Term::Unknown(leaf) => {
                     write!(text, "?[{}]", self.leaf(*leaf).key).expect("a string takes any text");
                 }

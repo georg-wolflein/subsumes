@@ -4,11 +4,12 @@
 //! a variable, and the term of the variable says what its keywords say. Schemas that say the
 //! same share a variable, also between A and B.
 //!
-//! The engine models the types, `null`, the booleans, numbers, the connectives and
+//! The engine models the types, `null`, the booleans, numbers, strings, the connectives and
 //! references. Every other keyword becomes a predicate that it does not model, a leaf, which
 //! keeps the place where it stands. A leaf says something only about the instances its
-//! keyword is about: `minLength` about strings, and so a number satisfies it. The terms
-//! about numbers are the same in that: a string satisfies `minimum`.
+//! keyword is about: `minItems` about arrays, and so a number satisfies it. The terms about
+//! numbers and about strings are the same in that: a string satisfies `minimum`, and a
+//! number satisfies `minLength`.
 
 mod classes;
 
@@ -18,6 +19,7 @@ use serde_json::Value;
 
 use self::classes::written;
 use crate::context::{Context, Exhausted};
+use crate::formats;
 use crate::rational::{Rational, exact};
 use crate::schema::{Count, Graph, Keywords, NodeId, Schema, Type};
 use crate::term::{InstanceType, TermId, TypeSet, VarId};
@@ -265,14 +267,15 @@ impl Lowering<'_, '_> {
         }
     }
 
-    /// The term for "the instance is this value". `null`, the booleans and the numbers are
-    /// terms of the engine; any other value is of one type and a leaf over that type.
+    /// The term for "the instance is this value". `null`, the booleans, the numbers and the
+    /// strings are terms of the engine; an array or an object is of one type and a leaf over
+    /// that type.
     fn constant(&mut self, id: NodeId, keyword: &'static str, value: &Value) -> TermId {
         let kind = match value {
             Value::Null => return self.context.terms.type_is(NULL),
             Value::Bool(value) => return self.context.terms.bool_const(*value),
             Value::Number(number) => return self.context.terms.num_const(exact(number)),
-            Value::String(_) => STRING,
+            Value::String(word) => return self.context.terms.str_const(word),
             Value::Array(_) => ARRAY,
             Value::Object(_) => OBJECT,
         };
@@ -301,19 +304,52 @@ impl Lowering<'_, '_> {
     }
 
     fn strings(&mut self, id: NodeId, keywords: &Keywords, parts: &mut Vec<TermId>) {
-        self.count(STRING, id, "minLength", keywords.min_length, parts);
-        self.count(STRING, id, "maxLength", keywords.max_length, parts);
+        // A count that was too large to keep stays a leaf.
+        match keywords.min_length {
+            Some(Count::Of(least)) => parts.push(self.context.terms.min_len(least)),
+            beyond => self.count(STRING, id, "minLength", beyond, parts),
+        }
+        match keywords.max_length {
+            Some(Count::Of(most)) => parts.push(self.context.terms.max_len(most)),
+            beyond => self.count(STRING, id, "maxLength", beyond, parts),
+        }
         if let Some(pattern) = keywords.pattern {
-            parts.push(self.leaf(
-                STRING,
-                id,
-                "pattern",
-                format!("pattern {}", written!(pattern)),
-            ));
+            // A pattern that is not read as a language is a leaf.
+            parts.push(match self.context.languages.pattern(pattern) {
+                Ok(language) => self.context.terms.patt(language),
+                Err(_) => {
+                    let key = format!("pattern {}", written!(pattern));
+                    self.leaf(STRING, id, "pattern", key)
+                }
+            });
         }
         if let Some(format) = keywords.format {
-            parts.push(self.leaf(STRING, id, "format", format!("format {}", written!(format))));
+            parts.push(self.format(id, format));
         }
+    }
+
+    /// The term of a format. A format that is not modelled is a leaf. One that is modelled
+    /// in part is the strings that it accepts, or one of those that it leaves open if a
+    /// leaf holds, which stands for what the format makes of them.
+    fn format(&mut self, id: NodeId, format: &str) -> TermId {
+        let Some(modelled) = formats::modelled(format) else {
+            let key = format!("format {}", written!(format));
+            return self.leaf(STRING, id, "format", key);
+        };
+        let Context {
+            terms, languages, ..
+        } = &mut *self.context;
+        let accepted = terms.patt(languages.format(format, modelled.accepted));
+        let Some(open) = modelled.open else {
+            return accepted;
+        };
+        let name = format!("{format}, where it is open");
+        let open = terms.patt(languages.format(&name, open));
+        let key = format!("format {} where it is open", written!(format));
+        let holds = self.leaf(STRING, id, "format", key);
+        let terms = &mut self.context.terms;
+        let may_be = terms.all_of([open, holds]);
+        terms.any_of([accepted, may_be])
     }
 
     fn arrays(&mut self, id: NodeId, keywords: &Keywords, parts: &mut Vec<TermId>) {
@@ -497,12 +533,13 @@ mod tests {
     }
 
     #[test]
-    fn a_constant_is_a_term_if_it_is_null_a_boolean_or_a_number() {
+    fn a_constant_is_a_term_unless_it_is_an_array_or_an_object() {
         assert_eq!(term(&json!({"const": null})), "type(null)");
         assert_eq!(term(&json!({"const": true})), "is(true)");
+        assert_eq!(term(&json!({"const": "a"})), r#"is("a")"#);
         assert_eq!(
-            term(&json!({"enum": [null, false, 1, "a"]})),
-            r#"any(type(null), is(false), is(1), all(type(string), ?[const "a"]))"#
+            term(&json!({"enum": [null, false, 1, "a", {}]})),
+            r#"any(type(null), is(false), is(1), is("a"), all(type(object), ?[const {}]))"#
         );
         assert_eq!(term(&json!({"enum": []})), "false");
         assert_eq!(
@@ -579,12 +616,67 @@ mod tests {
         );
     }
 
+    /// What the terms of a schema that are about a language are about, as text.
+    fn languages(schema: &Value) -> Vec<String> {
+        let truth = json!(true);
+        let graph = parse(schema, &truth).unwrap().link().unwrap();
+        let mut context = Context::new(u64::MAX);
+        let (a, _) = lower(&graph, &mut context).unwrap();
+        let body = context.terms.variable(a).body;
+        let parts = match context.terms.term(body) {
+            crate::term::Term::AllOf(parts) => parts.to_vec(),
+            _ => vec![body],
+        };
+        let shown = parts
+            .iter()
+            .filter_map(|part| match context.terms.term(*part) {
+                crate::term::Term::Patt(language) => Some(context.languages.show(*language)),
+                _ => None,
+            });
+        shown.collect()
+    }
+
+    #[test]
+    fn a_keyword_about_strings_is_a_term() {
+        let schema = json!({"minLength": 2, "maxLength": 3, "pattern": "^a", "format": "date"});
+        assert_eq!(
+            term(&schema),
+            "all(minlen(2), maxlen(3), patt(l2), patt(l3))"
+        );
+        assert_eq!(languages(&schema), [r#""^a""#, "format date"]);
+        // At least no character is what every string has.
+        assert_eq!(term(&json!({"minLength": 0})), "true");
+        assert_eq!(term(&json!({"maxLength": 0})), "maxlen(0)");
+        // One pattern is one language wherever it stands, and so is one format.
+        let twice =
+            json!({"pattern": "a", "format": "uuid", "not": {"pattern": "a", "format": "uuid"}});
+        assert_eq!(
+            terms(&twice, &json!(true)),
+            [
+                "all(not x2, patt(l2), patt(l3))",
+                "true",
+                "all(patt(l2), patt(l3))"
+            ]
+        );
+        // What is not read as a language stays a leaf: a pattern that asks where a word
+        // ends, one that the `regex` crate does not take, and a format that is not modelled.
+        assert_eq!(
+            term(&json!({"pattern": r"a\b", "format": "hostname"})),
+            r#"all(?[pattern "a\\b"], ?[format "hostname"])"#
+        );
+        assert_eq!(
+            term(&json!({"pattern": "a(?=b)"})),
+            r#"?[pattern "a(?=b)"]"#
+        );
+        assert_eq!(
+            term(&json!({"format": "no format"})),
+            r#"?[format "no format"]"#
+        );
+    }
+
     #[test]
     fn every_other_keyword_is_a_leaf_with_what_it_holds() {
         let schema = json!({
-            "maxLength": 3,
-            "pattern": "^a",
-            "format": "date",
             "minItems": 4,
             "uniqueItems": true,
             "required": ["a"],
@@ -592,7 +684,7 @@ mod tests {
         });
         assert_eq!(
             term(&schema),
-            r#"all(?[maxLength 3], ?[pattern "^a"], ?[format "date"], ?[minItems 4], ?[uniqueItems], ?[required "a"], ?[minProperties 5])"#
+            r#"all(?[minItems 4], ?[uniqueItems], ?[required "a"], ?[minProperties 5])"#
         );
         assert_eq!(term(&json!({"uniqueItems": false})), "true");
         // `minContains` says nothing without `contains`.
@@ -601,8 +693,8 @@ mod tests {
 
     #[test]
     fn a_leaf_says_which_types_it_is_about_and_where_it_was_first() {
-        let a = json!({"type": "string", "minLength": 1});
-        let b = json!({"minLength": 1, "$dynamicRef": "#here", "$dynamicAnchor": "here"});
+        let a = json!({"type": "array", "minItems": 1});
+        let b = json!({"minItems": 1, "$dynamicRef": "#here", "$dynamicAnchor": "here"});
         let graph = parse(&a, &b).unwrap().link().unwrap();
         let mut context = Context::new(u64::MAX);
         let (_, of_b) = lower(&graph, &mut context).unwrap();
@@ -624,9 +716,9 @@ mod tests {
         // A dynamic reference may be about any instance, and no other is like it.
         assert_eq!(leaves[0].domain, TypeSet::ALL);
         assert_eq!(place(leaves[0]), (Side::B, "#/$dynamicRef".to_owned()));
-        // The leaf of `minLength` is about strings. A has it too, and A is lowered first.
-        assert_eq!(leaves[1].domain, STRING);
-        assert_eq!(place(leaves[1]), (Side::A, "#/minLength".to_owned()));
+        // The leaf of `minItems` is about arrays. A has it too, and A is lowered first.
+        assert_eq!(leaves[1].domain, ARRAY);
+        assert_eq!(place(leaves[1]), (Side::A, "#/minItems".to_owned()));
     }
 
     #[test]

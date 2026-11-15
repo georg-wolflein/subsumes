@@ -4,29 +4,44 @@ use num_traits::One;
 use serde_json::{Number, Value, json};
 
 use crate::canonical::number::Numbers;
+use crate::canonical::string::Strings;
 use crate::context::{Budget, Exhausted};
+use crate::language::Languages;
 use crate::rational::{Rational, written};
 use crate::term::InstanceType;
 
-/// An instance of a type about which a branch says nothing else, except which booleans and
-/// which numbers it may be.
+/// What a branch leaves of the types that it says more about than that an instance is of
+/// them.
+pub(crate) struct Left<'b> {
+    /// Whether an instance may be `true`. If not, it may be `false`.
+    pub may_be_true: bool,
+    pub numbers: &'b Numbers,
+    pub strings: &'b Strings,
+}
+
+/// An instance of a type about which a branch says nothing else, except which booleans,
+/// which numbers and which strings it may be.
 ///
 /// `None` for a number when the branch leaves only numbers that no JSON number stands for.
 ///
 /// # Errors
 ///
-/// When the budget does not cover the search for a number.
+/// When the budget does not cover the search for a number or for a string.
 pub(crate) fn instance(
     kind: InstanceType,
-    may_be_true: bool,
-    numbers: &Numbers,
+    left: &Left,
+    languages: &mut Languages,
     budget: &mut Budget,
 ) -> Result<Option<Value>, Exhausted> {
     Ok(Some(match kind {
         InstanceType::Null => Value::Null,
-        InstanceType::Boolean => Value::Bool(may_be_true),
-        InstanceType::Number => return Ok(number(numbers, budget)?.map(Value::Number)),
-        InstanceType::String => json!(""),
+        InstanceType::Boolean => Value::Bool(left.may_be_true),
+        InstanceType::Number => return Ok(number(left.numbers, budget)?.map(Value::Number)),
+        // The shortest string that is left, and of several one of plain characters.
+        InstanceType::String => {
+            let shortest = left.strings.shortest(languages, budget)?;
+            return Ok(shortest.map(Value::String));
+        }
         InstanceType::Array => json!([]),
         InstanceType::Object => json!({}),
     }))
@@ -116,9 +131,16 @@ mod tests {
 
     #[test]
     fn a_type_without_anything_else_gives_its_plainest_instance() {
-        let budget = &mut Budget::new(0);
-        let all = Numbers::default();
-        let mut of = |kind, may_be_true| instance(kind, may_be_true, &all, budget).unwrap();
+        let (budget, languages) = (&mut Budget::new(0), &mut Languages::default());
+        let (numbers, strings) = (&Numbers::default(), &Strings::default());
+        let mut of = |kind, may_be_true| {
+            let left = Left {
+                may_be_true,
+                numbers,
+                strings,
+            };
+            instance(kind, &left, languages, budget).unwrap()
+        };
         assert_eq!(of(InstanceType::Null, true), Some(json!(null)));
         assert_eq!(of(InstanceType::Boolean, true), Some(json!(true)));
         assert_eq!(of(InstanceType::Boolean, false), Some(json!(false)));
