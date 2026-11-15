@@ -1928,11 +1928,18 @@ mod tests {
             counterexample(&json!({"properties": {"ab": {"minimum": 1}}}), &two),
             json!({"ab": 0})
         );
-        // A pattern of a few words is those words.
+        // A pattern of a few words asks of those names what `properties` would, and so
+        // does a pattern of one word.
         let words = json!({"patternProperties": {"^(a|b)$": {"type": "null"}}});
         let named = json!({"properties": {"a": {"type": "null"}, "b": {"type": "null"}}});
         yes(&words, &named);
         yes(&named, &words);
+        let word = json!({"patternProperties": {"^a$": {"type": "null"}}});
+        let name = json!({"properties": {"a": {"type": "null"}}});
+        yes(&word, &name);
+        yes(&name, &word);
+        yes(&word, &named);
+        assert_eq!(counterexample(&named, &word), json!({"b": true}));
     }
 
     #[test]
