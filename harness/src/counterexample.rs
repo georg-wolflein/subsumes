@@ -76,6 +76,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_validator_reads_a_large_float_as_the_whole_number_that_it_holds() {
+        // 2^60 + 256, which a float holds and prints as a number that ends in 200. A whole
+        // number between the two is less than the float.
+        let least = validator(&json!({"minimum": 1.152_921_504_606_847_2e18})).unwrap();
+        assert!(least.is_valid(&json!(1_152_921_504_606_847_232_u64)));
+        assert!(!least.is_valid(&json!(1_152_921_504_606_847_210_u64)));
+        // -2^63, which is printed as a number that ends in 000 and is less.
+        let least = validator(&json!({"minimum": -9.223_372_036_854_776e18})).unwrap();
+        assert!(least.is_valid(&json!(i64::MIN)));
+        let most = validator(&json!({"maximum": i64::MIN})).unwrap();
+        assert!(most.is_valid(&json!(-9.223_372_036_854_776e18)));
+    }
+
+    #[test]
     fn a_counterexample_is_valid_under_the_narrow_schema_only() {
         let (wide, narrow) = (
             json!({"type": "string"}),

@@ -1774,6 +1774,45 @@ mod tests {
     }
 
     #[test]
+    fn a_large_float_is_compared_as_the_whole_number_that_it_holds() {
+        // The bounds of a 64-bit integer, written as integers and as the floats nearest to
+        // them. The float for the least is that number, -2^63, and the float for the most
+        // is one more than it, 2^63.
+        let as_integers = json!({
+            "type": "integer",
+            "minimum": i64::MIN,
+            "maximum": i64::MAX,
+        });
+        let as_floats = json!({
+            "type": "integer",
+            "minimum": -9.223_372_036_854_776e18,
+            "maximum": 9.223_372_036_854_776e18,
+        });
+        yes(&as_floats, &as_integers);
+        assert_eq!(
+            counterexample(&as_integers, &as_floats),
+            json!(9_223_372_036_854_775_808_u64)
+        );
+        // A whole number between a float and what the float is printed as: 2^60 + 256 is
+        // printed as a number that ends in 200.
+        let (float, below) = (
+            json!({"minimum": 1.152_921_504_606_847_2e18}),
+            json!({"minimum": 1_152_921_504_606_847_210_u64}),
+        );
+        yes(&below, &float);
+        assert_eq!(
+            counterexample(&float, &below),
+            json!(1_152_921_504_606_847_210_u64)
+        );
+        // A float is given where no integer holds the number.
+        let beyond = json!({"type": "integer", "exclusiveMinimum": u64::MAX});
+        assert_eq!(
+            counterexample(&json!(false), &beyond),
+            json!(18_446_744_073_709_551_616.0)
+        );
+    }
+
+    #[test]
     fn a_property_that_there_has_to_be_is_there() {
         let (a, both) = (json!({"required": ["a"]}), json!({"required": ["b", "a"]}));
         yes(&a, &both);
