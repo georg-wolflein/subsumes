@@ -12,10 +12,12 @@
 //! - As a set of words: these words and no other, or every string but these words.
 //! - As a DFA, a deterministic finite automaton, for anything else.
 //!
-//! A pattern is only parsed when it comes in. Its DFA is built when something is asked
-//! that needs it, so a pattern that cancels against itself before that costs nothing. So it
-//! is with the strings that are in none of a few languages: they are kept as those
-//! languages, and who asks for [the shape](Languages::shape) of the language gets them.
+//! A pattern that is one word between `^` and `$`, such as `^type$`, comes in as the set of
+//! that word, by the id that the word has, and no DFA is built from it. Any other pattern
+//! is only parsed when it comes in. Its DFA is built when something is asked that needs it,
+//! so a pattern that cancels against itself before that costs nothing. So it is with the
+//! strings that are in none of a few languages: they are kept as those languages, and who
+//! asks for [the shape](Languages::shape) of the language gets them.
 
 mod dfa;
 mod pattern;
@@ -154,7 +156,8 @@ impl Languages {
     }
 
     /// The language of every string that holds a match of the pattern, as the `regex` crate
-    /// reads the pattern.
+    /// reads the pattern. For a pattern that is one word between `^` and `$` that is the set
+    /// of this word, by the id that [`Self::words`] gives it.
     ///
     /// # Errors
     ///
@@ -164,6 +167,10 @@ impl Languages {
             return *known;
         }
         let read = pattern::read(pattern).map(|read| {
+            // A word between `^` and `$` is that word, and needs no DFA.
+            if let Some(word) = pattern::one_word(&read) {
+                return self.words([word]);
+            }
             let id = self.add(Language::Pattern(Box::new(read)));
             self.sources.insert(id, format!("{pattern:?}"));
             id
@@ -226,31 +233,6 @@ impl Languages {
         let id = self.add(Language::Outside(of.clone()));
         self.outsides.insert(of, id);
         id
-    }
-
-    /// Keeps a pattern as the set of its words from now on, if it matches a few words and
-    /// no other string.
-    ///
-    /// # Errors
-    ///
-    /// When the budget does not cover the DFA of the pattern.
-    pub fn listed(&mut self, id: LanguageId, budget: &mut Budget) -> Result<(), Exhausted> {
-        /// The most words that are listed.
-        const FEW: u64 = 16;
-        let kept = &self.languages[id.0 as usize];
-        if matches!(kept, Language::Words { .. } | Language::Outside(_)) {
-            return Ok(());
-        }
-        if self.size(id, budget)?.is_some_and(|size| size <= FEW) {
-            let dfa = self.dfa(id, budget)?;
-            let words = dfa.words().into_iter().map(String::into_boxed_str);
-            self.languages[id.0 as usize] = Language::Words {
-                words: Rc::new(words.collect()),
-                others: false,
-            };
-            self.as_dfas.insert(id, dfa);
-        }
-        Ok(())
     }
 
     /// How a language is kept.
@@ -857,6 +839,24 @@ mod tests {
     }
 
     #[test]
+    fn a_word_between_the_two_ends_is_that_word_and_no_pattern() {
+        let mut store = Store::new();
+        assert_eq!(store.pattern("^type$"), store.0.words(["type"]));
+        assert_eq!(store.pattern(r"^a\.b$"), store.0.words(["a.b"]));
+        assert_eq!(store.pattern("^é𝄞$"), store.0.words(["é𝄞"]));
+        assert_eq!(store.pattern("^$"), store.0.words([""]));
+        // Anything else between them is a pattern, and so is a word without one of them,
+        // or with something else in the place of one.
+        for pattern in [
+            "^a|b$", "^a", "a$", "a", "^[ab]$", "^a?$", "(?i)^a$", "^a$|^b$", "^ab*", "a*b$",
+            "^a^", "$a$", "^a$b", "^$a",
+        ] {
+            let read = store.pattern(pattern);
+            assert_eq!(store.0.show(read), format!("{pattern:?}"));
+        }
+    }
+
+    #[test]
     fn what_is_outside_a_few_languages_is_built_when_it_is_asked_for() {
         let mut store = Store::new();
         let (words, begins) = (store.0.words(["a", "b"]), store.pattern("^x-"));
@@ -968,30 +968,6 @@ mod tests {
             store.0.size(Languages::NOTHING, &mut unlimited()),
             Ok(Some(0))
         );
-    }
-
-    #[test]
-    fn a_pattern_of_a_few_words_is_kept_as_those_words_once_it_is_listed() {
-        let mut store = Store::new();
-        let few = store.pattern("^(a|bc|[x-z]9)$");
-        assert!(matches!(store.0.shape(few), Shape::Other));
-        store.0.listed(few, &mut unlimited()).unwrap();
-        let Shape::Words { words, others } = store.0.shape(few) else {
-            panic!("a few words are a set of words");
-        };
-        let words: Vec<&str> = words.iter().map(AsRef::as_ref).collect();
-        assert_eq!((words, others), (vec!["a", "bc", "x9", "y9", "z9"], false));
-        // It is the language that it was.
-        assert_eq!(store.shortest(few, Lengths::ANY), some("a"));
-        let begins = store.pattern("^[xy]");
-        let both = store.both(few, begins);
-        assert_eq!(store.0.show(both), r#"one of ["x9", "y9"]"#);
-        // What has more words, or no end of them, stays as it is.
-        for pattern in ["^[a-q]$", "^a+$", "a"] {
-            let read = store.pattern(pattern);
-            store.0.listed(read, &mut unlimited()).unwrap();
-            assert!(matches!(store.0.shape(read), Shape::Other), "{pattern}");
-        }
     }
 
     #[test]

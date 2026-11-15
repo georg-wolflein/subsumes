@@ -678,6 +678,12 @@ mod tests {
             languages(&json!({"additionalProperties": false})),
             ["any string"]
         );
+        // A pattern that is one word between `^` and `$` is that word.
+        let (pattern, property) = (
+            json!({"patternProperties": {"^a$": {"type": "null"}}}),
+            json!({"properties": {"a": {"type": "null"}}}),
+        );
+        assert_eq!(term(&pattern), term(&property));
         // At least no property is what every object has.
         assert_eq!(term(&json!({"minProperties": 0})), "true");
         assert_eq!(term(&json!({"maxProperties": 0})), "maxprops(0)");

@@ -280,12 +280,11 @@ impl Partitions {
                 }
             }
         }
-        // Every word that a language lists is a name of its own, also where the language
-        // is a pattern of a few words. Every other language is a pattern here.
+        // Every word that a set of words lists is a name of its own. Every other language
+        // is a pattern here.
         let mut names: BTreeSet<Box<str>> = BTreeSet::new();
         let mut patterns: Vec<LanguageId> = Vec::new();
         for language in &made_of {
-            languages.listed(*language, budget)?;
             match languages.shape(*language) {
                 Shape::Words { words, .. } => names.extend(words.iter().cloned()),
                 Shape::Outside(_) | Shape::Other => patterns.push(*language),
