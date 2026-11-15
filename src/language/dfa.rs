@@ -391,34 +391,6 @@ impl Dfa {
         Ok(Some(words[0]))
     }
 
-    /// The accepted words, of a DFA that accepts a few and no more.
-    pub fn words(&self) -> Vec<String> {
-        let width = self.classes.count();
-        let runs = &self.classes.runs;
-        let mut words = Vec::new();
-        // The beginnings of words that were read, each with the state that it leads to.
-        // None leads back to a state, since there is an end of words.
-        let mut read = vec![(0, String::new())];
-        while let Some((state, word)) = read.pop() {
-            for (index, (first, class)) in runs.iter().enumerate() {
-                let to = self.next[state * width + *class as usize];
-                if Some(to) == self.dead {
-                    continue;
-                }
-                let after = runs.get(index + 1).map_or(LAST + 1, |next| next.0);
-                for at in *first..after {
-                    let mut longer = word.clone();
-                    longer.push(character(at));
-                    read.push((to as usize, longer));
-                }
-            }
-            if self.accepts[state] {
-                words.push(word);
-            }
-        }
-        words
-    }
-
     /// Whether no string is accepted.
     pub fn is_empty(&self) -> bool {
         self.dead == Some(0)

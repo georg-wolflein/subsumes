@@ -47,6 +47,23 @@ pub(super) fn read(pattern: &str) -> Result<Hir, Unsupported> {
     Ok(read)
 }
 
+/// The word of a pattern that is one word between `^` and `$`, so that it matches this
+/// word and no other string.
+pub(super) fn one_word(pattern: &Hir) -> Option<&str> {
+    let HirKind::Concat(parts) = pattern.kind() else {
+        return None;
+    };
+    let is = |part: &Hir, look: Look| matches!(part.kind(), HirKind::Look(found) if *found == look);
+    match parts.as_slice() {
+        [start, end] if is(start, Look::Start) && is(end, Look::End) => Some(""),
+        [start, word, end] if is(start, Look::Start) && is(end, Look::End) => match word.kind() {
+            HirKind::Literal(word) => std::str::from_utf8(&word.0).ok(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// A state of the NFA, by what it does.
 #[derive(Debug)]
 enum State {

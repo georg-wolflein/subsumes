@@ -46,6 +46,11 @@
 //!
 //! A string that the engine gives is evaluated as it is too.
 //!
+//! A pattern that is one word between `^` and `$` never becomes a DFA: the store of
+//! languages keeps it as that word. None of the patterns above is one, so one run makes
+//! each of them one: `^a$`, `^b$`, `^ab$` or `^$`. The evaluator still asks the `regex`
+//! crate, to which they are patterns like any other.
+//!
 //! # Objects
 //!
 //! Nor is a leaf about objects. The evaluator looks at the properties that an object has:
@@ -898,6 +903,53 @@ fn mostly_plain() -> Vec<Value> {
     instances
 }
 
+/// The instances for schemas that are mostly about objects: a few that are no objects, and
+/// the objects of up to two of four names with a few values.
+fn mostly_objects() -> Vec<Value> {
+    let values = [
+        json!(null),
+        json!(true),
+        json!(1),
+        json!(0.5),
+        json!("a"),
+        json!(""),
+        json!([]),
+        json!({}),
+        json!({"a": null}),
+    ];
+    let mut instances = vec![json!(null), json!(0), json!("ab"), json!([])];
+    instances.extend(values.iter().cloned());
+    instances.extend(objects(&["a", "b", "ab", "c"], &values));
+    instances
+}
+
+/// Makes each pattern of a schema one that is a word between `^` and `$`, which the store
+/// of languages keeps as that word. The words are `a`, `b`, `ab` and the empty one.
+fn with_patterns_of_one_word(schema: &mut Value) {
+    let one_word = |pattern: &str| match pattern {
+        "^a" => "^a$",
+        "b$" => "^b$",
+        "b" => "^ab$",
+        _ => "^$",
+    };
+    match schema {
+        Value::Object(keywords) => {
+            if let Some(Value::String(pattern)) = keywords.get_mut("pattern") {
+                *pattern = one_word(pattern).to_owned();
+            }
+            if let Some(Value::Object(patterns)) = keywords.get_mut("patternProperties") {
+                let renamed = std::mem::take(patterns).into_iter();
+                *patterns = renamed
+                    .map(|(pattern, schema)| (one_word(&pattern).to_owned(), schema))
+                    .collect();
+            }
+            keywords.values_mut().for_each(with_patterns_of_one_word);
+        }
+        Value::Array(items) => items.iter_mut().for_each(with_patterns_of_one_word),
+        _ => {}
+    }
+}
+
 #[test]
 fn the_engine_agrees_with_every_instance_there_could_be() {
     let random = &mut Random(0);
@@ -983,22 +1035,7 @@ fn the_engine_agrees_on_objects() {
         never_negated: false,
         of_objects: true,
     };
-    // A few instances that are no objects, and the objects of up to two of four names
-    // with a few values.
-    let values = [
-        json!(null),
-        json!(true),
-        json!(1),
-        json!(0.5),
-        json!("a"),
-        json!(""),
-        json!([]),
-        json!({}),
-        json!({"a": null}),
-    ];
-    let mut instances = vec![json!(null), json!(0), json!("ab"), json!([])];
-    instances.extend(values.iter().cloned());
-    instances.extend(objects(&["a", "b", "ab", "c"], &values));
+    let instances = mostly_objects();
     let mut tally = Tally::default();
     for pair in 0..1_500 {
         let (a, b) = (schema(random, 2, shape), schema(random, 2, shape));
@@ -1017,6 +1054,41 @@ fn the_engine_agrees_on_objects() {
     } = tally;
     assert!(
         yes > 200 && no > 500 && objects > 300,
+        "{yes} {no} {objects}"
+    );
+}
+
+#[test]
+fn the_engine_agrees_on_patterns_of_one_word() {
+    let random = &mut Random(4);
+    let shape = Shape {
+        definitions: &[],
+        never_negated: false,
+        of_objects: true,
+    };
+    // Every string of up to three letters as well, since a pattern is asked of strings too.
+    let mut instances = mostly_objects();
+    instances.extend(strings().into_iter().map(Value::String));
+    let mut tally = Tally::default();
+    for pair in 0..1_000 {
+        let (a, b) = (schema(random, 2, shape), schema(random, 2, shape));
+        let (of_a, of_b) = (definitions(random, shape), definitions(random, shape));
+        let mut b = match pair % 4 {
+            0 => document(json!({"allOf": [a, b]}), &of_a),
+            1 => document(json!({"anyOf": [a, b]}), &of_a),
+            _ => document(b, &of_b),
+        };
+        let mut a = document(a, &of_a);
+        with_patterns_of_one_word(&mut a);
+        with_patterns_of_one_word(&mut b);
+        tally.compare(&a, &b, &instances, true);
+    }
+    println!("{tally}");
+    let Tally {
+        yes, no, objects, ..
+    } = tally;
+    assert!(
+        yes > 150 && no > 300 && objects > 200,
         "{yes} {no} {objects}"
     );
 }
