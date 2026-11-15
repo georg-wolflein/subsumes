@@ -328,6 +328,94 @@ impl Dfa {
         self.accepts[state]
     }
 
+    /// How many words are accepted, or `None` if there is no end of them. A count that a
+    /// `u64` does not hold is the largest that it does.
+    ///
+    /// # Errors
+    ///
+    /// When the budget does not cover a look at every state.
+    pub fn size(&self, budget: &mut Budget) -> Result<Option<u64>, Exhausted> {
+        let (width, count) = (self.classes.count(), self.accepts.len());
+        let dead = self.dead.map(|dead| dead as usize);
+        let row = |state: usize| &self.next[state * width..(state + 1) * width];
+        // Every state but the dead one leads to an accepted word. So there is no end of
+        // words exactly when some way through those states comes back to where it was. The
+        // states are put in an order in which each comes before those it leads to, which
+        // there is unless one leads back.
+        let mut leads_here = vec![0_usize; count];
+        for state in (0..count).filter(|state| Some(*state) != dead) {
+            budget.charge(cost(0, width))?;
+            for to in row(state) {
+                leads_here[*to as usize] += 1;
+            }
+        }
+        let live = (0..count).filter(|state| Some(*state) != dead);
+        let mut order: Vec<usize> = live.filter(|state| leads_here[*state] == 0).collect();
+        let mut at = 0;
+        while let Some(&state) = order.get(at) {
+            for to in row(state).iter().map(|to| *to as usize) {
+                leads_here[to] -= 1;
+                if leads_here[to] == 0 && Some(to) != dead {
+                    order.push(to);
+                }
+            }
+            at += 1;
+        }
+        if order.len() + usize::from(dead.is_some()) < count {
+            return Ok(None);
+        }
+        // How many characters each class has.
+        let mut characters = vec![0_u64; width];
+        for (index, (first, class)) in self.classes.runs.iter().enumerate() {
+            let after = self
+                .classes
+                .runs
+                .get(index + 1)
+                .map_or(LAST + 1, |next| next.0);
+            characters[*class as usize] += u64::from(after - first);
+        }
+        // The words that are accepted from a state: none more if it accepts, and for each
+        // character those from the state that the character leads to.
+        let mut words = vec![0_u64; count];
+        for &state in order.iter().rev() {
+            let mut from_here = u64::from(self.accepts[state]);
+            for (class, to) in row(state).iter().enumerate() {
+                let onward = characters[class].saturating_mul(words[*to as usize]);
+                from_here = from_here.saturating_add(onward);
+            }
+            words[state] = from_here;
+        }
+        Ok(Some(words[0]))
+    }
+
+    /// The accepted words, of a DFA that accepts a few and no more.
+    pub fn words(&self) -> Vec<String> {
+        let width = self.classes.count();
+        let runs = &self.classes.runs;
+        let mut words = Vec::new();
+        // The beginnings of words that were read, each with the state that it leads to.
+        // None leads back to a state, since there is an end of words.
+        let mut read = vec![(0, String::new())];
+        while let Some((state, word)) = read.pop() {
+            for (index, (first, class)) in runs.iter().enumerate() {
+                let to = self.next[state * width + *class as usize];
+                if Some(to) == self.dead {
+                    continue;
+                }
+                let after = runs.get(index + 1).map_or(LAST + 1, |next| next.0);
+                for at in *first..after {
+                    let mut longer = word.clone();
+                    longer.push(character(at));
+                    read.push((to as usize, longer));
+                }
+            }
+            if self.accepts[state] {
+                words.push(word);
+            }
+        }
+        words
+    }
+
     /// Whether no string is accepted.
     pub fn is_empty(&self) -> bool {
         self.dead == Some(0)

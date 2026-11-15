@@ -13,7 +13,9 @@
 //! - As a DFA, a deterministic finite automaton, for anything else.
 //!
 //! A pattern is only parsed when it comes in. Its DFA is built when something is asked
-//! that needs it, so a pattern that cancels against itself before that costs nothing.
+//! that needs it, so a pattern that cancels against itself before that costs nothing. So it
+//! is with the strings that are in none of a few languages: they are kept as those
+//! languages, and who asks for [the shape](Languages::shape) of the language gets them.
 
 mod dfa;
 mod pattern;
@@ -76,7 +78,24 @@ enum Language {
     /// The pattern of a format, which is not even parsed until something asks for its
     /// DFA.
     Format(&'static str),
+    /// Every string that is in none of these languages, of which nothing has asked for the
+    /// DFA yet.
+    Outside(Box<[LanguageId]>),
     Dfa(Rc<Dfa>),
+}
+
+/// How a language is kept, for who can make use of it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Shape<'l> {
+    /// These words and no other, or with `others` every string but these words.
+    Words {
+        words: &'l BTreeSet<Box<str>>,
+        others: bool,
+    },
+    /// Every string that is in none of these languages.
+    Outside(&'l [LanguageId]),
+    /// A pattern, a format or a DFA.
+    Other,
 }
 
 /// The languages of a check.
@@ -89,10 +108,14 @@ pub(crate) struct Languages {
     formats: HashMap<Box<str>, LanguageId>,
     of_words: HashMap<(Words, bool), LanguageId>,
     of_dfas: HashMap<Rc<Dfa>, LanguageId>,
-    /// The DFA of a set of words, once something has asked for it.
+    outsides: HashMap<Box<[LanguageId]>, LanguageId>,
+    /// The DFA of a set of words, or of what is outside a few languages, once
+    /// something has asked for it.
     as_dfas: HashMap<LanguageId, Rc<Dfa>>,
     intersections: HashMap<(LanguageId, LanguageId), LanguageId>,
     complements: HashMap<LanguageId, LanguageId>,
+    /// How many words a language has that is no set of words, once that was asked.
+    sizes: HashMap<LanguageId, Option<u64>>,
 }
 
 impl Default for Languages {
@@ -104,9 +127,11 @@ impl Default for Languages {
             formats: HashMap::new(),
             of_words: HashMap::new(),
             of_dfas: HashMap::new(),
+            outsides: HashMap::new(),
             as_dfas: HashMap::new(),
             intersections: HashMap::new(),
             complements: HashMap::new(),
+            sizes: HashMap::new(),
         };
         let none: [&str; 0] = [];
         assert_eq!(languages.words(none), Self::NOTHING);
@@ -139,6 +164,10 @@ impl Languages {
             return *known;
         }
         let read = pattern::read(pattern).map(|read| {
+            // A word between `^` and `$` is that word, and needs no DFA.
+            if let Some(word) = pattern::one_word(&read) {
+                return self.words([word]);
+            }
             let id = self.add(Language::Pattern(Box::new(read)));
             self.sources.insert(id, format!("{pattern:?}"));
             id
@@ -177,6 +206,69 @@ impl Languages {
         id
     }
 
+    /// The language of every string that is in none of these languages. With a pattern
+    /// among them it costs nothing until something asks for its DFA.
+    pub fn outside(&mut self, of: impl IntoIterator<Item = LanguageId>) -> LanguageId {
+        let mut of: Vec<LanguageId> = of.into_iter().collect();
+        of.sort_unstable();
+        of.dedup();
+        of.retain(|language| *language != Self::NOTHING);
+        match of.as_slice() {
+            [] => return Self::EVERYTHING,
+            [only] => {
+                if let Language::Words { words, others } = &self.languages[only.0 as usize] {
+                    let (words, others) = (Rc::clone(words), !*others);
+                    return self.set(words, others);
+                }
+            }
+            _ => {}
+        }
+        if let Some(known) = self.outsides.get(of.as_slice()) {
+            return *known;
+        }
+        let of: Box<[LanguageId]> = of.into();
+        let id = self.add(Language::Outside(of.clone()));
+        self.outsides.insert(of, id);
+        id
+    }
+
+    /// Keeps a pattern as the set of its words from now on, if it matches a few words and
+    /// no other string.
+    ///
+    /// # Errors
+    ///
+    /// When the budget does not cover the DFA of the pattern.
+    pub fn listed(&mut self, id: LanguageId, budget: &mut Budget) -> Result<(), Exhausted> {
+        /// The most words that are listed.
+        const FEW: u64 = 16;
+        let kept = &self.languages[id.0 as usize];
+        if matches!(kept, Language::Words { .. } | Language::Outside(_)) {
+            return Ok(());
+        }
+        if self.size(id, budget)?.is_some_and(|size| size <= FEW) {
+            let dfa = self.dfa(id, budget)?;
+            let words = dfa.words().into_iter().map(String::into_boxed_str);
+            self.languages[id.0 as usize] = Language::Words {
+                words: Rc::new(words.collect()),
+                others: false,
+            };
+            self.as_dfas.insert(id, dfa);
+        }
+        Ok(())
+    }
+
+    /// How a language is kept.
+    pub fn shape(&self, id: LanguageId) -> Shape<'_> {
+        match &self.languages[id.0 as usize] {
+            Language::Words { words, others } => Shape::Words {
+                words,
+                others: *others,
+            },
+            Language::Outside(of) => Shape::Outside(of),
+            _ => Shape::Other,
+        }
+    }
+
     /// The id of a DFA that came out of others.
     fn keep(&mut self, dfa: Dfa) -> LanguageId {
         if dfa.is_empty() {
@@ -209,6 +301,22 @@ impl Languages {
                 }
                 let listed = Dfa::of_words(words.iter().map(AsRef::as_ref), budget)?;
                 let built = Rc::new(if *others { listed.complement() } else { listed });
+                self.as_dfas.insert(id, Rc::clone(&built));
+                return Ok(built);
+            }
+            Language::Outside(of) => {
+                if let Some(known) = self.as_dfas.get(&id) {
+                    return Ok(Rc::clone(known));
+                }
+                // What is left of every string when each of the languages is taken out.
+                // None of them is kept this way itself, so this goes one level deep.
+                let of = of.clone();
+                let mut left = Self::EVERYTHING;
+                for language in of.iter() {
+                    let other = self.complement(*language, budget)?;
+                    left = self.intersection(left, other, budget)?;
+                }
+                let built = self.dfa(left, budget)?;
                 self.as_dfas.insert(id, Rc::clone(&built));
                 return Ok(built);
             }
@@ -343,12 +451,92 @@ impl Languages {
         Ok(self.set(Rc::new(held), false))
     }
 
+    /// The language of the strings that are in either.
+    ///
+    /// # Errors
+    ///
+    /// When the budget does not cover the DFAs.
+    pub fn union(
+        &mut self,
+        a: LanguageId,
+        b: LanguageId,
+        budget: &mut Budget,
+    ) -> Result<LanguageId, Exhausted> {
+        if a == Self::NOTHING || a == b {
+            return Ok(b);
+        }
+        if b == Self::NOTHING {
+            return Ok(a);
+        }
+        // What is in neither is outside both.
+        let (not_a, not_b) = (self.complement(a, budget)?, self.complement(b, budget)?);
+        let neither = self.intersection(not_a, not_b, budget)?;
+        self.complement(neither, budget)
+    }
+
+    /// The language of every string whose length is within the bounds, unless the bounds
+    /// are larger than a pattern can say.
+    pub fn of_lengths(&mut self, lengths: Lengths) -> Option<LanguageId> {
+        let pattern = match lengths {
+            Lengths::ANY => return Some(Self::EVERYTHING),
+            Lengths { min, max: None } => format!("(?s)^.{{{min},}}$"),
+            Lengths {
+                min,
+                max: Some(max),
+            } if max < min => return Some(Self::NOTHING),
+            Lengths {
+                min,
+                max: Some(max),
+            } => format!("(?s)^.{{{min},{max}}}$"),
+        };
+        self.pattern(&pattern).ok()
+    }
+
+    /// Whether the language holds the word.
+    ///
+    /// # Errors
+    ///
+    /// When the budget does not cover the DFA of a pattern.
+    pub fn contains(
+        &mut self,
+        id: LanguageId,
+        word: &str,
+        budget: &mut Budget,
+    ) -> Result<bool, Exhausted> {
+        if let Language::Words { words, others } = &self.languages[id.0 as usize] {
+            return Ok(words.contains(word) != *others);
+        }
+        budget.charge(1 + word.len() as u64 / 32)?;
+        Ok(self.dfa(id, budget)?.accepts(word))
+    }
+
+    /// How many words the language has, or `None` if there is no end of them. A count that
+    /// a `u64` does not hold is the largest that it does.
+    ///
+    /// # Errors
+    ///
+    /// When the budget does not cover the DFA or the count.
+    pub fn size(&mut self, id: LanguageId, budget: &mut Budget) -> Result<Option<u64>, Exhausted> {
+        match &self.languages[id.0 as usize] {
+            Language::Words { others: true, .. } => Ok(None),
+            Language::Words { words, .. } => Ok(Some(words.len() as u64)),
+            _ => {
+                if let Some(known) = self.sizes.get(&id) {
+                    return Ok(*known);
+                }
+                let size = self.dfa(id, budget)?.size(budget)?;
+                self.sizes.insert(id, size);
+                Ok(size)
+            }
+        }
+    }
+
     /// Whether every string of `narrow` is in `wide`.
     ///
     /// # Errors
     ///
     /// When the budget does not cover the DFAs.
-    // The engine compares languages by their intersections so far. Objects will ask this.
+    // The engine compares languages by their intersections, and the tests ask this.
     #[cfg_attr(not(test), expect(dead_code))]
     pub fn includes(
         &mut self,
@@ -464,6 +652,10 @@ impl Languages {
                     (true, false) => format!("any string but {listed}"),
                     (false, _) => format!("one of [{listed}]"),
                 }
+            }
+            Language::Outside(of) => {
+                let listed: Vec<String> = of.iter().map(|language| self.show(*language)).collect();
+                format!("none of [{}]", listed.join(", "))
             }
             _ => format!("language {}", id.0),
         }
@@ -666,6 +858,174 @@ mod tests {
         // A search and the pattern that spells the search out.
         let (search, spelled) = (store.pattern("b"), store.pattern("(?s)^.*b.*$"));
         assert!(store.includes(search, spelled) && store.includes(spelled, search));
+    }
+
+    #[test]
+    fn a_word_between_the_two_ends_is_that_word_and_no_pattern() {
+        let mut store = Store::new();
+        assert_eq!(store.pattern("^type$"), store.0.words(["type"]));
+        assert_eq!(store.pattern(r"^a\.b$"), store.0.words(["a.b"]));
+        assert_eq!(store.pattern("^é𝄞$"), store.0.words(["é𝄞"]));
+        assert_eq!(store.pattern("^$"), store.0.words([""]));
+        // Anything else between them is a pattern, and so is a word without one of them.
+        for pattern in [
+            "^a|b$", "^a", "a$", "a", "^[ab]$", "^a?$", "(?i)^a$", "^a$|^b$",
+        ] {
+            let read = store.pattern(pattern);
+            assert_eq!(store.0.show(read), format!("{pattern:?}"));
+        }
+    }
+
+    #[test]
+    fn what_is_outside_a_few_languages_is_built_when_it_is_asked_for() {
+        let mut store = Store::new();
+        let (words, begins) = (store.0.words(["a", "b"]), store.pattern("^x-"));
+        let ends = store.pattern("y$");
+        // Of nothing, and of sets of words only, it is a set of words.
+        assert_eq!(store.0.outside([]), Languages::EVERYTHING);
+        assert_eq!(store.0.outside([Languages::NOTHING]), Languages::EVERYTHING);
+        assert_eq!(store.0.outside([Languages::EVERYTHING]), Languages::NOTHING);
+        assert_eq!(store.0.outside([words]), store.not(words));
+        // With a pattern it is kept as the languages, in one order.
+        let outside = store.0.outside([begins, words, ends, begins]);
+        assert_eq!(outside, store.0.outside([ends, words, begins]));
+        assert_eq!(
+            store.0.show(outside),
+            r#"none of [one of ["a", "b"], "^x-", "y$"]"#
+        );
+        let Shape::Outside(of) = store.0.shape(outside) else {
+            panic!("it is kept as what it is outside of");
+        };
+        assert_eq!(of, [words, begins, ends]);
+        assert!(matches!(store.0.shape(begins), Shape::Other));
+        // And it is what its DFA says.
+        for (word, held) in [
+            ("c", true),
+            ("", true),
+            ("a", false),
+            ("x-c", false),
+            ("cy", false),
+            ("x", true),
+        ] {
+            assert_eq!(store.holds(outside, word), held, "{word:?}");
+            assert_eq!(
+                store.0.contains(outside, word, &mut unlimited()),
+                Ok(held),
+                "{word:?}"
+            );
+        }
+        let not_outside = store.not(outside);
+        assert!(store.includes(not_outside, begins) && store.includes(not_outside, words));
+        assert_eq!(store.shortest(outside, from(1)), some("c"));
+    }
+
+    #[test]
+    fn either_of_two_languages_is_what_is_outside_neither() {
+        let mut store = Store::new();
+        let either = |store: &mut Store, a, b| store.0.union(a, b, &mut unlimited()).unwrap();
+        let (a, bc) = (store.0.words(["a"]), store.0.words(["b", "c"]));
+        assert_eq!(either(&mut store, a, bc), store.0.words(["a", "b", "c"]));
+        assert_eq!(either(&mut store, a, Languages::NOTHING), a);
+        assert_eq!(either(&mut store, Languages::NOTHING, a), a);
+        assert_eq!(
+            either(&mut store, a, Languages::EVERYTHING),
+            Languages::EVERYTHING
+        );
+        let (begins, ends) = (store.pattern("^a"), store.pattern("b$"));
+        let both = either(&mut store, begins, ends);
+        let said = store.pattern("^a|b$");
+        assert!(store.includes(both, said) && store.includes(said, both));
+        let with_words = either(&mut store, begins, bc);
+        assert!(store.holds(with_words, "c") && store.holds(with_words, "ab"));
+        assert!(!store.holds(with_words, "d"));
+    }
+
+    #[test]
+    fn a_language_holds_a_word_or_does_not() {
+        let mut store = Store::new();
+        let holds =
+            |store: &mut Store, id, word| store.0.contains(id, word, &mut unlimited()).unwrap();
+        let words = store.0.words(["a", "b"]);
+        assert!(holds(&mut store, words, "a") && !holds(&mut store, words, "c"));
+        let others = store.not(words);
+        assert!(!holds(&mut store, others, "a") && holds(&mut store, others, "c"));
+        let lower = store.pattern("^[a-z]+$");
+        assert!(holds(&mut store, lower, "abc") && !holds(&mut store, lower, "aBc"));
+        assert!(!holds(&mut store, lower, ""));
+        // A set of words costs nothing, and a pattern its DFA.
+        let mut budget = Budget::new(0);
+        assert_eq!(store.0.contains(words, "a", &mut budget), Ok(true));
+        let digits = store.pattern("^[0-9]+$");
+        assert_eq!(store.0.contains(digits, "1", &mut budget), Err(Exhausted));
+    }
+
+    #[test]
+    fn the_words_of_a_language_are_counted() {
+        let mut store = Store::new();
+        let size = |store: &mut Store, pattern: &str| {
+            let read = store.pattern(pattern);
+            store.0.size(read, &mut unlimited()).unwrap()
+        };
+        assert_eq!(size(&mut store, "^(a|b)$"), Some(2));
+        assert_eq!(size(&mut store, "^[a-c]{2}$"), Some(9));
+        assert_eq!(size(&mut store, "^[a-c]{0,2}$"), Some(13));
+        assert_eq!(size(&mut store, "^(a|ab|abc)?$"), Some(4));
+        assert_eq!(size(&mut store, "^a*$"), None);
+        assert_eq!(size(&mut store, "a"), None);
+        assert_eq!(size(&mut store, "^a[^a]$"), Some(u64::from(LAST)));
+        // A count that is more than can be held is the most that can.
+        assert_eq!(size(&mut store, "(?s)^.{9}$"), Some(u64::MAX));
+        assert_eq!(size(&mut store, "$a"), Some(0));
+        let (few, others) = (store.0.words(["a", "b", "c"]), store.0.words(["a"]));
+        let others = store.not(others);
+        assert_eq!(store.0.size(few, &mut unlimited()), Ok(Some(3)));
+        assert_eq!(store.0.size(others, &mut unlimited()), Ok(None));
+        assert_eq!(
+            store.0.size(Languages::NOTHING, &mut unlimited()),
+            Ok(Some(0))
+        );
+    }
+
+    #[test]
+    fn a_pattern_of_a_few_words_is_kept_as_those_words_once_it_is_listed() {
+        let mut store = Store::new();
+        let few = store.pattern("^(a|bc|[x-z]9)$");
+        assert!(matches!(store.0.shape(few), Shape::Other));
+        store.0.listed(few, &mut unlimited()).unwrap();
+        let Shape::Words { words, others } = store.0.shape(few) else {
+            panic!("a few words are a set of words");
+        };
+        let words: Vec<&str> = words.iter().map(AsRef::as_ref).collect();
+        assert_eq!((words, others), (vec!["a", "bc", "x9", "y9", "z9"], false));
+        // It is the language that it was.
+        assert_eq!(store.shortest(few, Lengths::ANY), some("a"));
+        let begins = store.pattern("^[xy]");
+        let both = store.both(few, begins);
+        assert_eq!(store.0.show(both), r#"one of ["x9", "y9"]"#);
+        // What has more words, or no end of them, stays as it is.
+        for pattern in ["^[a-q]$", "^a+$", "a"] {
+            let read = store.pattern(pattern);
+            store.0.listed(read, &mut unlimited()).unwrap();
+            assert!(matches!(store.0.shape(read), Shape::Other), "{pattern}");
+        }
+    }
+
+    #[test]
+    fn the_strings_of_some_lengths_are_a_language() {
+        let mut store = Store::new();
+        assert_eq!(
+            store.0.of_lengths(Lengths::ANY),
+            Some(Languages::EVERYTHING)
+        );
+        assert_eq!(store.0.of_lengths(between(3, 2)), Some(Languages::NOTHING));
+        let short = store.0.of_lengths(between(1, 2)).unwrap();
+        for (word, held) in [("", false), ("a", true), ("é\n", true), ("abc", false)] {
+            assert_eq!(store.holds(short, word), held, "{word:?}");
+        }
+        let long = store.0.of_lengths(from(2)).unwrap();
+        assert!(!store.holds(long, "a") && store.holds(long, "abcdef"));
+        // A count that no pattern holds.
+        assert_eq!(store.0.of_lengths(from(u64::MAX)), None);
     }
 
     #[test]
