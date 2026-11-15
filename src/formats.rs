@@ -5,9 +5,10 @@
 //! crate, built from the grammar of the document that defines the format. Any other format is
 //! a predicate that the engine does not model.
 //!
-//! Two formats are modelled in part: of some strings the pattern says that the format accepts
-//! them, of others a second pattern says that the format may or may not, and all the rest it
-//! rejects.
+//! Four formats are modelled in part: of some strings the pattern says that the format accepts
+//! them, a second pattern holds the strings that it may accept, and all the rest it rejects.
+//! That is for strings of which no grammar says whether they are of the format, and for
+//! strings that the grammar of the format allows and that validators do not take.
 //!
 //! A digit is one of ASCII in every format, so the patterns say `[0-9]` and never `\d`.
 
@@ -16,9 +17,9 @@
 pub(crate) struct Format {
     /// The strings that the format accepts, as a pattern.
     pub accepted: &'static str,
-    /// The strings of which it is not modelled whether the format accepts them, as a pattern.
-    /// None of them is among those that it accepts. Without this, the pattern above is all
-    /// that the format accepts.
+    /// The strings that the format may accept, as a pattern: of those of them that the
+    /// pattern above does not hold, it is not modelled whether the format accepts them.
+    /// Without this, the pattern above is all that the format accepts.
     pub open: Option<&'static str>,
 }
 
@@ -38,9 +39,15 @@ pub(crate) fn modelled(format: &str) -> Option<Format> {
             accepted: DATE_TIME,
             open: Some(DATE_TIME_WITH_SECOND_60),
         },
-        "duration" => whole(DURATION),
+        "duration" => Format {
+            accepted: DURATION,
+            open: Some(DURATION_IN_EITHER_CASE),
+        },
         "uuid" => whole(UUID),
-        "ipv4" => whole(IPV4),
+        "ipv4" => Format {
+            accepted: IPV4,
+            open: Some(IPV4_WITH_ZEROS_BEFORE_A_NUMBER),
+        },
         "ipv6" => whole(IPV6),
         "uri" => whole(URI),
         "uri-reference" => whole(URI_REFERENCE),
@@ -101,26 +108,90 @@ const TIME_WITH_SECOND_60: &str = whole!(time!("60"));
 const DATE_TIME: &str = whole!(date!(), "[Tt]", time!("[0-5][0-9]"));
 const DATE_TIME_WITH_SECOND_60: &str = whole!(date!(), "[Tt]", time!("60"));
 
-// RFC 3339, appendix A: `duration`.
-const DURATION: &str = whole!(
-    "P(?:",
-    "(?:[0-9]+D|[0-9]+M(?:[0-9]+D)?|[0-9]+Y(?:[0-9]+M(?:[0-9]+D)?)?)",
-    "(?:T(?:[0-9]+H(?:[0-9]+M(?:[0-9]+S)?)?|[0-9]+M(?:[0-9]+S)?|[0-9]+S))?",
-    "|T(?:[0-9]+H(?:[0-9]+M(?:[0-9]+S)?)?|[0-9]+M(?:[0-9]+S)?|[0-9]+S)",
-    "|[0-9]+W)"
-);
+// RFC 3339, appendix A: `duration`, with the letters as the grammar writes them.
+//
+// The grammar is ABNF, in which a letter in quotes stands for both of its cases, so by the
+// letter `p1d` is a duration too. Validators take the capital letters only. So of a duration
+// with a small letter it is left open whether it is one, and the second pattern holds a
+// duration in either case.
+macro_rules! duration_time {
+    ($t:literal, $h:literal, $m:literal, $s:literal) => {
+        concat!(
+            $t,
+            "(?:[0-9]+",
+            $h,
+            "(?:[0-9]+",
+            $m,
+            "(?:[0-9]+",
+            $s,
+            ")?)?",
+            "|[0-9]+",
+            $m,
+            "(?:[0-9]+",
+            $s,
+            ")?",
+            "|[0-9]+",
+            $s,
+            ")"
+        )
+    };
+}
+macro_rules! duration {
+    ($p:literal, $y:literal, $m:literal, $w:literal, $d:literal, $t:literal, $h:literal, $s:literal) => {
+        concat!(
+            $p,
+            "(?:",
+            "(?:[0-9]+",
+            $d,
+            "|[0-9]+",
+            $m,
+            "(?:[0-9]+",
+            $d,
+            ")?",
+            "|[0-9]+",
+            $y,
+            "(?:[0-9]+",
+            $m,
+            "(?:[0-9]+",
+            $d,
+            ")?)?)",
+            "(?:",
+            duration_time!($t, $h, $m, $s),
+            ")?",
+            "|",
+            duration_time!($t, $h, $m, $s),
+            "|[0-9]+",
+            $w,
+            ")"
+        )
+    };
+}
+const DURATION: &str = whole!(duration!("P", "Y", "M", "W", "D", "T", "H", "S"));
+const DURATION_IN_EITHER_CASE: &str = whole!(duration!(
+    "[Pp]", "[Yy]", "[Mm]", "[Ww]", "[Dd]", "[Tt]", "[Hh]", "[Ss]"
+));
 
 // RFC 4122, section 3.
 const UUID: &str =
     whole!("[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}");
 
-// RFC 2673, section 3.2: four numbers up to 255, none with a zero before it.
+// RFC 2673, section 3.2: four numbers up to 255, none with a zero before it. That is also
+// what RFC 3986 takes for an address inside an IPv6 address and inside a URI.
+//
+// The grammar of RFC 2673 gives a number one to three digits, so by the letter `01.2.3.4`
+// is an address too. Validators do not take a number with a zero before it, which some
+// programs read as octal. So of an address with such a number it is left open whether it is
+// one, and the second pattern holds four numbers up to 255 of one to three digits each.
 macro_rules! ipv4 {
     () => {
         r"(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])"
     };
 }
 const IPV4: &str = whole!(ipv4!());
+const IPV4_WITH_ZEROS_BEFORE_A_NUMBER: &str = whole!(
+    r"(?:(?:25[0-5]|2[0-4][0-9]|[01][0-9]{2}|[0-9]{1,2})\.){3}",
+    "(?:25[0-5]|2[0-4][0-9]|[01][0-9]{2}|[0-9]{1,2})"
+);
 
 // RFC 4291, section 2.2, as RFC 3986 writes it out in `IPv6address`: eight groups, of which
 // `::` stands for one or more, and the last two may be an IPv4 address.
@@ -296,7 +367,6 @@ mod tests {
         let is_open = |string: &str| open.as_ref().is_some_and(|open| open.is_match(string));
         for string in valid {
             assert!(accepted.is_match(string), "{format} accepts {string:?}");
-            assert!(!is_open(string), "{format} is sure of {string:?}");
         }
         for string in invalid {
             assert!(!accepted.is_match(string), "{format} rejects {string:?}");
@@ -521,15 +591,28 @@ mod tests {
                 "P1Y3D",
                 "PT1H3S",
                 "P\u{9e8}Y",
-                "p1d",
                 "P1.5D",
                 "P-1D",
                 "1D",
                 "P1D ",
                 "P1M1M",
                 "PT1S1S",
+                "p1y2w",
+                "pt",
+                "P1d2h",
+                "P1\u{17f}",
+                "P1\u{212a}",
             ],
         );
+        // By the letter of the grammar a small letter is as good as a capital one, and
+        // validators do not take it. The letters of other alphabets that are a small `s`
+        // or a `k` to some are neither.
+        leaves_open(
+            "duration",
+            &["p1d", "pt0s", "P1dT2h", "p4y", "P1Y2m3dT4h5M6s", "P2w"],
+        );
+        let either = regex::Regex::new(DURATION_IN_EITHER_CASE).unwrap();
+        assert!(either.is_match("P1Y2M3DT4H5M6S"));
     }
 
     #[test]
@@ -576,18 +659,35 @@ mod tests {
                 "127.0",
                 "0x7f000001",
                 "2130706433",
-                "087.10.0.1",
                 "1\u{9e8}7.0.0.1",
                 "1.2.3.",
                 ".1.2.3",
                 "1..2.3",
                 "1.2.3.4 ",
-                "1.2.3.00",
                 "300.1.1.1",
                 "1.2.3.-4",
                 "192.168.1.0/24",
+                "0256.1.1.1",
+                "0001.2.3.4",
+                "1.2.3.0o7",
+                "00.1.1.256",
             ],
         );
+        // By the letter of the grammar a number may have zeros before it, and validators
+        // do not take one that has.
+        leaves_open(
+            "ipv4",
+            &[
+                "087.10.0.1",
+                "1.2.3.00",
+                "01.2.3.4",
+                "001.002.003.004",
+                "000.0.0.0",
+                "255.255.255.099",
+            ],
+        );
+        // Inside an IPv6 address and a URI the number has no zero before it.
+        accepts("ipv6", &["::1.2.3.4"], &["::01.2.3.4"]);
     }
 
     #[test]

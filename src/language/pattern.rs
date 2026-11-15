@@ -171,7 +171,12 @@ impl Nfa {
     }
 
     /// The characters in classes that no set tells apart, and for each set its classes.
-    fn classes(&self) -> (Classes, Vec<Vec<u32>>) {
+    ///
+    /// Each run of characters is of the class of the sets that hold it, and those are
+    /// looked through for each run. With a few sets that costs no step. With many it costs
+    /// one for every eight words of 64 sets, and for a class that is new one more for every
+    /// 64 sets.
+    fn classes(&self, budget: &mut Budget) -> Result<(Classes, Vec<Vec<u32>>), Exhausted> {
         // Where a set begins to hold the characters, and where it ceases to.
         let mut turns: Vec<(Place, usize)> = Vec::new();
         for (set, ranges) in self.sets.iter().enumerate() {
@@ -195,22 +200,28 @@ impl Nfa {
                 holding[set / 64] ^= 1 << (set % 64);
                 turn += 1;
             }
+            budget.charge((holding.len() / 8) as u64)?;
             let next = u32::try_from(ids.len()).expect("fewer than 2^32 classes");
-            let class = *ids.entry(holding.clone()).or_insert_with(|| {
-                for (set, held) in held.iter_mut().enumerate() {
-                    if holding[set / 64] >> (set % 64) & 1 == 1 {
-                        held.push(next);
+            let class = match ids.get(&holding) {
+                Some(class) => *class,
+                None => {
+                    budget.charge((self.sets.len() / 64) as u64)?;
+                    for (set, held) in held.iter_mut().enumerate() {
+                        if holding[set / 64] >> (set % 64) & 1 == 1 {
+                            held.push(next);
+                        }
                     }
+                    ids.insert(holding.clone(), next);
+                    next
                 }
-                next
-            });
+            };
             runs.push((at, class));
             match turns.get(turn) {
                 Some((place, _)) => at = *place,
                 None => break,
             }
         }
-        (Classes::new(runs), held)
+        Ok((Classes::new(runs), held))
     }
 
     /// The states that are reached from some states without a character, which is their
@@ -320,7 +331,7 @@ pub(super) fn dfa(pattern: &Hir, budget: &mut Budget) -> Result<Dfa, Exhausted> 
     let mut nfa = Nfa::default();
     let matched = nfa.add(State::Match, budget)?;
     let first = nfa.build(pattern, matched, budget)?;
-    let (classes, held) = nfa.classes();
+    let (classes, held) = nfa.classes(budget)?;
     let (next, accepts) = determinized(&nfa, first, &classes, &held, budget)?;
     Ok(Dfa::canonical(&classes, &next, &accepts))
 }
@@ -587,5 +598,31 @@ mod tests {
         let nested = read("^((a{100}){100}){100}$").unwrap();
         let mut budget = Budget::new(100_000);
         assert_eq!(dfa(&nested, &mut budget), Err(Exhausted));
+    }
+
+    #[test]
+    fn sorting_the_characters_into_classes_costs_steps_where_the_sets_are_many() {
+        // A word of so many characters, all of them different: each is a set of its own.
+        // What it costs to sort the characters into classes, with so many steps to spend.
+        let sorted = |length: u32, steps: u64| {
+            let characters = (0..length).map(|at| char::from_u32(0x1_0000 + at).unwrap());
+            let word: String = characters.collect();
+            let unlimited = &mut Budget::new(u64::MAX);
+            let mut nfa = Nfa::default();
+            let matched = nfa.add(State::Match, unlimited).unwrap();
+            nfa.build(&read(&word).unwrap(), matched, unlimited)
+                .unwrap();
+            let mut budget = Budget::new(steps);
+            let classes = nfa.classes(&mut budget);
+            (classes.map(|(classes, _)| classes.count()), budget.spent())
+        };
+        // With a few sets it costs nothing: a class for each character and one for the rest.
+        assert_eq!(sorted(50, 0), (Ok(51), 0));
+        // With thousands of sets, every run of characters is held against all of them. That
+        // is charged, and before it is done.
+        let (classes, steps) = sorted(4_000, u64::MAX);
+        assert_eq!(classes, Ok(4_001));
+        assert!(steps > 200_000, "{steps}");
+        assert_eq!(sorted(30_000, 100_000), (Err(Exhausted), 100_000));
     }
 }

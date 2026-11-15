@@ -37,7 +37,7 @@ JSON Schema recommends ECMA-262 regular expressions for `pattern` and `patternPr
 
 The dialect changes answers. In ECMA-262, `\d` matches only `0` to `9`; in the `regex` crate it matches every Unicode decimal digit. So `^\d+$` accepts `"٣"` here and `^[0-9]+$` does not subsume it, although the two patterns are equivalent under ECMA-262.
 
-A pattern matches a string when it matches anywhere in it, as the draft says, so `a` accepts `"banana"`. A counterexample that is a string is the shortest there is, such as `"A"` for a string of letters that is not one of lower-case letters.
+A pattern matches a string when it matches anywhere in it, as the draft says, so `a` accepts `"banana"`. A counterexample that is a string is the shortest of the alternative in which the library finds one, such as `"A"` for a string of letters that is not one of lower-case letters. Where a schema has several alternatives, as an `enum` has, a later one may hold a shorter string.
 
 Other dialects may be supported later. For now this is the only one.
 
@@ -46,6 +46,8 @@ Other dialects may be supported later. For now this is the only one.
 `format` is asserted for the formats whose strings are a regular language that can be written down exactly: `date`, `time`, `date-time`, `duration`, `uuid`, `ipv4`, `ipv6`, `uri`, `uri-reference`, `json-pointer` and `relative-json-pointer`. Each follows the grammar of the document that defines it, so a `date` has the days of its month, and February has 29 in a leap year.
 
 A time may have the second 60 only where a leap second was, which no grammar says. So the library leaves open whether a `time` or a `date-time` with the second 60 is one, and a check whose answer depends on such a string returns `Unknown`.
+
+Two more kinds of string are left open, because the grammar that the draft names allows them and validators do not take them: an `ipv4` address in which a number has a zero before it, such as `01.2.3.4`, and a `duration` in lower-case letters, such as `p1d`.
 
 Any other format is an [unsupported construct](#unsupported-constructs).
 

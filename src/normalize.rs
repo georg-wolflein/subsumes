@@ -974,6 +974,37 @@ mod tests {
             counterexample(&json!({"maxLength": 9}), &time),
             json!("00:00:00.0z")
         );
+        // Where the grammar of a format allows what validators do not take, that is left
+        // open too: a number of an address with a zero before it, and a duration in small
+        // letters.
+        let address = json!({"format": "ipv4"});
+        yes(&address, &json!({"enum": ["1.2.3.4", "0.0.0.0", 1]}));
+        assert_eq!(
+            counterexample(&address, &json!({"enum": ["1.2.3.4", "1.2.3.256"]})),
+            json!("1.2.3.256")
+        );
+        assert_eq!(
+            depends_on(&address, &json!({"const": "01.2.3.4"})),
+            (Side::A, "#/format".to_owned())
+        );
+        assert_eq!(
+            depends_on(
+                &json!(false),
+                &json!({"format": "ipv4", "const": "01.2.3.4"})
+            ),
+            (Side::B, "#/format".to_owned())
+        );
+        let duration = json!({"format": "duration"});
+        yes(&duration, &json!({"enum": ["P1D", "PT0S"]}));
+        assert_eq!(
+            depends_on(&duration, &json!({"const": "p1d"})),
+            (Side::A, "#/format".to_owned())
+        );
+        assert_eq!(
+            counterexample(&duration, &json!({"const": "p1"})),
+            json!("p1")
+        );
+        yes(&json!({"pattern": "^[Pp]"}), &duration);
         // A format that is not modelled is a leaf, and so is a pattern that is not.
         let host = json!({"format": "hostname"});
         yes(&host, &host.clone());

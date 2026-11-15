@@ -283,6 +283,9 @@ impl Languages {
                     others: more_others,
                 },
             ) => {
+                // A step for every sixteen words that are looked at, so that a few cost
+                // none.
+                budget.charge(((words.len() + more.len()) / 16) as u64)?;
                 let both: BTreeSet<Box<str>> = match (others, more_others) {
                     (false, false) => words.intersection(more).cloned().collect(),
                     (false, true) => words.difference(more).cloned().collect(),
@@ -431,6 +434,20 @@ impl Languages {
                 places[at] = 0;
             }
         }
+    }
+
+    /// How many words the sets of words hold together, each set counted once.
+    #[cfg(test)]
+    pub fn words_kept(&self) -> usize {
+        let mut sets: Vec<&Words> = Vec::new();
+        for language in &self.languages {
+            if let Language::Words { words, .. } = language
+                && !sets.iter().any(|known| Rc::ptr_eq(known, words))
+            {
+                sets.push(words);
+            }
+        }
+        sets.iter().map(|words| words.len()).sum()
     }
 
     /// A language as text, for tests and for the viewer.

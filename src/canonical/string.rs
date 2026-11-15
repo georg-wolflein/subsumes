@@ -12,6 +12,7 @@
 //! and that is seen without a DFA.
 
 use std::collections::BTreeSet;
+use std::rc::Rc;
 
 use crate::context::{Budget, Exhausted};
 use crate::language::{LanguageId, Languages, Lengths};
@@ -26,7 +27,7 @@ pub(crate) struct Strings {
     /// What those of them leave that were put together so far, and those that were not:
     /// each with whether it is asked against, and whether it is one string.
     left: LanguageId,
-    fresh: Vec<(LanguageId, bool, bool)>,
+    fresh: Vec<(LanguageId, bool, Option<Rc<str>>)>,
     lengths: Lengths,
     /// Whether what was asked leaves no string on the face of it.
     none: bool,
@@ -50,9 +51,9 @@ impl Strings {
     pub fn take(&mut self, term: &Term, negated: bool, languages: &mut Languages) {
         match (term, negated) {
             (Term::StrConst(word), _) => {
-                self.ask(languages.words([word.as_ref()]), negated, true);
+                self.ask(languages.words([word.as_ref()]), negated, Some(word));
             }
-            (Term::Patt(language), _) => self.ask(*language, negated, false),
+            (Term::Patt(language), _) => self.ask(*language, negated, None),
             (Term::MinLen(least), false) => self.lengths.min = self.lengths.min.max(*least),
             // Shorter than the least.
             (Term::MinLen(least), true) => match least.checked_sub(1) {
@@ -71,8 +72,8 @@ impl Strings {
     }
 
     /// Keeps the strings of a language, or with `negated` those that are not of it.
-    /// `one_string` says that the language is one string.
-    fn ask(&mut self, language: LanguageId, negated: bool, one_string: bool) {
+    /// `one_string` is the string of a language that is one string.
+    fn ask(&mut self, language: LanguageId, negated: bool, one_string: Option<&str>) {
         let (asked, against) = if negated {
             (&mut self.without, &self.within)
         } else {
@@ -81,7 +82,8 @@ impl Strings {
         if against.contains(&language) {
             self.none = true;
         } else if asked.insert(language) {
-            self.fresh.push((language, negated, one_string));
+            self.fresh
+                .push((language, negated, one_string.map(Rc::from)));
         }
     }
 
@@ -101,23 +103,38 @@ impl Strings {
         budget: &mut Budget,
     ) -> Result<LanguageId, Exhausted> {
         // What came in since the last time is put together first, and of that the single
-        // strings first. They make one set of words, however many they are, so a DFA
-        // takes them in at once and not one by one.
+        // strings first. Those that are asked against are taken out all at once, as one
+        // set of words however many they are. Taken out one at a time, each would leave a
+        // set of its own with every word before it, which is the square of their number
+        // in words, and a DFA would take them in one by one.
         let mut fresh = Languages::EVERYTHING;
-        for one_string in [true, false] {
-            let of_a_kind = self.fresh.iter().filter(|asked| asked.2 == one_string);
-            for (language, negated, _) in of_a_kind {
-                // Once no string is left, the rest is not worth a DFA.
-                if fresh == Languages::NOTHING {
-                    return Ok(fresh);
-                }
-                let language = if *negated {
-                    languages.complement(*language, budget)?
-                } else {
-                    *language
-                };
-                fresh = languages.intersection(fresh, language, budget)?;
+        let mut taken_out: Vec<&str> = Vec::new();
+        for (language, negated, one_string) in &self.fresh {
+            match one_string {
+                Some(word) if *negated => taken_out.push(word),
+                Some(_) => fresh = languages.intersection(fresh, *language, budget)?,
+                None => {}
             }
+        }
+        if !taken_out.is_empty() {
+            // A step for each word that the set is made of.
+            budget.charge(taken_out.len() as u64)?;
+            let these = languages.words(taken_out);
+            let others = languages.complement(these, budget)?;
+            fresh = languages.intersection(fresh, others, budget)?;
+        }
+        let patterns = self.fresh.iter().filter(|asked| asked.2.is_none());
+        for (language, negated, _) in patterns {
+            // Once no string is left, the rest is not worth a DFA.
+            if fresh == Languages::NOTHING {
+                return Ok(fresh);
+            }
+            let language = if *negated {
+                languages.complement(*language, budget)?
+            } else {
+                *language
+            };
+            fresh = languages.intersection(fresh, language, budget)?;
         }
         languages.intersection(self.left, fresh, budget)
     }
@@ -261,7 +278,37 @@ mod tests {
         let (found, spent) = shortest(&["in ^a+$", "not in ^aa*$"]);
         assert_eq!(found, None);
         assert!(spent > 0);
-        // What only sets of words say costs nothing either.
-        assert_eq!(shortest(&["= a", "!= b", "<= 1"]), (some("a"), 0));
+        // What only sets of words say costs a step for each word that is taken out.
+        assert_eq!(shortest(&["= a", "<= 1"]), (some("a"), 0));
+        assert_eq!(shortest(&["= a", "!= b", "<= 1"]), (some("a"), 1));
+        assert_eq!(shortest(&["!= a", "!= b", "!= c"]), (some(""), 3));
+    }
+
+    #[test]
+    fn many_strings_are_taken_out_as_one_set() {
+        let languages = &mut Languages::default();
+        let mut terms = Terms::default();
+        let mut strings = Strings::default();
+        let count = 2_000;
+        for index in 0..count {
+            let word = terms.str_const(&format!("x{index:04}"));
+            strings.take(terms.term(word), true, languages);
+        }
+        let mut budget = Budget::new(u64::MAX);
+        assert_eq!(strings.is_empty(languages, &mut budget), Ok(false));
+        // A step for each word. Each is kept twice: by itself, and in the one set of all.
+        // Taken out one at a time, the sets on the way would hold two million words.
+        assert_eq!(budget.spent(), count);
+        assert_eq!(languages.words_kept(), 2 * count as usize);
+        assert_eq!(strings.shortest(languages, &mut budget), Ok(some("")));
+        // The budget ends it before the set is made.
+        let mut again = Strings::default();
+        for index in 0..count {
+            let word = terms.str_const(&format!("y{index:04}"));
+            again.take(terms.term(word), true, languages);
+        }
+        let mut budget = Budget::new(count - 1);
+        assert_eq!(again.is_empty(languages, &mut budget), Err(Exhausted));
+        assert_eq!(languages.words_kept(), 3 * count as usize);
     }
 }
