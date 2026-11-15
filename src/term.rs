@@ -171,6 +171,20 @@ pub(crate) enum Term {
     MinProps(u64),
     /// The instance is no object, or an object of at most so many properties.
     MaxProps(u64),
+    /// The instance is no array, or an array whose item at this position, if it has one, is
+    /// a value that the schema of the variable accepts. The first position is 0.
+    Item(u64, VarId),
+    /// The instance is no array, or an array in which every item from this position on is
+    /// a value that the schema of the variable accepts.
+    AddIts(u64, VarId),
+    /// The instance is no array, or an array with an item that the schema of the variable
+    /// accepts.
+    Contains(VarId),
+    /// The instance is no array, or an array of at least so many items, which is more than
+    /// none.
+    MinIts(u64),
+    /// The instance is no array, or an array of at most so many items.
+    MaxIts(u64),
     /// The instance satisfies a predicate that the engine does not model.
     Unknown(LeafId),
     AllOf(Box<[TermId]>),
@@ -364,6 +378,37 @@ impl Terms {
     /// The term for "no object, or an object of at most so many properties".
     pub fn max_props(&mut self, most: u64) -> TermId {
         self.intern(Term::MaxProps(most))
+    }
+
+    /// The term for "no array, or the item at this position, if there is one, satisfies the
+    /// schema of the variable".
+    pub fn item(&mut self, position: u64, variable: VarId) -> TermId {
+        self.intern(Term::Item(position, variable))
+    }
+
+    /// The term for "no array, or every item from this position on satisfies the schema of
+    /// the variable".
+    pub fn add_its(&mut self, from: u64, variable: VarId) -> TermId {
+        self.intern(Term::AddIts(from, variable))
+    }
+
+    /// The term for "no array, or an array with an item that satisfies the schema of the
+    /// variable".
+    pub fn contains(&mut self, variable: VarId) -> TermId {
+        self.intern(Term::Contains(variable))
+    }
+
+    /// The term for "no array, or an array of at least so many items".
+    pub fn min_its(&mut self, least: u64) -> TermId {
+        self.intern(match least {
+            0 => Term::True,
+            _ => Term::MinIts(least),
+        })
+    }
+
+    /// The term for "no array, or an array of at most so many items".
+    pub fn max_its(&mut self, most: u64) -> TermId {
+        self.intern(Term::MaxIts(most))
     }
 
     /// The term of a predicate that the engine does not model. `key` tells it from every
@@ -661,6 +706,23 @@ impl Terms {
                 Term::MaxProps(most) => {
                     write!(text, "maxprops({most})").expect("a string takes any text");
                 }
+                Term::Item(position, variable) => {
+                    write!(text, "item({position}: x{})", variable.0)
+                        .expect("a string takes any text");
+                }
+                Term::AddIts(from, variable) => {
+                    write!(text, "addits({from}: x{})", variable.0)
+                        .expect("a string takes any text");
+                }
+                Term::Contains(variable) => {
+                    write!(text, "contains(x{})", variable.0).expect("a string takes any text");
+                }
+                Term::MinIts(least) => {
+                    write!(text, "minits({least})").expect("a string takes any text");
+                }
+                Term::MaxIts(most) => {
+                    write!(text, "maxits({most})").expect("a string takes any text");
+                }
                 Term::Unknown(leaf) => {
                     write!(text, "?[{}]", self.leaf(*leaf).key).expect("a string takes any text");
                 }
@@ -883,6 +945,26 @@ mod tests {
         // What is asked of no name, and at least no property, is asked of nothing.
         assert_eq!(terms.p_prop(Languages::NOTHING, variable), terms.truth());
         assert_eq!(terms.min_props(0), terms.truth());
+    }
+
+    #[test]
+    fn a_term_about_arrays_is_written_with_its_position() {
+        let mut terms = Terms::default();
+        let variable = terms.new_variable(NodeId::new(0));
+        let all = [
+            terms.item(1, variable),
+            terms.add_its(2, variable),
+            terms.contains(variable),
+            terms.min_its(2),
+            terms.max_its(3),
+        ];
+        let all = terms.all_of(all);
+        assert_eq!(
+            terms.show(all),
+            "all(item(1: x0), addits(2: x0), contains(x0), minits(2), maxits(3))"
+        );
+        // At least no item is asked of nothing.
+        assert_eq!(terms.min_its(0), terms.truth());
     }
 
     #[test]

@@ -13,11 +13,11 @@
 //! - `Yes` exactly when every kind that B accepts, A accepts.
 //! - `No` only with an instance of which every kind is accepted by B and not by A.
 //! - `Unknown` only when some kind is accepted by B and not by A, and no instance that
-//!   holds no array is.
+//!   no leaf is about is.
 //!
-//! The only leaves here are about arrays. An instance that holds no array is of one kind
-//! only, and of an array the empty one stands for all, with every way of answering the
-//! leaves.
+//! The only leaves here are about arrays: `uniqueItems`, and a `contains` that counts its
+//! items. An instance of which no leaf is asked is of one kind only. Of any other, every
+//! array answers a leaf alike, in every way that the leaves can be answered.
 //!
 //! # Numbers
 //!
@@ -64,6 +64,16 @@
 //! that the engine gives is evaluated as it is, and neither does an `Unknown`, since the
 //! schemas for values hold no leaf.
 //!
+//! # Arrays
+//!
+//! The evaluator looks at the items that an array has: how many there are, and whether the
+//! schema of a position, of every position after those, or of `contains` accepts an item,
+//! which it asks itself. A constant that is an array or an object is the value that is
+//! equal to it, with a number for the number that it is. The arrays that are listed have up
+//! to three items of a few values, with an array and an object among them. As with objects
+//! that is not one of every kind, and a `Yes` is held against fewer arrays than it could
+//! be. The schemas for items hold no leaf either.
+//!
 //! # Schemas that refer to themselves
 //!
 //! A definition that refers to itself, or to one that refers back, accepts what it can be
@@ -94,6 +104,9 @@ use crate::{Checker, Reason, Verdict};
 struct Leaves<'l> {
     satisfies: &'l BTreeMap<String, bool>,
     asked: &'l RefCell<Vec<String>>,
+    /// Every leaf that was asked of an array, with an answer or without, in the order in
+    /// which they were asked.
+    looked: &'l RefCell<Vec<String>>,
 }
 
 impl Leaves<'_> {
@@ -102,6 +115,7 @@ impl Leaves<'_> {
         if !value.is_array() {
             return true;
         }
+        self.looked.borrow_mut().push(key.clone());
         let answer = self.satisfies.get(&key).copied();
         answer.unwrap_or_else(|| {
             self.asked.borrow_mut().push(key);
@@ -131,6 +145,10 @@ enum Which {
 /// What the definitions surely accept of a value, and what they possibly accept.
 type Both<'d> = Rc<(Definitions<'d>, Definitions<'d>)>;
 
+/// A value as text, with the answer to each leaf that is asked of it, or none where a leaf
+/// has no answer.
+type Answered = (String, Vec<Option<bool>>);
+
 /// A schema with its definitions, by the fragment that a reference to each holds.
 struct Document<'d> {
     schema: &'d Value,
@@ -138,9 +156,13 @@ struct Document<'d> {
     /// Whether no definition refers to one. Then a reference is read by reading the
     /// definition where the reference stands, and nothing is read until it stands still.
     without_cycles: bool,
-    /// What the definitions accept of the values that were looked at and hold no array,
-    /// by the value as text. Of a value that holds one, that depends on the leaves.
-    known: RefCell<HashMap<String, Both<'d>>>,
+    /// The leaves that are asked of each value that was looked at, by the value as text.
+    /// They are the same however they are answered, since every part of a schema is looked
+    /// at.
+    leaves_of: RefCell<HashMap<String, Rc<[String]>>>,
+    /// What the definitions accept of each such value, by the value and the answers to
+    /// those leaves.
+    known: RefCell<HashMap<Answered, Both<'d>>>,
 }
 
 fn type_of(value: &Value) -> &'static str {
@@ -154,23 +176,22 @@ fn type_of(value: &Value) -> &'static str {
     }
 }
 
-/// Whether a value is this constant, which is no array and no object.
+/// Whether a value is this constant. A number is the number that it stands for, also
+/// inside an array or an object.
 fn is(value: &Value, constant: &Value) -> bool {
     match (value, constant) {
         (Value::Number(value), Value::Number(constant)) => value.as_f64() == constant.as_f64(),
-        (_, Value::Array(_) | Value::Object(_)) => {
-            panic!("no schema here has the constant {constant}")
+        (Value::Array(items), Value::Array(constants)) => {
+            let pairs = items.iter().zip(constants);
+            items.len() == constants.len() && pairs.fold(true, |all, (a, b)| all & is(a, b))
+        }
+        (Value::Object(members), Value::Object(constants)) => {
+            let same = |(name, member): (&String, &Value)| {
+                constants.get(name).is_some_and(|other| is(member, other))
+            };
+            members.len() == constants.len() && members.iter().all(same)
         }
         _ => value == constant,
-    }
-}
-
-/// Whether a value is an array or holds one.
-fn holds_an_array(value: &Value) -> bool {
-    match value {
-        Value::Array(_) => true,
-        Value::Object(members) => members.values().any(holds_an_array),
-        _ => false,
     }
 }
 
@@ -186,6 +207,7 @@ impl<'d> Document<'d> {
             schema,
             without_cycles: !definitions.iter().any(refers),
             definitions,
+            leaves_of: RefCell::default(),
             known: RefCell::default(),
         }
     }
@@ -250,6 +272,7 @@ impl<'d> Document<'d> {
         let number = |holds: &dyn Fn(f64) -> bool| value.as_f64().is_none_or(holds);
         let string = |holds: &dyn Fn(&str) -> bool| value.as_str().is_none_or(holds);
         let members = value.as_object();
+        let items = value.as_array();
         let has = |name: &str| members.is_none_or(|members| members.contains_key(name));
         let named = |names: &Value| -> Vec<bool> {
             let names = names.as_array().unwrap().iter();
@@ -327,7 +350,37 @@ impl<'d> Document<'d> {
                 "exclusiveMaximum" => number(&|number| number < at(held)),
                 "multipleOf" => number(&|number| (number / at(held)).fract() == 0.0),
                 "uniqueItems" => held == &json!(false) || leaves.hold(value, keyword.clone()),
-                "minItems" => leaves.hold(value, format!("{keyword} {held}")),
+                "minItems" => items.is_none_or(|items| items.len() >= count(held)),
+                "maxItems" => items.is_none_or(|items| items.len() <= count(held)),
+                "prefixItems" => {
+                    let schemas = held.as_array().unwrap().iter();
+                    let there = items.into_iter().flatten();
+                    all(&mut there
+                        .zip(schemas)
+                        .map(|(item, schema)| inside(item, schema)))
+                }
+                // The items after those that `prefixItems` names.
+                "items" => {
+                    let named = keywords.get("prefixItems").and_then(Value::as_array);
+                    let after = items.into_iter().flatten().skip(named.map_or(0, Vec::len));
+                    all(&mut after.map(|item| inside(item, held)))
+                }
+                "contains" => {
+                    let bound = |name: &str| keywords.get(name).map(count);
+                    match (bound("minContains"), bound("maxContains")) {
+                        (None | Some(1), None) => {
+                            let there = items.into_iter().flatten();
+                            let any = there.fold(false, |any, item| any | inside(item, held));
+                            items.is_none() || any
+                        }
+                        (Some(0), None) => true,
+                        // How many items there are to be is one leaf with the schema.
+                        (least, most) => {
+                            leaves.hold(value, format!("contains {held} {least:?} {most:?}"))
+                        }
+                    }
+                }
+                "minContains" | "maxContains" => true,
                 "required" => all(&mut named(held).into_iter()),
                 "minProperties" => members.is_none_or(|members| members.len() >= count(held)),
                 "maxProperties" => members.is_none_or(|members| members.len() <= count(held)),
@@ -411,13 +464,31 @@ impl<'d> Document<'d> {
     /// What the definitions surely accept of a value, and what they possibly accept. For
     /// the values inside the value that is asked again, and found as it was left.
     fn definitions(&self, value: &Value, leaves: &Leaves) -> Both<'d> {
-        let text = (!holds_an_array(value)).then(|| value.to_string());
-        if let Some(known) = text
-            .as_ref()
-            .and_then(|text| self.known.borrow().get(text).cloned())
-        {
-            return known;
+        let text = value.to_string();
+        let answered = |asked: &[String]| -> Vec<Option<bool>> {
+            let answer = |leaf: &String| leaves.satisfies.get(leaf).copied();
+            asked.iter().map(answer).collect()
+        };
+        let asked = self.leaves_of.borrow().get(&text).cloned();
+        if let Some(asked) = asked {
+            let answers = answered(&asked);
+            let known = self
+                .known
+                .borrow()
+                .get(&(text.clone(), answers.clone()))
+                .cloned();
+            if let Some(known) = known {
+                // As if the leaves had been asked again.
+                for (leaf, answer) in asked.iter().zip(answers) {
+                    leaves.looked.borrow_mut().push(leaf.clone());
+                    if answer.is_none() {
+                        leaves.asked.borrow_mut().push(leaf.clone());
+                    }
+                }
+                return known;
+            }
         }
+        let looked = leaves.looked.borrow().len();
         let mut surely = self.accepting_nothing();
         let possibly = loop {
             let possibly = self.read_out(value, Which::Possibly, &surely, leaves);
@@ -428,9 +499,16 @@ impl<'d> Document<'d> {
             surely = next;
         };
         let both = Rc::new((surely, possibly));
-        if let Some(text) = text {
-            self.known.borrow_mut().insert(text, Rc::clone(&both));
-        }
+        let mut asked = leaves.looked.borrow()[looked..].to_vec();
+        asked.sort();
+        asked.dedup();
+        let answers = answered(&asked);
+        self.leaves_of
+            .borrow_mut()
+            .insert(text.clone(), asked.into());
+        self.known
+            .borrow_mut()
+            .insert((text, answers), Rc::clone(&both));
         both
     }
 
@@ -509,17 +587,23 @@ fn objects(names: &[&str], values: &[Value]) -> Vec<Value> {
 }
 
 /// What is no object, with both booleans, a number of every kind and a string of every
-/// kind, and the empty array for all arrays.
+/// kind, and an array without an item and one with an item.
 fn plain_instances() -> Vec<Value> {
     let numbers = QUARTERS.map(|quarters| json!(f64::from(quarters) / 4.0));
     let strings = strings().into_iter().map(Value::String);
-    let others = [json!(null), json!(true), json!(false), json!([])];
+    let others = [
+        json!(null),
+        json!(true),
+        json!(false),
+        json!([]),
+        json!([null]),
+    ];
     others.into_iter().chain(numbers).chain(strings).collect()
 }
 
 /// What holds for an instance, with every way of answering the leaves about it.
 struct Found {
-    /// The instance holds no array, so that no leaf is about it.
+    /// No leaf is asked of the instance.
     exact: bool,
     /// Some kind is surely accepted by B and not possibly by A.
     some_tells_apart: bool,
@@ -535,6 +619,7 @@ fn found(a: &Document, b: &Document, instance: &Value) -> Found {
         let leaves = Leaves {
             satisfies,
             asked: &asked,
+            looked: &RefCell::default(),
         };
         let (_, a_possibly) = a.accepted(instance, &leaves);
         let (b_surely, _) = b.accepted(instance, &leaves);
@@ -543,7 +628,7 @@ fn found(a: &Document, b: &Document, instance: &Value) -> Found {
     // The first look finds the leaves that there are to answer. Without any, as for every
     // instance that holds no array, it is the answer.
     let (tells_apart, mut leaves) = ask(&BTreeMap::new());
-    let exact = !holds_an_array(instance);
+    let exact = leaves.is_empty();
     if leaves.is_empty() {
         return Found {
             exact,
@@ -588,6 +673,8 @@ struct Shape {
     /// Whether most of what the schemas say is about objects and about the values of
     /// their properties.
     of_objects: bool,
+    /// Whether most of it is about arrays and about their items, with objects among them.
+    of_arrays: bool,
 }
 
 /// Schemas that refer to `d` only, so that none refers to itself.
@@ -595,6 +682,7 @@ const WITHOUT_CYCLES: Shape = Shape {
     definitions: &[],
     never_negated: false,
     of_objects: false,
+    of_arrays: false,
 };
 
 /// A reference to one of the definitions of the shape.
@@ -603,15 +691,29 @@ fn reference(random: &mut Random, shape: Shape) -> Value {
     json!({"$ref": format!("#/$defs/{name}")})
 }
 
-/// A schema for the value of a property. It holds no leaf: what it asks of an array, every
-/// array answers alike. Where the shape has definitions, it is often a reference to one,
-/// which makes a cycle through the property.
+/// A schema for the value of a property or for an item. It holds no leaf. Where the shape
+/// has definitions, it is often a reference to one, which makes a cycle through the
+/// property or the item.
 fn for_a_value(random: &mut Random, depth: usize, shape: Shape) -> Value {
     if !shape.definitions.is_empty() && random.chance(50) {
         return reference(random, shape);
     }
     if depth > 0 && random.chance(30) {
+        // Among arrays, an array more often than an object.
+        if shape.of_arrays && random.chance(60) {
+            return about_arrays(random, depth - 1, shape, false);
+        }
         return about_objects(random, depth - 1, shape);
+    }
+    if shape.of_arrays && random.chance(25) {
+        let of_arrays = [
+            json!({"minItems": 1}),
+            json!({"maxItems": 0}),
+            json!({"const": []}),
+            json!({"const": [null]}),
+            json!({"items": {"type": "null"}}),
+        ];
+        return of_arrays[random.below(of_arrays.len())].clone();
     }
     let plain = [
         json!(true),
@@ -673,15 +775,63 @@ fn about_objects(random: &mut Random, depth: usize, shape: Shape) -> Value {
     }
 }
 
+/// A schema that says something of arrays, with schemas for the items. With `leaves` it may
+/// be one that the engine does not model.
+fn about_arrays(random: &mut Random, depth: usize, shape: Shape, leaves: bool) -> Value {
+    let of = |random: &mut Random| for_a_value(random, depth, shape);
+    match random.below(if leaves { 23 } else { 19 }) {
+        0 | 1 => json!({"items": of(random)}),
+        2 => json!({"prefixItems": [of(random)]}),
+        3 => json!({"prefixItems": [of(random), of(random)]}),
+        4 => json!({"prefixItems": [of(random)], "items": of(random)}),
+        5 | 6 => json!({"contains": of(random)}),
+        7 => json!({"minItems": 1 + random.below(2)}),
+        8 => json!({"maxItems": random.below(3)}),
+        9 => json!({"type": "array"}),
+        10 => json!({"type": "array", "items": of(random), "minItems": 1}),
+        11 => json!({"contains": of(random), "maxItems": 1}),
+        12 => {
+            let values = [
+                json!([]),
+                json!([null]),
+                json!([1, "a"]),
+                json!([[]]),
+                json!([{"a": null}]),
+            ];
+            json!({"const": values[random.below(values.len())]})
+        }
+        13 => json!({"enum": [[], [1.0], [1, 1], {"a": [null]}]}),
+        14 => json!({"minItems": 2, "maxItems": 2}),
+        15 => json!({"type": ["array", "null"]}),
+        16 => json!({"prefixItems": [of(random)], "items": false}),
+        17 => json!({"contains": of(random), "minContains": random.below(2)}),
+        18 => json!({"type": "array", "prefixItems": [of(random)], "minItems": 2}),
+        19 | 20 => json!({"uniqueItems": true}),
+        21 => json!({"contains": {"type": "null"}, "maxContains": 1 + random.below(2)}),
+        _ => json!({
+            "contains": {"type": "null"},
+            "minContains": random.below(3),
+            "maxContains": 2,
+        }),
+    }
+}
+
 /// A schema without a schema below it that is asked of the same instance. More often than
 /// not it is a reference to one of the definitions of the shape, so that cycles are common.
 fn plain(random: &mut Random, shape: Shape) -> Value {
-    let often = if shape.of_objects { 25 } else { 60 };
+    let often = if shape.of_objects || shape.of_arrays {
+        25
+    } else {
+        60
+    };
     if !shape.definitions.is_empty() && random.chance(often) {
         return reference(random, shape);
     }
     if shape.of_objects && random.chance(75) {
         return about_objects(random, 1, shape);
+    }
+    if shape.of_arrays && random.chance(75) {
+        return about_arrays(random, 1, shape, true);
     }
     let plain = [
         json!(true),
@@ -778,7 +928,16 @@ fn schema(random: &mut Random, depth: usize, shape: Shape) -> Value {
             ("additionalProperties", json!({"type": "null"})),
             ("propertyNames", json!({"pattern": "^a"})),
         ];
-        let beside = if shape.of_objects {
+        let about_arrays = [
+            ("type", json!("array")),
+            ("minItems", json!(1)),
+            ("maxItems", json!(2)),
+            ("items", json!({"type": "null"})),
+            ("uniqueItems", json!(true)),
+        ];
+        let beside = if shape.of_arrays {
+            about_arrays
+        } else if shape.of_objects {
             about_objects
         } else {
             beside
@@ -819,21 +978,36 @@ fn document(mut schema: Value, definitions: &Value) -> Value {
 struct Tally {
     yes: usize,
     no: usize,
-    /// The checks that ended in `No` with a number, those with a string, and those with
-    /// an object that has a property.
+    /// The checks that ended in `No` with a number, those with a string, those with an
+    /// object that has a property, and those with an array that has an item.
     numbers: usize,
     strings: usize,
     objects: usize,
+    arrays: usize,
     unknown: usize,
     /// The checks that ended in `Unknown` although there was an instance to give.
     missed: usize,
 }
 
+/// How far an `Unknown` of the engine is held against the evaluator.
+#[derive(Clone, Copy, PartialEq)]
+enum Unknown {
+    /// Some kind tells the two schemas apart, and no instance that no leaf is about does.
+    /// That is for instances that hold one of every kind, and schemas of which none refers
+    /// to itself.
+    Exact,
+    /// Only the second of the two, for instances that do not hold one of every kind: a
+    /// kind that tells the schemas apart may be one that is not listed.
+    Found,
+    /// Neither. The negation of a schema that refers to itself is a leaf to the engine,
+    /// and so the engine may miss an instance that the evaluator sees.
+    Any,
+}
+
 impl Tally {
     /// Holds the verdict of the engine against the evaluator, which looks at these
-    /// instances. `complete` says that the engine has to see everything that the evaluator
-    /// sees, which it does where no schema refers to itself.
-    fn compare(&mut self, a: &Value, b: &Value, instances: &[Value], complete: bool) {
+    /// instances.
+    fn compare(&mut self, a: &Value, b: &Value, instances: &[Value], unknown: Unknown) {
         let names = ["d", "e", "f"].into_iter();
         let fragments = names.map(|name| (name.to_owned(), format!("/$defs/{name}")));
         let fragments = fragments.collect();
@@ -862,12 +1036,14 @@ impl Tally {
                 self.strings += usize::from(counterexample.is_string());
                 let members = counterexample.as_object();
                 self.objects += usize::from(members.is_some_and(|members| !members.is_empty()));
+                let items = counterexample.as_array();
+                self.arrays += usize::from(items.is_some_and(|items| !items.is_empty()));
             }
             Verdict::Unknown {
                 reason: Reason::Unsupported { .. },
             } => {
-                assert!(!complete || !subsumed, "{context}");
-                assert!(!complete || !one_tells_apart, "{context}");
+                assert!(unknown != Unknown::Exact || !subsumed, "{context}");
+                assert!(unknown == Unknown::Any || !one_tells_apart, "{context}");
                 self.unknown += 1;
                 // There was an instance to give, and the engine did not find a branch for it.
                 self.missed += usize::from(found.iter().any(|found| found.all_tell_apart));
@@ -885,12 +1061,13 @@ impl std::fmt::Display for Tally {
             numbers,
             strings,
             objects,
+            arrays,
             unknown,
             missed,
         } = self;
         write!(
             f,
-            "{yes} Yes, {no} No, {numbers} of them with a number, {strings} with a string and {objects} with an object that has a property, {unknown} Unknown, {missed} of them with an instance to give"
+            "{yes} Yes, {no} No, {numbers} of them with a number, {strings} with a string, {objects} with an object that has a property and {arrays} with an array that has an item, {unknown} Unknown, {missed} of them with an instance to give"
         )
     }
 }
@@ -920,6 +1097,54 @@ fn mostly_objects() -> Vec<Value> {
     let mut instances = vec![json!(null), json!(0), json!("ab"), json!([])];
     instances.extend(values.iter().cloned());
     instances.extend(objects(&["a", "b", "ab", "c"], &values));
+    instances
+}
+
+/// The arrays of up to so many of these values.
+fn arrays(most: usize, values: &[Value]) -> Vec<Value> {
+    let mut arrays = vec![Vec::new()];
+    let mut from = 0;
+    for _ in 0..most {
+        let end = arrays.len();
+        for at in from..end {
+            for value in values {
+                let mut longer = arrays[at].clone();
+                longer.push(value.clone());
+                arrays.push(longer);
+            }
+        }
+        from = end;
+    }
+    arrays.into_iter().map(Value::Array).collect()
+}
+
+/// The instances for schemas that are mostly about arrays: a few that are no arrays, and
+/// the arrays of up to three of a few values, with an array and an object among them.
+fn mostly_arrays() -> Vec<Value> {
+    let values = [
+        json!(null),
+        json!(1),
+        json!("a"),
+        json!([]),
+        json!([null]),
+        json!({}),
+        json!({"a": null}),
+    ];
+    let mut instances = vec![
+        json!(null),
+        json!(0),
+        json!("ab"),
+        json!({}),
+        json!({"a": []}),
+        json!({"a": [null]}),
+        json!({"a": null, "b": [1]}),
+        json!([[1]]),
+        json!([[1, "a"]]),
+        json!([[[]]]),
+        json!([{"a": [null]}]),
+        json!([1, 1, 1, 1]),
+    ];
+    instances.extend(arrays(3, &values));
     instances
 }
 
@@ -967,7 +1192,7 @@ fn the_engine_agrees_with_every_instance_there_could_be() {
             _ => document(b, &of_b),
         };
         let a = document(a, &of_a);
-        tally.compare(&a, &b, &instances, true);
+        tally.compare(&a, &b, &instances, Unknown::Exact);
     }
     println!("{tally}");
     let Tally {
@@ -996,6 +1221,7 @@ fn the_engine_agrees_on_schemas_that_refer_to_themselves() {
             definitions: &["e", "f"],
             never_negated: pair % 2 == 0,
             of_objects: false,
+            of_arrays: false,
         };
         let (a, b) = (schema(random, 2, shape), schema(random, 2, shape));
         let of_a = definitions(random, shape);
@@ -1010,7 +1236,7 @@ fn the_engine_agrees_on_schemas_that_refer_to_themselves() {
         };
         let a = document(a, &of_a);
         // The negation of a cycle is a leaf to the engine, and the evaluator knows it.
-        tally.compare(&a, &b, &instances, false);
+        tally.compare(&a, &b, &instances, Unknown::Any);
     }
     println!("{tally}");
     let Tally {
@@ -1034,6 +1260,7 @@ fn the_engine_agrees_on_objects() {
         definitions: &[],
         never_negated: false,
         of_objects: true,
+        of_arrays: false,
     };
     let instances = mostly_objects();
     let mut tally = Tally::default();
@@ -1046,7 +1273,7 @@ fn the_engine_agrees_on_objects() {
             _ => document(b, &of_b),
         };
         let a = document(a, &of_a);
-        tally.compare(&a, &b, &instances, true);
+        tally.compare(&a, &b, &instances, Unknown::Exact);
     }
     println!("{tally}");
     let Tally {
@@ -1065,6 +1292,7 @@ fn the_engine_agrees_on_patterns_of_one_word() {
         definitions: &[],
         never_negated: false,
         of_objects: true,
+        of_arrays: false,
     };
     // Every string of up to three letters as well, since a pattern is asked of strings too.
     let mut instances = mostly_objects();
@@ -1081,7 +1309,7 @@ fn the_engine_agrees_on_patterns_of_one_word() {
         let mut a = document(a, &of_a);
         with_patterns_of_one_word(&mut a);
         with_patterns_of_one_word(&mut b);
-        tally.compare(&a, &b, &instances, true);
+        tally.compare(&a, &b, &instances, Unknown::Exact);
     }
     println!("{tally}");
     let Tally {
@@ -1091,6 +1319,83 @@ fn the_engine_agrees_on_patterns_of_one_word() {
         yes > 150 && no > 300 && objects > 200,
         "{yes} {no} {objects}"
     );
+}
+
+#[test]
+fn the_engine_agrees_on_arrays() {
+    let random = &mut Random(5);
+    let shape = Shape {
+        definitions: &[],
+        never_negated: false,
+        of_objects: false,
+        of_arrays: true,
+    };
+    let instances = mostly_arrays();
+    let mut tally = Tally::default();
+    for pair in 0..1_500 {
+        let (a, b) = (schema(random, 2, shape), schema(random, 2, shape));
+        let (of_a, of_b) = (definitions(random, shape), definitions(random, shape));
+        let b = match pair % 4 {
+            0 => document(json!({"allOf": [a, b]}), &of_a),
+            1 => document(json!({"anyOf": [a, b]}), &of_a),
+            _ => document(b, &of_b),
+        };
+        let a = document(a, &of_a);
+        tally.compare(&a, &b, &instances, Unknown::Found);
+    }
+    println!("{tally}");
+    let Tally {
+        yes,
+        no,
+        arrays,
+        unknown,
+        ..
+    } = tally;
+    assert!(
+        yes > 200 && no > 500 && arrays > 150 && unknown > 10,
+        "{yes} {no} {arrays} {unknown}"
+    );
+}
+
+#[test]
+fn the_engine_agrees_on_schemas_that_hold_themselves_in_an_item() {
+    let random = &mut Random(6);
+    // Arrays in arrays, three deep.
+    let plain = [json!(null), json!(1)];
+    let mut inner = plain.to_vec();
+    inner.extend(arrays(2, &plain));
+    let mut instances = vec![json!("a"), json!({}), json!({"a": [null]})];
+    instances.extend(inner.iter().cloned());
+    let deeper = arrays(2, &inner);
+    let deepest = deeper
+        .iter()
+        .filter(|array| array.as_array().unwrap().len() < 2);
+    let deepest: Vec<Value> = deepest.map(|array| json!([array])).collect();
+    instances.extend(deeper);
+    instances.extend(deepest);
+    let mut tally = Tally::default();
+    for pair in 0..700 {
+        let shape = Shape {
+            definitions: &["e", "f"],
+            never_negated: pair % 2 == 0,
+            of_objects: false,
+            of_arrays: true,
+        };
+        let (a, b) = (schema(random, 2, shape), schema(random, 2, shape));
+        let of_a = definitions(random, shape);
+        let b = match pair % 3 {
+            0 => document(json!({"allOf": [a, b]}), &of_a),
+            1 => document(json!({"anyOf": [a, b]}), &of_a),
+            _ => document(b, &definitions(random, shape)),
+        };
+        let a = document(a, &of_a);
+        tally.compare(&a, &b, &instances, Unknown::Any);
+    }
+    println!("{tally}");
+    let Tally {
+        yes, no, arrays, ..
+    } = tally;
+    assert!(yes > 150 && no > 150 && arrays > 50, "{yes} {no} {arrays}");
 }
 
 #[test]
@@ -1115,6 +1420,7 @@ fn the_engine_agrees_on_schemas_that_hold_themselves_in_a_property() {
             definitions: &["e", "f"],
             never_negated: pair % 2 == 0,
             of_objects: true,
+            of_arrays: false,
         };
         let (a, b) = (schema(random, 2, shape), schema(random, 2, shape));
         let of_a = definitions(random, shape);
@@ -1124,7 +1430,7 @@ fn the_engine_agrees_on_schemas_that_hold_themselves_in_a_property() {
             _ => document(b, &definitions(random, shape)),
         };
         let a = document(a, &of_a);
-        tally.compare(&a, &b, &instances, false);
+        tally.compare(&a, &b, &instances, Unknown::Any);
     }
     println!("{tally}");
     let Tally {

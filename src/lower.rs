@@ -4,16 +4,21 @@
 //! a variable, and the term of the variable says what its keywords say. Schemas that say the
 //! same share a variable, also between A and B.
 //!
-//! The engine models the types, `null`, the booleans, numbers, strings, objects, the
+//! The engine models the types, `null`, the booleans, numbers, strings, objects, arrays, the
 //! connectives and references. Every other keyword becomes a predicate that it does not
 //! model, a leaf, which keeps the place where it stands. A leaf says something only about
-//! the instances its keyword is about: `minItems` about arrays, and so a number satisfies
-//! it. The terms about numbers, about strings and about objects are the same in that: a
-//! string satisfies `minimum`, and a number satisfies `minLength` and `required`.
+//! the instances its keyword is about: `uniqueItems` about arrays, and so a number
+//! satisfies it. The terms about numbers, about strings, about objects and about arrays
+//! are the same in that: a string satisfies `minimum`, and a number satisfies `minLength`,
+//! `required` and `minItems`.
 //!
-//! A schema that is the value of a property is not reached in place: it is asked of a
-//! value inside the instance. It has a variable too, which the term about the property
-//! names.
+//! A schema that is the value of a property or an item of an array is not reached in
+//! place: it is asked of a value inside the instance. It has a variable too, which the
+//! term about the property or the item names.
+//!
+//! A constant that is an array or an object is taken apart in the same way: the term says
+//! how many items or which properties there are, and names a variable for each value
+//! inside, whose term is that the instance is that value.
 
 mod classes;
 
@@ -24,6 +29,7 @@ use serde_json::Value;
 use self::classes::written;
 use crate::context::{Context, Exhausted};
 use crate::formats;
+use crate::normalize::DEEPEST;
 use crate::rational::{Rational, exact};
 use crate::schema::{Count, Graph, Keywords, NodeId, Schema, Type};
 use crate::term::{InstanceType, TermId, TypeSet, VarId};
@@ -40,6 +46,7 @@ pub(crate) fn lower(graph: &Graph, context: &mut Context) -> Result<(VarId, VarI
         classes: &classes,
         context,
         variables: HashMap::new(),
+        constants: HashMap::new(),
         pending: VecDeque::new(),
     };
     let a = lowering.variable(graph.a);
@@ -91,6 +98,9 @@ struct Lowering<'g, 'c> {
     context: &'c mut Context,
     /// The variable of each class that has one.
     variables: HashMap<u32, VarId>,
+    /// The variable of each value inside a constant, by the term that says "the instance
+    /// is this value".
+    constants: HashMap<TermId, VarId>,
     /// The variables that have no term yet, in the order in which they were made.
     pending: VecDeque<VarId>,
 }
@@ -263,21 +273,73 @@ impl Lowering<'_, '_> {
         }
     }
 
-    /// The term for "the instance is this value". `null`, the booleans, the numbers and the
-    /// strings are terms of the engine; an array or an object is of one type and a leaf over
-    /// that type.
+    /// The term for "the instance is this value", for a value of `const` or `enum`.
+    ///
+    /// A value that is nested deeper than an instance may be is not taken apart: it is of
+    /// one type and a leaf over that type, which is unlike every other.
     fn constant(&mut self, id: NodeId, keyword: &'static str, value: &Value) -> TermId {
-        let kind = match value {
-            Value::Null => return self.context.terms.type_is(NULL),
-            Value::Bool(value) => return self.context.terms.bool_const(*value),
-            Value::Number(number) => return self.context.terms.num_const(exact(number)),
-            Value::String(word) => return self.context.terms.str_const(word),
-            Value::Array(_) => ARRAY,
-            Value::Object(_) => OBJECT,
-        };
-        let is_it = self.leaf(kind, id, keyword, format!("const {value}"));
-        let of_type = self.context.terms.type_is(kind);
-        self.context.terms.all_of([of_type, is_it])
+        if too_deep(value) {
+            let kind = if value.is_array() { ARRAY } else { OBJECT };
+            let is_it = self.leaf_of_its_own(kind, id, keyword);
+            let of_type = self.context.terms.type_is(kind);
+            return self.context.terms.all_of([of_type, is_it]);
+        }
+        self.value(id, value)
+    }
+
+    /// The term for "the instance is this value". `null`, the booleans, the numbers and the
+    /// strings are terms of their own. An array is an array of so many items, each of them
+    /// the value at its position, and an object is an object with these properties and no
+    /// other, each of them the value of its name.
+    ///
+    /// This goes as deep as the value does, which is no deeper than an instance may be.
+    fn value(&mut self, id: NodeId, value: &Value) -> TermId {
+        match value {
+            Value::Null => self.context.terms.type_is(NULL),
+            Value::Bool(value) => self.context.terms.bool_const(*value),
+            Value::Number(number) => self.context.terms.num_const(exact(number)),
+            Value::String(word) => self.context.terms.str_const(word),
+            Value::Array(items) => {
+                let mut parts = vec![self.context.terms.type_is(ARRAY)];
+                for (position, item) in items.iter().enumerate() {
+                    let variable = self.inside_a_constant(id, item);
+                    parts.push(self.context.terms.item(position as u64, variable));
+                }
+                let count = items.len() as u64;
+                parts.push(self.context.terms.min_its(count));
+                parts.push(self.context.terms.max_its(count));
+                self.context.terms.all_of(parts)
+            }
+            Value::Object(members) => {
+                let mut parts = vec![self.context.terms.type_is(OBJECT)];
+                for (name, member) in members {
+                    let variable = self.inside_a_constant(id, member);
+                    let named = self.context.languages.words([name.as_str()]);
+                    parts.push(self.context.terms.p_prop(named, variable));
+                    parts.push(self.context.terms.p_req(named));
+                }
+                // Every name is there, so with no more properties than names there is no
+                // other.
+                parts.push(self.context.terms.max_props(members.len() as u64));
+                self.context.terms.all_of(parts)
+            }
+        }
+    }
+
+    /// The variable of a value inside a constant. Its term is "the instance is this
+    /// value", and a value that is met again has the variable that it had before. It
+    /// stands where the constant does.
+    fn inside_a_constant(&mut self, id: NodeId, value: &Value) -> VarId {
+        let body = self.value(id, value);
+        let terms = &mut self.context.terms;
+        let variable = *self.constants.entry(body).or_insert_with(|| {
+            let variable = terms.new_variable(id);
+            terms.variable_mut(variable).body = body;
+            variable
+        });
+        let side = self.graph.node(id).side as usize;
+        terms.variable_mut(variable).sides[side] = true;
+        variable
     }
 
     fn numbers(&mut self, keywords: &Keywords, parts: &mut Vec<TermId>) {
@@ -349,43 +411,57 @@ impl Lowering<'_, '_> {
     }
 
     fn arrays(&mut self, id: NodeId, keywords: &Keywords, parts: &mut Vec<TermId>) {
-        // `items` is about the items after those that `prefixItems` names, so the two are
-        // one predicate.
-        if !keywords.prefix_items.is_empty() || keywords.items.is_some() {
-            let prefix: Vec<String> = keywords
-                .prefix_items
-                .iter()
-                .map(|s| self.class(*s))
-                .collect();
-            let rest = keywords
-                .items
-                .map_or_else(|| "any".to_owned(), |s| self.class(s));
-            let keyword = if keywords.items.is_some() {
-                "items"
-            } else {
-                "prefixItems"
-            };
-            let key = format!("items [{}] then {rest}", prefix.join(", "));
-            parts.push(self.leaf(ARRAY, id, keyword, key));
+        // The item at each of the first positions satisfies the schema of its position,
+        // and every item after those the schema of `items`.
+        for (position, schema) in keywords.prefix_items.iter().enumerate() {
+            let variable = self.variable(*schema);
+            parts.push(self.context.terms.item(position as u64, variable));
         }
-        // `minContains` and `maxContains` say how many items `contains` is about, and
-        // nothing without it.
+        if let Some(schema) = keywords.items {
+            let variable = self.variable(schema);
+            let from = keywords.prefix_items.len() as u64;
+            parts.push(self.context.terms.add_its(from, variable));
+        }
+        // `contains` asks for an item that satisfies its schema. `minContains` and
+        // `maxContains` say how many such items there are to be, and nothing without it.
+        // At least one is what it asks by itself, and at least none is nothing asked. Any
+        // other number is not modelled: then the three are one predicate.
         if let Some(schema) = keywords.contains {
-            let bounds = [keywords.min_contains, keywords.max_contains];
-            if bounds.contains(&Some(Count::Beyond)) {
-                parts.push(self.leaf_of_its_own(ARRAY, id, "contains"));
-            } else {
-                let bound = |count| match count {
-                    Some(Count::Of(count)) => count.to_string(),
-                    _ => "unset".to_owned(),
-                };
-                let (least, most) = (bound(bounds[0]), bound(bounds[1]));
-                let key = format!("contains {} from {least} to {most}", self.class(schema));
-                parts.push(self.leaf(ARRAY, id, "contains", key));
+            match (keywords.min_contains, keywords.max_contains) {
+                (None | Some(Count::Of(1)), None) => {
+                    let variable = self.variable(schema);
+                    parts.push(self.context.terms.contains(variable));
+                }
+                (Some(Count::Of(0)), None) => {}
+                (Some(Count::Beyond), _) | (_, Some(Count::Beyond)) => {
+                    parts.push(self.leaf_of_its_own(ARRAY, id, "contains"));
+                }
+                (least, most) => {
+                    let bound = |count| match count {
+                        Some(Count::Of(count)) => count.to_string(),
+                        _ => "unset".to_owned(),
+                    };
+                    let (least, most) = (bound(least), bound(most));
+                    let key = format!("contains {} from {least} to {most}", self.class(schema));
+                    // The leaf stands at the bound that makes it one.
+                    let keyword = if keywords.max_contains.is_some() {
+                        "maxContains"
+                    } else {
+                        "minContains"
+                    };
+                    parts.push(self.leaf(ARRAY, id, keyword, key));
+                }
             }
         }
-        self.count(ARRAY, id, "minItems", keywords.min_items, parts);
-        self.count(ARRAY, id, "maxItems", keywords.max_items, parts);
+        // A count that was too large to keep stays a leaf.
+        match keywords.min_items {
+            Some(Count::Of(least)) => parts.push(self.context.terms.min_its(least)),
+            beyond => self.count(ARRAY, id, "minItems", beyond, parts),
+        }
+        match keywords.max_items {
+            Some(Count::Of(most)) => parts.push(self.context.terms.max_its(most)),
+            beyond => self.count(ARRAY, id, "maxItems", beyond, parts),
+        }
         if keywords.unique_items {
             parts.push(self.leaf(ARRAY, id, "uniqueItems", "uniqueItems".to_owned()));
         }
@@ -479,6 +555,24 @@ impl Lowering<'_, '_> {
     }
 }
 
+/// Whether a value holds more arrays and objects inside one another than an instance may:
+/// more than [`DEEPEST`], itself among them. This goes no deeper than that.
+fn too_deep(value: &Value) -> bool {
+    let mut pending = vec![(value, 1_u32)];
+    while let Some((value, depth)) = pending.pop() {
+        let inside: Box<dyn Iterator<Item = &Value>> = match value {
+            Value::Array(items) => Box::new(items.iter()),
+            Value::Object(members) => Box::new(members.values()),
+            _ => continue,
+        };
+        if depth > DEEPEST {
+            return true;
+        }
+        pending.extend(inside.map(|value| (value, depth + 1)));
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{Map, json};
@@ -557,24 +651,99 @@ mod tests {
     }
 
     #[test]
-    fn a_constant_is_a_term_unless_it_is_an_array_or_an_object() {
+    fn a_constant_is_a_term() {
         assert_eq!(term(&json!({"const": null})), "type(null)");
         assert_eq!(term(&json!({"const": true})), "is(true)");
         assert_eq!(term(&json!({"const": "a"})), r#"is("a")"#);
         assert_eq!(
-            term(&json!({"enum": [null, false, 1, "a", {}]})),
-            r#"any(type(null), is(false), is(1), is("a"), all(type(object), ?[const {}]))"#
+            term(&json!({"enum": [null, false, 1, "a", {}, []]})),
+            r#"any(type(null), is(false), is(1), is("a"), all(type(object), maxprops(0)), all(type(array), maxits(0)))"#
         );
         assert_eq!(term(&json!({"enum": []})), "false");
-        assert_eq!(
-            term(&json!({"const": [1, {"a": null}]})),
-            r#"all(type(array), ?[const [1,{"a":null}]])"#
-        );
         // One value is one term, whichever keyword holds it and however it is written.
         assert_eq!(term(&json!({"enum": [1]})), term(&json!({"const": 1})));
         assert_eq!(term(&json!({"const": 1.0})), term(&json!({"const": 1})));
         assert_eq!(term(&json!({"const": 0.5})), "is(0.5)");
         assert_eq!(term(&json!({"enum": ["a"]})), term(&json!({"const": "a"})));
+    }
+
+    #[test]
+    fn a_constant_that_is_an_array_or_an_object_names_a_variable_for_each_value_inside() {
+        // So many items, each the value at its position. A value that is met again has
+        // the variable that it had before.
+        let list = json!({"const": [1, "a", 1.0]});
+        assert_eq!(
+            terms(&list, &json!(true)),
+            [
+                "all(type(array), item(0: x2), item(1: x3), item(2: x2), minits(3), maxits(3))",
+                "true",
+                "is(1)",
+                r#"is("a")"#,
+            ]
+        );
+        // These properties and no other, each the value of its name.
+        let record = json!({"const": {"a": null, "b": [null]}});
+        assert_eq!(
+            terms(&record, &json!(true)),
+            [
+                "all(type(object), pprop(l2: x2), preq(l2), pprop(l3: x3), preq(l3), maxprops(2))",
+                "true",
+                "type(null)",
+                "all(type(array), item(0: x2), minits(1), maxits(1))",
+            ]
+        );
+        // One value is one term, however the numbers in it are written, and a variable of
+        // A is one of B too.
+        let (a, b) = (json!({"const": [[1.0]]}), json!({"enum": [[[1]]]}));
+        let (terms, of_a, of_b) = lowered(&a, &b);
+        assert_eq!(terms.variable(of_a).body, terms.variable(of_b).body);
+        let inside: Vec<[bool; 2]> = terms.variables().map(|(_, inside)| inside.sides).collect();
+        assert_eq!(
+            inside,
+            [[true, false], [false, true], [true, true], [true, true]]
+        );
+    }
+
+    #[test]
+    fn a_constant_that_is_nested_too_deep_is_a_leaf() {
+        let nested = |levels: u32| {
+            let mut value = json!(null);
+            for _ in 0..levels {
+                value = json!([value]);
+            }
+            value
+        };
+        // As deep as an instance may be, it is taken apart.
+        let deepest = term(&json!({"const": nested(DEEPEST)}));
+        assert!(
+            deepest.starts_with("all(type(array), item(0: x") && !deepest.contains("?["),
+            "{deepest}"
+        );
+        // One level more and it is a leaf, which is like no other: not the same value
+        // elsewhere either.
+        let too_deep = json!({"const": nested(DEEPEST + 1)});
+        let (terms, of_a, of_b) = lowered(&too_deep, &too_deep);
+        assert_ne!(of_a, of_b);
+        let shown = terms.show(terms.variable(of_a).body);
+        assert!(shown.starts_with("all(type(array), ?[const @"), "{shown}");
+        // A value that is very much deeper is not gone through to its end.
+        // It is built by hand: `json!` copies what it is given, level by level.
+        let mut endless = json!(null);
+        for _ in 0..100_000 {
+            endless = Value::Object([("a".to_owned(), endless)].into_iter().collect());
+        }
+        let schema = Value::Object(
+            [("enum".to_owned(), Value::Array(vec![json!(1), endless]))]
+                .into_iter()
+                .collect(),
+        );
+        let shown = term(&schema);
+        assert!(
+            shown.starts_with("any(is(1), all(type(object), ?[enum @"),
+            "{shown}"
+        );
+        // Dropping the value takes a level of the stack for each of its own.
+        std::mem::forget(schema);
     }
 
     #[test]
@@ -775,25 +944,58 @@ mod tests {
     }
 
     #[test]
-    fn every_other_keyword_is_a_leaf_with_what_it_holds() {
+    fn a_keyword_about_arrays_is_a_term() {
         let schema = json!({
+            "prefixItems": [{"type": "null"}, false],
+            "items": {"type": "string"},
+            "contains": {"minimum": 1},
             "minItems": 4,
-            "uniqueItems": true,
             "maxItems": 5,
         });
         assert_eq!(
-            term(&schema),
-            "all(?[minItems 4], ?[maxItems 5], ?[uniqueItems])"
+            terms(&schema, &json!(true)),
+            [
+                "all(item(0: x2), item(1: x3), addits(2: x4), contains(x5), minits(4), maxits(5))",
+                "true",
+                "type(null)",
+                "false",
+                "type(string)",
+                "min(1)",
+            ]
         );
-        assert_eq!(term(&json!({"uniqueItems": false})), "true");
-        // `minContains` says nothing without `contains`.
+        // Without `prefixItems`, `items` is about every item.
+        assert_eq!(term(&json!({"items": {}})), "addits(0: x2)");
+        // At least no item is what every array has.
+        assert_eq!(term(&json!({"minItems": 0})), "true");
+        assert_eq!(term(&json!({"maxItems": 0})), "maxits(0)");
+        // `contains` asks for one item, also when `minContains` says so, and for nothing
+        // when `minContains` asks for none. The bounds say nothing without it.
+        let one = json!({"contains": {}, "minContains": 1});
+        assert_eq!(term(&one), "contains(x2)");
+        assert_eq!(term(&json!({"contains": {}, "minContains": 0})), "true");
         assert_eq!(term(&json!({"minContains": 2, "maxContains": 3})), "true");
     }
 
     #[test]
+    fn every_other_keyword_is_a_leaf_with_what_it_holds() {
+        let schema = json!({
+            "format": "hostname",
+            "uniqueItems": true,
+            "minItems": 1e30,
+        });
+        let shown = term(&schema);
+        assert!(
+            shown.starts_with(r#"all(?[format "hostname"], ?[minItems @"#),
+            "{shown}"
+        );
+        assert!(shown.ends_with("?[uniqueItems])"), "{shown}");
+        assert_eq!(term(&json!({"uniqueItems": false})), "true");
+    }
+
+    #[test]
     fn a_leaf_says_which_types_it_is_about_and_where_it_was_first() {
-        let a = json!({"type": "array", "minItems": 1});
-        let b = json!({"minItems": 1, "$dynamicRef": "#here", "$dynamicAnchor": "here"});
+        let a = json!({"type": "array", "uniqueItems": true});
+        let b = json!({"uniqueItems": true, "$dynamicRef": "#here", "$dynamicAnchor": "here"});
         let graph = parse(&a, &b).unwrap().link().unwrap();
         let mut context = Context::new(u64::MAX);
         let (_, of_b) = lower(&graph, &mut context).unwrap();
@@ -815,25 +1017,38 @@ mod tests {
         // A dynamic reference may be about any instance, and no other is like it.
         assert_eq!(leaves[0].domain, TypeSet::ALL);
         assert_eq!(place(leaves[0]), (Side::B, "#/$dynamicRef".to_owned()));
-        // The leaf of `minItems` is about arrays. A has it too, and A is lowered first.
+        // The leaf of `uniqueItems` is about arrays. A has it too, and A is lowered first.
         assert_eq!(leaves[1].domain, ARRAY);
-        assert_eq!(place(leaves[1]), (Side::A, "#/minItems".to_owned()));
+        assert_eq!(place(leaves[1]), (Side::A, "#/uniqueItems".to_owned()));
     }
 
     #[test]
     fn keywords_that_depend_on_each_other_are_one_leaf() {
         let count = |text: &str| text.matches("?[").count();
-        // `items` is about what `prefixItems` leaves.
-        let items = term(&json!({"prefixItems": [{}, false], "items": {"type": "null"}}));
-        assert!(
-            items.starts_with("?[items [#") && count(&items) == 1,
-            "{items}"
-        );
-        let prefix = term(&json!({"prefixItems": [{}]}));
-        assert!(prefix.ends_with("then any]"), "{prefix}");
-        // The bounds of `contains` belong to it.
+        // The bounds of `contains` belong to it. More than one item, or a most, is not
+        // modelled, and the leaf stands at the bound.
         let contains = term(&json!({"contains": {}, "minContains": 2}));
-        assert!(contains.ends_with("from 2 to unset]"), "{contains}");
+        assert!(
+            contains.starts_with("?[contains #") && contains.ends_with("from 2 to unset]"),
+            "{contains}"
+        );
+        let most = json!({"contains": {}, "minContains": 1, "maxContains": 3});
+        let (terms, of_a, _) = lowered(&most, &json!(true));
+        let shown = terms.show(terms.variable(of_a).body);
+        assert!(
+            shown.ends_with("from 1 to 3]") && count(&shown) == 1,
+            "{shown}"
+        );
+        let crate::term::Term::Unknown(leaf) = terms.term(terms.variable(of_a).body) else {
+            panic!("{shown} is no leaf");
+        };
+        assert_eq!(terms.leaf(*leaf).keyword, Some("maxContains"));
+        // What the leaf holds is not opened: its schema has no variable.
+        assert_eq!(terms.variables().count(), 2);
+        // A most is not modelled with a least of none either, where `contains` by itself
+        // would ask for nothing.
+        let none_or_few = term(&json!({"contains": {}, "minContains": 0, "maxContains": 3}));
+        assert!(none_or_few.ends_with("from 0 to 3]"), "{none_or_few}");
     }
 
     #[test]
@@ -841,13 +1056,13 @@ mod tests {
         let a = json!({
             "type": "object",
             "properties": {"name": {"type": "string"}, "age": {"minimum": 0}},
-            "items": {"type": "null"},
+            "uniqueItems": true,
         });
         let mut b = a.clone();
         let (terms, of_a, of_b) = lowered(&a, &b);
         assert_eq!(of_a, of_b);
         assert_eq!(terms.variable(of_a).sides, [true, true]);
-        // The schema and its two properties. What `items` holds is inside a leaf.
+        // The schema and its two properties.
         assert_eq!(terms.variables().count(), 3);
 
         // One property changes. The variables of A and B differ, and so does the term of
@@ -862,7 +1077,7 @@ mod tests {
             other => panic!("{other:?} is no conjunction"),
         };
         let (of_a, of_b) = (parts(of_a), parts(of_b));
-        // The type, the two properties and the items.
+        // The type, the two properties and the leaf of `uniqueItems`.
         assert_eq!((of_a.len(), of_b.len()), (4, 4));
         let shared = of_a.iter().filter(|part| of_b.contains(part)).count();
         assert_eq!(shared, 3);
@@ -906,12 +1121,16 @@ mod tests {
             terms(&list, &json!(true)),
             ["any(x2, x3)", "true", "type(null)", "x0"]
         );
-        // What a leaf holds is not opened, so the cycle through `items` ends in the leaf.
-        let tree = json!({"items": {"$ref": "#"}});
-        assert_eq!(terms(&tree, &json!(true)).len(), 2);
+        // What a leaf holds is not opened, so the cycle through a `contains` that is
+        // counted ends in the leaf.
+        let counted = json!({"contains": {"$ref": "#"}, "maxContains": 1});
+        assert_eq!(terms(&counted, &json!(true)).len(), 2);
         // The schema of a property has a variable, and a cycle through it is one of terms.
+        // So has the schema of an item.
         let chain = json!({"properties": {"next": {"$ref": "#"}}});
         assert_eq!(terms(&chain, &json!(true)), ["pprop(l2: x2)", "true", "x0"]);
+        let tree = json!({"items": {"$ref": "#"}});
+        assert_eq!(terms(&tree, &json!(true)), ["addits(0: x2)", "true", "x0"]);
     }
 
     #[test]

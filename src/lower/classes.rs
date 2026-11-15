@@ -13,6 +13,7 @@ use std::fmt::Write;
 
 use serde_json::{Number, Value};
 
+use super::too_deep;
 use crate::context::{Budget, Exhausted};
 use crate::rational::exact;
 use crate::schema::{Count, Graph, Keywords, Node, NodeId, Part, Schema};
@@ -135,12 +136,16 @@ fn assertions(id: NodeId, keywords: &Keywords, text: &mut String) {
     put("$dynamicAnchor", keywords.dynamic_anchor.map(quoted));
     put("type", keywords.types.map(|types| format!("{types:?}")));
     // A number is the number that it stands for, however it is written: `1.0` says what `1`
-    // says. Inside an array or an object it is told apart by how it is written, until those
-    // constants are terms.
+    // says, also inside an array or an object. A value that is nested deeper than an
+    // instance may be is not written out, and is like no other.
     let number = |number: &Number| exact(number).to_string();
-    let constant = |value: &Value| match value {
-        Value::Number(value) => number(value),
-        other => written!(other),
+    let constant = |value: &Value| {
+        if too_deep(value) {
+            return unlike_any_other();
+        }
+        let mut text = String::new();
+        write_value(value, &mut text);
+        text
     };
     let listed = |values: &[Value]| values.iter().map(constant).collect::<Vec<_>>().join(",");
     put("enum", keywords.enumeration.map(listed));
@@ -175,6 +180,38 @@ fn assertions(id: NodeId, keywords: &Keywords, text: &mut String) {
 
 fn quoted(text: &str) -> String {
     written!(text)
+}
+
+/// Writes a value as text that is equal for two values exactly when they are one value: a
+/// number is written as the number that it stands for, and the properties of an object in
+/// the order of their names.
+///
+/// This goes as deep as the value does, which is no deeper than an instance may be.
+fn write_value(value: &Value, text: &mut String) {
+    match value {
+        Value::Number(number) => text.push_str(&exact(number).to_string()),
+        Value::Array(items) => {
+            text.push('[');
+            for item in items {
+                write_value(item, text);
+                text.push(',');
+            }
+            text.push(']');
+        }
+        Value::Object(members) => {
+            let mut members: Vec<(&String, &Value)> = members.iter().collect();
+            members.sort_by_key(|(name, _)| *name);
+            text.push('{');
+            for (name, member) in members {
+                text.push_str(&quoted(name));
+                text.push(':');
+                write_value(member, text);
+                text.push(',');
+            }
+            text.push('}');
+        }
+        plain => text.push_str(&written!(plain)),
+    }
 }
 
 /// The nodes in an order in which every node comes after the nodes it leads to, unless they
@@ -324,8 +361,21 @@ mod tests {
             (json!({"const": 1}), json!({"const": "1"})),
             (json!({"enum": [1, 2]}), json!({"enum": ["1,2"]})),
             (json!({"enum": [1, 2]}), json!({"enum": [2, 1]})),
-            // A number inside a constant is compared as it is written, for now.
-            (json!({"const": [1]}), json!({"const": [1.0]})),
+            // An array or an object is the values that it holds, each where it is.
+            (json!({"const": [1, 2]}), json!({"const": [2, 1]})),
+            (json!({"const": [1, 2]}), json!({"const": ["1,2"]})),
+            (json!({"const": [1, 2]}), json!({"const": [12]})),
+            (json!({"const": [1, 2.5]}), json!({"const": [12.5]})),
+            (json!({"const": ["a", "b"]}), json!({"const": ["a\",\"b"]})),
+            (json!({"const": [1, [2]]}), json!({"const": [[1], 2]})),
+            (json!({"const": [[]]}), json!({"const": [{}]})),
+            (json!({"const": []}), json!({"const": {}})),
+            (json!({"const": {"a": 1}}), json!({"const": {"b": 1}})),
+            (
+                json!({"const": {"a": 1}}),
+                json!({"const": {"a": 1, "b": 1}}),
+            ),
+            (json!({"const": {"a": [1]}}), json!({"const": {"a": 1}})),
         ];
         for (a, b) in apart {
             let (of_a, of_b) = classed(&a, &b);
@@ -345,6 +395,12 @@ mod tests {
             (
                 json!({"enum": [1, "a", null]}),
                 json!({"enum": [1.0, "a", null]}),
+            ),
+            // Also inside an array or an object.
+            (json!({"const": [1]}), json!({"const": [1.0]})),
+            (
+                json!({"const": {"a": [1, {"b": 2.0}], "c": null}}),
+                json!({"const": {"c": null, "a": [1.0, {"b": 2}]}}),
             ),
         ];
         for (a, b) in alike {

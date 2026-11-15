@@ -2,9 +2,9 @@
 //!
 //! `all[B, not A]` is taken apart into *branches*. A branch is a conjunction of what the
 //! engine knows how to combine: the types an instance may still have, the booleans, the
-//! numbers, the strings and the objects it may still be, the leaves that must hold and
-//! those that must not, and the variables taken for true or for false. A disjunction splits
-//! a branch in as many as it has alternatives.
+//! numbers, the strings, the objects and the arrays it may still be, the leaves that must
+//! hold and those that must not, and the variables taken for true or for false. A
+//! disjunction splits a branch in as many as it has alternatives.
 //!
 //! - A branch that contradicts itself is *refuted*. If every branch is, A subsumes B.
 //! - A branch that is not refuted and has a type that no leaf is about gives an instance of
@@ -18,22 +18,24 @@
 //!
 //! # Values inside an instance
 //!
-//! What a branch says about objects is about the values of their properties, and a value
-//! is an instance of its own. What a value has to satisfy is a *c-reference*: a set of
-//! variables, each as it stands or negated. Whether there is such a value is the question
-//! that the check began with, asked of other schemas, and it is answered the same way: by
-//! a *task*, which takes the c-reference apart into branches. The answer of a task is
-//! kept, so that each c-reference is decided once.
+//! What a branch says about objects is about the values of their properties, and what it
+//! says about arrays is about their items. Such a value is an instance of its own. What a
+//! value has to satisfy is a *c-reference*: a set of variables, each as it stands or
+//! negated. Whether there is such a value is the question that the check began with, asked
+//! of other schemas, and it is answered the same way: by a *task*, which takes the
+//! c-reference apart into branches. The answer of a task is kept, so that each c-reference
+//! is decided once.
 //!
 //! A branch that needs to know of a c-reference waits while a task decides it. The tasks
 //! that wait are a stack, and none of this recurses, however deep the schemas go.
 //!
-//! A schema may hold itself in a property, and then a task comes to ask for a c-reference
-//! that a task below it on the stack is still deciding. A value is finite, so such a
-//! c-reference accepts what it can be shown to accept without itself: it is taken to accept
-//! nothing. An answer that was found that way holds only as long as the task below is at
-//! work, unless it is an instance, which nothing can take back. So it is kept apart, and
-//! becomes an answer for good when the task below ends without an instance either.
+//! A schema may hold itself in a property or in an item, and then a task comes to ask for
+//! a c-reference that a task below it on the stack is still deciding. A value is finite, so
+//! such a c-reference accepts what it can be shown to accept without itself: it is taken
+//! to accept nothing. An answer that was found that way holds only as long as the task
+//! below is at work, unless it is an instance, which nothing can take back. So it is kept
+//! apart, and becomes an answer for good when the task below ends without an instance
+//! either.
 
 #[cfg(test)]
 mod exhaustive;
@@ -43,8 +45,10 @@ use std::rc::Rc;
 
 use serde_json::Value;
 
+use crate::canonical::Left;
+use crate::canonical::array::Arrays;
 use crate::canonical::number::Numbers;
-use crate::canonical::object::{Left, Objects, Partitions, Solver};
+use crate::canonical::object::{Objects, Partitions, Solver};
 use crate::canonical::string::Strings;
 use crate::context::{Context, Exhausted};
 use crate::generate;
@@ -185,6 +189,10 @@ struct Branch {
     objects: Objects,
     objects_asked: bool,
     objects_depend: Option<Cause>,
+    /// And the same for the arrays.
+    arrays: Arrays,
+    arrays_asked: bool,
+    arrays_depend: Option<Cause>,
     /// The leaves that must hold, and the types that they are about.
     holds: BTreeSet<LeafId>,
     covered: TypeSet,
@@ -216,6 +224,9 @@ impl Default for Branch {
             objects: Objects::default(),
             objects_asked: false,
             objects_depend: None,
+            arrays: Arrays::default(),
+            arrays_asked: false,
+            arrays_depend: None,
             holds: BTreeSet::new(),
             covered: TypeSet::NONE,
             fails: BTreeSet::new(),
@@ -230,6 +241,7 @@ impl Default for Branch {
 const BOOLEAN: TypeSet = TypeSet::of(InstanceType::Boolean);
 const NUMBER: TypeSet = TypeSet::of(InstanceType::Number);
 const STRING: TypeSet = TypeSet::of(InstanceType::String);
+const ARRAY: TypeSet = TypeSet::of(InstanceType::Array);
 const OBJECT: TypeSet = TypeSet::of(InstanceType::Object);
 
 impl Branch {
@@ -238,7 +250,8 @@ impl Branch {
         let leaves = self.holds.len() + self.fails.len();
         let variables = self.taken.len() + self.met.len();
         let copied = (leaves + variables + self.choices.len()) as u64;
-        copied + self.numbers.weight() + self.strings.weight() + self.objects.weight()
+        let values = self.objects.weight() + self.arrays.weight();
+        copied + self.numbers.weight() + self.strings.weight() + values
     }
 
     /// Keeps only instances of these types. Returns whether any are left.
@@ -278,16 +291,19 @@ impl Branch {
         if !self.fails.is_empty() {
             return TypeSet::NONE;
         }
-        let free = self.types.intersection(self.covered.complement());
-        match self.objects_depend {
-            Some(_) => free.intersection(OBJECT.complement()),
-            None => free,
+        let mut free = self.types.intersection(self.covered.complement());
+        if self.objects_depend.is_some() {
+            free = free.intersection(OBJECT.complement());
         }
+        if self.arrays_depend.is_some() {
+            free = free.intersection(ARRAY.complement());
+        }
+        free
     }
 
     /// What stands between the branch and an instance: a leaf, if one is about a type that
     /// is left. Without one, every type that is left is free of leaves, and it is what
-    /// stood in the way of an object or of a number.
+    /// stood in the way of an object, of an array or of a number.
     fn cause(&self, terms: &Terms, otherwise: Option<Cause>) -> Cause {
         let about_what_is_left = |leaf: &&LeafId| {
             let about = terms.leaf(**leaf).domain;
@@ -297,6 +313,7 @@ impl Branch {
         let leaf = must_not_hold.or_else(|| self.holds.iter().find(about_what_is_left));
         let leaf = leaf.map(|leaf| Cause::Leaf(*leaf));
         leaf.or(self.objects_depend)
+            .or(self.arrays_depend)
             .or(otherwise)
             .unwrap_or(Cause::Number)
     }
@@ -588,7 +605,7 @@ impl Engine<'_> {
         // The objects come last: a branch that waits for the engine to decide what the
         // value of a property satisfies is asked again from here.
         if branch.objects_asked && branch.types.contains(InstanceType::Object) {
-            match self.objects(branch, false)? {
+            match self.left(branch, InstanceType::Object, false)? {
                 Left::Needs(wanted) => return Ok(Settled::Needs(wanted)),
                 Left::Nothing => {
                     if !branch.restrict(OBJECT.complement()) {
@@ -596,15 +613,31 @@ impl Engine<'_> {
                     }
                 }
                 Left::Unknown(cause) => branch.objects_depend = Some(cause),
-                Left::Object(_) => branch.objects_depend = None,
+                Left::Value(_) => branch.objects_depend = None,
             }
         }
         branch.objects_asked = false;
+        // And the arrays after them, which wait for the values of their items in the same
+        // way. A branch that waits here has been asked about its objects.
+        if branch.arrays_asked && branch.types.contains(InstanceType::Array) {
+            match self.left(branch, InstanceType::Array, false)? {
+                Left::Needs(wanted) => return Ok(Settled::Needs(wanted)),
+                Left::Nothing => {
+                    if !branch.restrict(ARRAY.complement()) {
+                        return Ok(Settled::Refuted);
+                    }
+                }
+                Left::Unknown(cause) => branch.arrays_depend = Some(cause),
+                Left::Value(_) => branch.arrays_depend = None,
+            }
+        }
+        branch.arrays_asked = false;
         Ok(Settled::Stands)
     }
 
-    /// Whether the branch leaves an object, and with `give` such an object.
-    fn objects(&mut self, branch: &Branch, give: bool) -> Result<Left, Exhausted> {
+    /// Whether the branch leaves an object, or with `of` an array, and with `give` such a
+    /// value.
+    fn left(&mut self, branch: &Branch, of: InstanceType, give: bool) -> Result<Left, Exhausted> {
         let Self {
             context,
             tasks,
@@ -640,13 +673,17 @@ impl Engine<'_> {
                 Some(assumed.found.clone())
             }
         };
-        let mut solver = Solver {
-            terms,
-            languages,
-            budget,
-            partitions,
+        let left = if of == InstanceType::Array {
+            branch.arrays.left(terms, budget, &mut ask, give)?
+        } else {
+            let mut solver = Solver {
+                terms,
+                languages,
+                budget,
+                partitions,
+            };
+            branch.objects.left(&mut solver, &mut ask, give)?
         };
-        let left = branch.objects.left(&mut solver, &mut ask, give)?;
         if let Some(task) = tasks.last_mut() {
             task.lowest = lowest;
         }
@@ -658,14 +695,14 @@ impl Engine<'_> {
     fn instance(&mut self, branch: &Branch) -> Result<Given, Exhausted> {
         let mut in_the_way = None;
         for kind in branch.free().iter() {
-            if kind == InstanceType::Object {
-                match self.objects(branch, true)? {
-                    Left::Object(Some(object)) => return Ok(Given::Instance(object)),
+            if matches!(kind, InstanceType::Object | InstanceType::Array) {
+                match self.left(branch, kind, true)? {
+                    Left::Value(Some(value)) => return Ok(Given::Instance(value)),
                     Left::Needs(wanted) => return Ok(Given::Needs(wanted)),
                     Left::Unknown(cause) => {
                         in_the_way.get_or_insert(cause);
                     }
-                    Left::Nothing | Left::Object(None) => {}
+                    Left::Nothing | Left::Value(None) => {}
                 }
                 continue;
             }
@@ -755,6 +792,27 @@ impl Engine<'_> {
                 }
                 let found = found.clone();
                 return self.take_about_objects(branch, &found, negated);
+            }
+            // And what is no array satisfies every term about arrays.
+            (
+                Term::Item(..)
+                | Term::AddIts(..)
+                | Term::Contains(_)
+                | Term::MinIts(_)
+                | Term::MaxIts(_),
+                _,
+            ) => {
+                let stands = !negated || branch.restrict(ARRAY);
+                if stands && branch.types.contains(InstanceType::Array) {
+                    let found = found.clone();
+                    let Context { terms, budget, .. } = &mut *self.context;
+                    // What is asked of every item from a position on is taken in at each
+                    // position that the branch tells apart.
+                    budget.charge(branch.arrays.weight() / 8)?;
+                    branch.arrays.take(&found, negated, terms);
+                    branch.arrays_asked = true;
+                }
+                stands
             }
             (Term::Unknown(leaf), _) => branch.take(*leaf, negated, &self.context.terms),
             (Term::AllOf(parts), false) | (Term::AnyOf(parts), true) => {
@@ -1150,53 +1208,57 @@ mod tests {
 
     #[test]
     fn a_leaf_and_its_negation_refute_a_branch() {
-        let long = json!({"minItems": 3});
-        let long_list = json!({"type": "array", "minItems": 3});
-        yes(&long, &long);
-        yes(&long, &long_list);
+        let set = json!({"uniqueItems": true});
+        let set_list = json!({"type": "array", "uniqueItems": true});
+        yes(&set, &set);
+        yes(&set, &set_list);
         // The other way, an instance that is no array tells them apart.
-        assert_eq!(counterexample(&long_list, &long), json!(null));
+        assert_eq!(counterexample(&set_list, &set), json!(null));
         // Subschemas of one class make one leaf.
-        let list = json!({"type": "array", "items": {"type": "string"}});
-        let filled = json!({"type": "array", "items": {"type": "string"}, "minItems": 1});
-        yes(&list, &filled);
+        let few = json!({"type": "array", "contains": {"type": "string"}, "maxContains": 2});
+        let mut few_set = few.clone();
+        few_set["uniqueItems"] = json!(true);
+        yes(&few, &few_set);
         assert_eq!(
-            depends_on(&filled, &list),
-            (Side::A, "#/minItems".to_owned())
+            depends_on(&few_set, &few),
+            (Side::A, "#/uniqueItems".to_owned())
+        );
+        // A leaf with another schema, or with another count, is another leaf.
+        let fewer = json!({"type": "array", "contains": {"type": "string"}, "maxContains": 1});
+        assert_eq!(
+            depends_on(&few, &fewer),
+            (Side::A, "#/maxContains".to_owned())
+        );
+        let twice = json!({"type": "array", "contains": {"type": "null"}, "minContains": 2});
+        assert_eq!(
+            depends_on(&twice, &few),
+            (Side::A, "#/minContains".to_owned())
+        );
+        // With a least of none, a most still says something.
+        let none_or_one = json!({"contains": {}, "minContains": 0, "maxContains": 1});
+        assert_eq!(
+            depends_on(&none_or_one, &json!({"type": "array"})),
+            (Side::A, "#/maxContains".to_owned())
         );
     }
 
     #[test]
     fn a_leaf_is_about_one_type_only() {
-        // No number is too short a list, and no list is too small a number.
-        yes(&json!({"minItems": 3}), &json!({"type": "integer"}));
+        // No number has the same item twice, and no list is too small a number.
+        yes(&json!({"uniqueItems": true}), &json!({"type": "integer"}));
         yes(
             &json!({"minimum": 3}),
-            &json!({"type": "array", "minItems": 1}),
+            &json!({"type": "array", "uniqueItems": true}),
         );
         // An object satisfies the leaf about arrays, so an object is an instance.
-        let either = json!({"type": ["array", "object"], "minItems": 3});
+        let either = json!({"type": ["array", "object"], "uniqueItems": true});
         assert_eq!(counterexample(&json!({"type": "null"}), &either), json!({}));
         assert_eq!(
             depends_on(
-                &json!({"type": "array", "minItems": 3}),
+                &json!({"type": "array", "uniqueItems": true}),
                 &json!({"type": "array"})
             ),
-            (Side::A, "#/minItems".to_owned())
-        );
-        // A constant is of the type of its value.
-        yes(&json!({"type": "array"}), &json!({"const": [1]}));
-        yes(
-            &json!({"enum": [[1], 1, null]}),
-            &json!({"enum": [null, [1]]}),
-        );
-        assert_eq!(
-            counterexample(&json!({"const": [1]}), &json!({"type": "number"})),
-            json!(0)
-        );
-        assert_eq!(
-            depends_on(&json!({"const": [1]}), &json!({"type": "array"})),
-            (Side::A, "#/const".to_owned())
+            (Side::A, "#/uniqueItems".to_owned())
         );
     }
 
@@ -1377,10 +1439,10 @@ mod tests {
             &json!({"type": "string", "not": {"enum": ["a", "b"]}}),
             &json!({"type": "string", "not": {"pattern": "^[ab]$"}}),
         );
-        // A string in a constant of another type is not looked at yet.
+        // A string in a constant that is an array is that string too.
         assert_eq!(
-            depends_on(&json!({"const": ["a"]}), &json!({"const": ["b"]})),
-            (Side::A, "#/const".to_owned())
+            counterexample(&json!({"const": ["a"]}), &json!({"const": ["b"]})),
+            json!(["b"])
         );
     }
 
@@ -1704,11 +1766,8 @@ mod tests {
             json!(1)
         );
         assert_eq!(counterexample(&json!({"const": 1}), &not_one), json!(0));
-        // A number in a constant of another type is not looked at yet.
-        assert_eq!(
-            depends_on(&json!({"const": [1]}), &json!({"const": [1.0]})),
-            (Side::A, "#/const".to_owned())
-        );
+        // A number in a constant that is an array is that number too.
+        yes(&json!({"const": [1]}), &json!({"const": [1.0]}));
     }
 
     #[test]
@@ -1765,11 +1824,14 @@ mod tests {
         // Another instance is given where there is one, and a leaf is named where there is one.
         let or_null = json!({"type": ["number", "null"], "exclusiveMinimum": f64::MAX});
         assert_eq!(counterexample(&json!(false), &or_null), json!(null));
-        let or_list =
-            json!({"type": ["number", "array"], "exclusiveMinimum": f64::MAX, "minItems": 1});
+        let or_list = json!({
+            "type": ["number", "array"],
+            "exclusiveMinimum": f64::MAX,
+            "uniqueItems": true,
+        });
         assert_eq!(
             depends_on(&json!(false), &or_list),
-            (Side::B, "#/minItems".to_owned())
+            (Side::B, "#/uniqueItems".to_owned())
         );
     }
 
@@ -2416,27 +2478,30 @@ mod tests {
         let listed = |schema: Value| json!({"type": "object", "properties": {"a": schema}});
         assert_eq!(
             depends_on(
-                &listed(json!({"minItems": 1})),
+                &listed(json!({"uniqueItems": true})),
                 &listed(json!({"type": "array"}))
             ),
-            (Side::A, "#/properties/a/minItems".to_owned())
+            (Side::A, "#/properties/a/uniqueItems".to_owned())
         );
         // What cancels inside the value cancels.
         yes(
-            &listed(json!({"minItems": 1})),
-            &listed(json!({"type": "array", "minItems": 1})),
+            &listed(json!({"uniqueItems": true})),
+            &listed(json!({"type": "array", "uniqueItems": true})),
         );
         // A value of another type is an instance.
         assert_eq!(
             counterexample(
-                &listed(json!({"type": "array", "minItems": 1})),
+                &listed(json!({"type": "array", "uniqueItems": true})),
                 &listed(json!({}))
             ),
             json!({"a": null})
         );
         // Another object is given where there is one, and types refute as ever.
-        let filled =
-            json!({"type": "object", "properties": {"a": {"minItems": 1}}, "required": ["b"]});
+        let filled = json!({
+            "type": "object",
+            "properties": {"a": {"uniqueItems": true}},
+            "required": ["b"],
+        });
         assert_eq!(
             counterexample(&filled, &listed(json!({"type": "array"}))),
             json!({})
@@ -2448,6 +2513,389 @@ mod tests {
     }
 
     #[test]
+    fn an_item_is_compared_by_the_schema_of_its_position() {
+        let (strings, words) = (
+            json!({"items": {"type": "string"}}),
+            json!({"items": {"type": "string", "minLength": 1}}),
+        );
+        yes(&strings, &words);
+        assert_eq!(counterexample(&words, &strings), json!([""]));
+        // What is no array has no items.
+        assert_eq!(
+            counterexample(&json!({"type": "array"}), &words),
+            json!(null)
+        );
+        yes(&words, &json!({"type": "number"}));
+        // Every array has every item of the empty one as it should be.
+        yes(&words, &json!({"maxItems": 0}));
+        yes(&json!({"items": false}), &json!({"maxItems": 0}));
+        yes(&json!({"maxItems": 0}), &json!({"items": false}));
+
+        // `prefixItems` is about the first positions, each by itself, and about no item
+        // that is not there.
+        let pair = json!({"prefixItems": [{"type": "string"}, {"type": "number"}]});
+        let first = json!({"prefixItems": [{"type": "string"}]});
+        yes(&first, &pair);
+        assert_eq!(counterexample(&pair, &first), json!(["", null]));
+        assert_eq!(
+            counterexample(&pair, &json!({"type": "array"})),
+            json!([null])
+        );
+        let swapped = json!({"prefixItems": [{"type": "number"}, {"type": "string"}]});
+        assert_eq!(counterexample(&pair, &swapped), json!([0]));
+        // `items` is about what comes after them.
+        let then = json!({"prefixItems": [{"type": "string"}], "items": {"type": "number"}});
+        yes(&pair, &then);
+        assert_eq!(counterexample(&then, &pair), json!(["", 0, null]));
+        yes(&then, &json!({"const": ["a", 1, 2.5]}));
+        assert_eq!(
+            counterexample(&then, &json!({"items": {"type": "number"}})),
+            json!([0])
+        );
+        // With no item allowed after the first, the array has one at most.
+        let one = json!({"prefixItems": [{}], "items": false});
+        yes(&one, &json!({"maxItems": 1}));
+        yes(&json!({"maxItems": 1}), &one);
+
+        // An item of an item.
+        let (table, rows) = (
+            json!({"items": {"items": {"type": "integer"}}}),
+            json!({"items": {"items": {"type": "number"}}}),
+        );
+        yes(&rows, &table);
+        assert_eq!(counterexample(&table, &rows), json!([[0.1]]));
+        // And an item that is an object, or an object with a property that is an array.
+        let named = |schema: Value| json!({"items": {"properties": {"a": schema}}});
+        yes(
+            &named(json!({"type": "number"})),
+            &named(json!({"const": 1})),
+        );
+        assert_eq!(
+            counterexample(
+                &named(json!({"const": 1})),
+                &named(json!({"type": "number"}))
+            ),
+            json!([{"a": 0}])
+        );
+        let listed = |schema: Value| json!({"properties": {"a": {"items": schema}}});
+        assert_eq!(
+            counterexample(&listed(json!(false)), &listed(json!({"type": "null"}))),
+            json!({"a": [null]})
+        );
+    }
+
+    #[test]
+    fn an_array_contains_an_item_or_it_does_not() {
+        let (with_null, with_string) = (
+            json!({"contains": {"type": "null"}}),
+            json!({"contains": {"type": "string"}}),
+        );
+        assert_eq!(
+            counterexample(&with_null, &json!({"type": "array"})),
+            json!([])
+        );
+        assert_eq!(counterexample(&with_null, &with_string), json!([""]));
+        yes(&with_null, &json!({"const": [1, null]}));
+        yes(
+            &with_null,
+            &json!({"prefixItems": [{"type": "null"}], "minItems": 1}),
+        );
+        // Without such an item, every item is another.
+        let none = json!({"not": {"contains": {"type": "null"}}});
+        yes(
+            &none,
+            &json!({"type": "array", "items": {"type": "string"}}),
+        );
+        yes(&json!({"items": {"not": {"type": "null"}}}), &none);
+        assert_eq!(
+            counterexample(&none, &json!({"type": "array"})),
+            json!([null])
+        );
+        // Two schemas want an item each, and share one where the array has no more.
+        let both = json!({
+            "type": "array",
+            "allOf": [with_null, {"contains": {"type": ["null", "string"]}}],
+        });
+        assert_eq!(counterexample(&json!(false), &both), json!([null, null]));
+        let apart = json!({"type": "array", "allOf": [with_null, with_string]});
+        assert_eq!(counterexample(&json!(false), &apart), json!(["", null]));
+        let one = |schema: &Value| json!({"allOf": [schema, {"maxItems": 1}]});
+        assert_eq!(
+            counterexample(&json!({"not": both}), &one(&both)),
+            json!([null])
+        );
+        yes(&json!({"not": {"type": "array"}}), &one(&apart));
+        // An item that the array contains is one of those that `items` is about.
+        let strings = json!({"type": "array", "items": {"type": "string"}});
+        yes(
+            &json!({"not": {"type": "array"}}),
+            &json!({"allOf": [strings, with_null]}),
+        );
+        yes(&with_string, &json!({"allOf": [strings, {"minItems": 1}]}));
+        assert_eq!(counterexample(&with_string, &strings), json!([]),);
+        // `minContains` of one is what `contains` asks by itself, and of none it asks
+        // nothing.
+        let (once, never) = (
+            json!({"contains": {"type": "null"}, "minContains": 1}),
+            json!({"contains": {"type": "null"}, "minContains": 0}),
+        );
+        yes(&once, &with_null);
+        yes(&with_null, &once);
+        yes(&never, &json!(true));
+    }
+
+    #[test]
+    fn items_are_counted() {
+        yes(&json!({"minItems": 1}), &json!({"minItems": 2}));
+        assert_eq!(
+            counterexample(&json!({"minItems": 2}), &json!({"minItems": 1})),
+            json!([null])
+        );
+        yes(&json!({"maxItems": 2}), &json!({"maxItems": 1}));
+        assert_eq!(
+            counterexample(&json!({"maxItems": 1}), &json!({"maxItems": 2})),
+            json!([null, null])
+        );
+        // No array has at least two items and at most one.
+        let neither = json!({"minItems": 2, "maxItems": 1});
+        yes(&json!({"not": {"type": "array"}}), &neither);
+        yes(
+            &json!({"minItems": 1, "maxItems": 1}),
+            &json!({"const": [null]}),
+        );
+        // An item that there has to be counts, and so does a position that has to be there.
+        yes(&json!({"minItems": 1}), &json!({"contains": {}}));
+        yes(&json!({"contains": {}}), &json!({"minItems": 1}));
+        let second = json!({"not": {"prefixItems": [{}, {"type": "null"}]}});
+        yes(&json!({"minItems": 2}), &second);
+        assert_eq!(counterexample(&json!(false), &second), json!([null, true]));
+        // The items that are added to have enough satisfy what their positions ask.
+        let filled = json!({"type": "array", "items": {"const": "a"}, "minItems": 3});
+        assert_eq!(
+            counterexample(&json!(false), &filled),
+            json!(["a", "a", "a"])
+        );
+        // A count that no array of the budget has is not reached.
+        let endless = json!({"type": "array", "minItems": u64::MAX});
+        assert_eq!(reason(&json!(false), &endless), Reason::Budget);
+        yes(&json!({"minItems": 3}), &endless);
+    }
+
+    #[test]
+    fn a_constant_that_is_an_array_or_an_object_is_that_value() {
+        // A constant is of the type of its value.
+        yes(&json!({"type": "array"}), &json!({"const": [1]}));
+        yes(
+            &json!({"enum": [[1], 1, null]}),
+            &json!({"enum": [null, [1]]}),
+        );
+        assert_eq!(
+            counterexample(&json!({"const": [1]}), &json!({"type": "number"})),
+            json!(0)
+        );
+        // Every other array is another value: shorter, longer, or with another item.
+        let one = json!({"const": [1]});
+        assert_eq!(
+            counterexample(&one, &json!({"type": "array"})),
+            json!([null])
+        );
+        assert_eq!(counterexample(&one, &json!({"maxItems": 0})), json!(null));
+        let empty = json!({"type": "array", "maxItems": 0});
+        assert_eq!(counterexample(&one, &empty), json!([]));
+        let filled = json!({"type": "array", "minItems": 1});
+        assert_eq!(counterexample(&one, &filled), json!([null]));
+        let ones = json!({"type": "array", "minItems": 1, "items": {"const": 1}});
+        assert_eq!(counterexample(&one, &ones), json!([1, 1]));
+        yes(&one, &json!({"allOf": [ones, {"maxItems": 1}]}));
+        assert_eq!(
+            counterexample(&one, &json!({"const": [1, 2]})),
+            json!([1, 2])
+        );
+        assert_eq!(counterexample(&json!({"const": [1, 2]}), &one), json!([1]));
+        // What a schema asks of the items, the constant answers.
+        let schema = json!({
+            "prefixItems": [{"type": "integer"}],
+            "items": {"type": "string"},
+            "contains": {"type": "string", "minLength": 2},
+        });
+        yes(&schema, &json!({"const": [1, "a", "bc"]}));
+        assert_eq!(
+            counterexample(&schema, &json!({"enum": [[1, "ab"], [1, "a"]]})),
+            json!([1, "a"])
+        );
+
+        // An object is its properties and no other.
+        let record = json!({"const": {"a": 1, "b": [null]}});
+        yes(&json!({"type": "object", "required": ["a", "b"]}), &record);
+        yes(
+            &json!({"properties": {"b": {"items": {"type": "null"}}}}),
+            &record,
+        );
+        yes(
+            &json!({"additionalProperties": {"not": {"type": "string"}}}),
+            &record,
+        );
+        assert_eq!(
+            counterexample(&record, &json!({"type": "object"})),
+            json!({"a": null})
+        );
+        let same = json!({
+            "type": "object",
+            "properties": {"a": {"const": 1.0}, "b": {"const": [null]}},
+            "required": ["a", "b"],
+            "additionalProperties": false,
+        });
+        yes(&record, &same);
+        yes(&same, &record);
+        let open = json!({
+            "type": "object",
+            "properties": {"a": {"const": 1}, "b": {"const": [null]}},
+            "required": ["a", "b"],
+        });
+        assert_eq!(
+            counterexample(&record, &open),
+            json!({"a": 1, "b": [null], "c": null})
+        );
+        // A value inside a value, and one that is met twice.
+        let deep = json!({"const": [[1], {"a": [1]}, [1]]});
+        yes(&deep, &deep.clone());
+        yes(&json!({"items": {"not": {"type": "number"}}}), &deep);
+        assert_eq!(
+            counterexample(&json!({"const": [[1], {"a": [2]}, [1]]}), &deep),
+            json!([[1], {"a": [1]}, [1]])
+        );
+        // A value of an `enum` is that value, among the others.
+        let either = json!({"enum": [{"a": 1}, [], "a"]});
+        assert_eq!(
+            counterexample(&json!({"enum": [[], "a"]}), &either),
+            json!({"a": 1})
+        );
+        yes(&either, &json!({"const": []}));
+    }
+
+    #[test]
+    fn a_schema_that_holds_itself_in_an_item_accepts_what_is_built_in_finitely_many_steps() {
+        // Nulls in arrays, however deep.
+        let tree = json!({
+            "$id": "https://example.com/tree",
+            "anyOf": [{"type": "null"}, {"type": "array", "items": {"$ref": "#"}}],
+        });
+        yes(&tree, &json!({"const": [[null, []], null]}));
+        assert_eq!(counterexample(&tree, &json!(true)), json!(true));
+        assert_eq!(
+            counterexample(&tree, &json!({"type": "array"})),
+            json!([true])
+        );
+        assert_eq!(
+            counterexample(&tree, &json!({"const": [[null, [1]]]})),
+            json!([[null, [1]]])
+        );
+        // An array that must hold an array like itself has no end, so there is none.
+        let endless = json!({
+            "$id": "https://example.com/endless",
+            "type": "array",
+            "minItems": 1,
+            "items": {"$ref": "#"},
+        });
+        yes(&json!(false), &endless);
+        // With an end allowed, the shortest is given.
+        let chain = json!({
+            "$id": "https://example.com/chain",
+            "type": "array",
+            "items": {"$ref": "#"},
+        });
+        assert_eq!(counterexample(&json!(false), &chain), json!([]));
+        assert_eq!(counterexample(&json!({"maxItems": 0}), &chain), json!([[]]));
+    }
+
+    #[test]
+    fn what_stands_in_the_way_of_an_item_stands_in_the_way_of_the_array() {
+        let listed = |schema: Value| json!({"type": "array", "items": schema});
+        assert_eq!(
+            depends_on(
+                &listed(json!({"uniqueItems": true})),
+                &listed(json!({"type": "array"}))
+            ),
+            (Side::A, "#/items/uniqueItems".to_owned())
+        );
+        // What cancels inside the item cancels.
+        yes(
+            &listed(json!({"uniqueItems": true})),
+            &listed(json!({"type": "array", "uniqueItems": true})),
+        );
+        // An item of another type is an instance, and so is an array without the item.
+        assert_eq!(
+            counterexample(
+                &listed(json!({"type": "array", "uniqueItems": true})),
+                &listed(json!({}))
+            ),
+            json!([null])
+        );
+        let filled = json!({"type": "array", "items": {"uniqueItems": true}, "minItems": 1});
+        assert_eq!(
+            counterexample(&filled, &listed(json!({"type": "array"}))),
+            json!([])
+        );
+        // An array is given where the leaf is about the arrays of another place.
+        let either = json!({"type": "array", "prefixItems": [{}, {"uniqueItems": true}]});
+        assert_eq!(counterexample(&json!(false), &either), json!([]));
+        assert_eq!(
+            counterexample(&json!({"maxItems": 0}), &either),
+            json!([null])
+        );
+        assert_eq!(
+            depends_on(
+                &json!({"maxItems": 1}),
+                &json!({"allOf": [either, {"items": {"type": "array"}}]})
+            ),
+            (Side::B, "#/allOf/0/prefixItems/1/uniqueItems".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_schema_that_is_nested_deep_in_items_is_decided_without_recursion() {
+        let nested = |depth: usize, innermost: Value| {
+            let mut schema = innermost;
+            for _ in 0..depth {
+                schema = Value::Object(Map::from_iter([
+                    ("type".to_owned(), json!("array")),
+                    ("items".to_owned(), schema),
+                ]));
+            }
+            schema
+        };
+        // Each level is an item of the level above, and a task of its own.
+        let (whole, any) = (
+            nested(20_000, json!({"type": "integer"})),
+            nested(20_000, json!({"type": "number"})),
+        );
+        let check = Checker::new()
+            .budget(10_000_000)
+            .check(&any, &whole)
+            .unwrap();
+        assert_eq!(check.verdict, Verdict::Yes);
+        assert!(check.steps > 100_000, "{}", check.steps);
+        // The other way an instance holds an array for each level, and one that deep
+        // cannot be given: there is no counterexample, and no stack is used up for one.
+        let check = Checker::new()
+            .budget(10_000_000)
+            .check(&whole, &any)
+            .unwrap();
+        assert_eq!(reason_of(&check.verdict), Some(Reason::Unrepresentable));
+        // An instance of 127 arrays inside one another is given, and no deeper one.
+        let (integer, number) = (json!({"type": "integer"}), json!({"type": "number"}));
+        let instance = counterexample(&nested(127, integer.clone()), &nested(127, number.clone()));
+        let read: Value = serde_json::from_str(&instance.to_string()).unwrap();
+        assert_eq!(read, instance);
+        assert_eq!(
+            reason(&nested(128, integer), &nested(128, number)),
+            Reason::Unrepresentable
+        );
+        // Dropping a value this deep would recurse, which is no concern of this test.
+        std::mem::forget((whole, any));
+    }
+
+    #[test]
     fn a_schema_subsumes_itself_whatever_it_contains() {
         let schemas = [
             json!({"type": "integer", "minimum": 0, "multipleOf": 0.5}),
@@ -2455,6 +2903,8 @@ mod tests {
             json!({"properties": {"a": {"items": {"contains": {}}}}, "additionalProperties": false}),
             json!({"unevaluatedProperties": false, "allOf": [{"properties": {"a": {}}}]}),
             json!({"oneOf": [{"minimum": 1}, {"maximum": 0}], "not": {"uniqueItems": true}}),
+            json!({"prefixItems": [{"type": "null"}], "items": {"minItems": 2}, "maxItems": 3}),
+            json!({"contains": {"contains": {}, "maxContains": 2}, "const": [[1, {"a": []}]]}),
             // A resource of its own, so that `#` is the schema wherever it stands.
             json!({"$id": "https://example.com/tree", "anyOf": [{"type": "null"}, {"items": {"$ref": "#"}}]}),
             json!({"$id": "https://example.com/endless", "$ref": "#"}),
@@ -2661,7 +3111,12 @@ mod tests {
     fn branches_that_cannot_give_an_instance_are_left_alone() {
         // Twenty choices between two leaves about arrays: a million branches, none of which
         // is refuted and none of which gives an instance. The first one settles the answer.
-        let choice = |n: u32| json!({"anyOf": [{"minItems": n}, {"maxItems": n + 100}]});
+        let choice = |n: u32| {
+            json!({"anyOf": [
+                {"contains": {}, "minContains": n + 2},
+                {"contains": {}, "maxContains": n + 100},
+            ]})
+        };
         let b = json!({"type": "array", "allOf": (0..20).map(choice).collect::<Vec<_>>()});
         let a = json!({"type": "array", "uniqueItems": true});
         let check = Checker::new().check(&a, &b).unwrap();
@@ -2678,6 +3133,48 @@ mod tests {
             counterexample(&a, &json!({"anyOf": [b, {"type": "number"}]})),
             json!(0)
         );
+    }
+
+    #[test]
+    fn branches_whose_array_depends_on_a_leaf_are_left_alone_too() {
+        // Every item is an array of which a leaf is asked, so whether there is an array
+        // with an item is what the engine does not know. Twenty choices that such an array
+        // satisfies either way: a million branches, none of which is refuted and none of
+        // which gives an instance. The first one settles the answer here too.
+        let choice = |n: u32| json!({"anyOf": [{"maxItems": n + 1}, {"contains": {"minimum": n}}]});
+        let b = json!({
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "array", "uniqueItems": true},
+            "allOf": (0..20).map(choice).collect::<Vec<_>>(),
+        });
+        let check = Checker::new().check(&json!({"type": "null"}), &b).unwrap();
+        assert_eq!(
+            check.verdict,
+            Verdict::Unknown {
+                reason: Reason::Unsupported {
+                    schema: Side::B,
+                    location: "#/items/uniqueItems".to_owned(),
+                },
+            }
+        );
+        assert!(check.steps < 2_000, "{}", check.steps);
+        // So it is with an object whose property depends on a leaf.
+        let choice = |n: u32| json!({"anyOf": [{"maxProperties": n + 1}, {"required": ["a"]}]});
+        let b = json!({
+            "type": "object",
+            "required": ["a"],
+            "properties": {"a": {"type": "array", "uniqueItems": true}},
+            "allOf": (0..20).map(choice).collect::<Vec<_>>(),
+        });
+        let check = Checker::new().check(&json!({"type": "null"}), &b).unwrap();
+        assert!(matches!(
+            check.verdict,
+            Verdict::Unknown {
+                reason: Reason::Unsupported { .. }
+            }
+        ));
+        assert!(check.steps < 2_000, "{}", check.steps);
     }
 
     #[test]

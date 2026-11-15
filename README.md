@@ -20,9 +20,9 @@ Each check returns one of three verdicts:
 
 ## Status
 
-The engine is being built keyword by keyword. So far it models the types, `null`, the booleans, numbers, strings, objects, `allOf`, `anyOf`, `oneOf`, `not`, `if`/`then`/`else` and `$ref`. For numbers that is `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, `integer`, and a number in `const` or `enum`. For strings it is `minLength`, `maxLength`, `pattern`, `format`, and a string in `const` or `enum`. For objects it is `properties`, `patternProperties`, `additionalProperties`, `propertyNames`, `required`, `dependentRequired`, `dependentSchemas`, `minProperties` and `maxProperties`. A check whose answer depends on any other keyword returns `Unknown` and names the keyword: the keywords about arrays, `unevaluatedProperties`, and an array or an object in `const` or `enum`. So does every check of a schema that uses a `$dynamicRef`, until the engine models it.
+The engine is being built keyword by keyword. So far it models the types, `null`, the booleans, numbers, strings, objects, arrays, `allOf`, `anyOf`, `oneOf`, `not`, `if`/`then`/`else` and `$ref`. For numbers that is `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, `integer`, and a number in `const` or `enum`. For strings it is `minLength`, `maxLength`, `pattern`, `format`, and a string in `const` or `enum`. For objects it is `properties`, `patternProperties`, `additionalProperties`, `propertyNames`, `required`, `dependentRequired`, `dependentSchemas`, `minProperties` and `maxProperties`. For arrays it is `prefixItems`, `items`, `contains`, `minItems` and `maxItems`. A `const` or an `enum` may hold any value. A check whose answer depends on any other keyword returns `Unknown` and names the keyword: `uniqueItems`, `maxContains`, a `minContains` of two or more, `unevaluatedProperties` and `unevaluatedItems`. So does every check of a schema that uses a `$dynamicRef`, until the engine models it.
 
-Two schemas that share such a keyword with the same value can still be decided, because what both say cancels. The engine decides two thirds of the checks of the benchmark corpus.
+Two schemas that share such a keyword with the same value can still be decided, because what both say cancels. The engine decides 95 in 100 of the checks of the benchmark corpus.
 
 ## Goals
 
@@ -59,7 +59,15 @@ Any other format is an [unsupported construct](#unsupported-constructs).
 
 The value of a property is an instance of its own, and is compared as one: its numbers exactly, its strings as languages, and an object inside it the same way again. A schema may hold itself in a property, as a list or a tree does. It then accepts the instances that can be built in finitely many steps, so a list whose every element must have a next one accepts nothing.
 
-A counterexample that is an object has the properties that it must have and no more, such as `{"name": null}` for a `name` that should have been a string. A name that no schema lists is made up: `"a"`, then `"b"`. A counterexample holds at most 127 objects inside one another, which is as deep as `serde_json` reads a value back from text.
+A counterexample that is an object has the properties that it must have and no more, such as `{"name": null}` for a `name` that should have been a string. A name that no schema lists is made up: `"a"`, then `"b"`. A counterexample holds at most 127 objects and arrays inside one another, which is as deep as `serde_json` reads a value back from text.
+
+## Arrays
+
+An item of an array is an instance of its own too, and so is each value inside a `const` or an `enum` that is an array or an object. A schema may hold itself in an item, as a tree does, and accepts the instances that can be built in finitely many steps.
+
+A counterexample that is an array is as short as it may be, such as `[null]` for an item that should have been a string, and `[]` wherever the empty array will do.
+
+`contains` asks for one item that its schema accepts. A `maxContains`, or a `minContains` of two or more, is not supported yet: a check whose answer depends on one returns `Unknown`.
 
 ## Numbers
 
@@ -82,5 +90,6 @@ A schema that is spread over several files is bundled into one first, as [the sp
 A few JSON schema constructs are not modelled. A check whose answer depends on one of them returns `Unknown` (and a reason why):
 
 - `uniqueItems: true`.
+- `maxContains`, and a `minContains` of two or more.
 - Patterns with lookaround or backreferences, which the `regex` crate does not accept either, and patterns that ask where a word or a line begins or ends (`\b`, `\B`, and `^` or `$` under `(?m)`).
 - Formats other than those listed under [Formats](#formats), such as `hostname`, `email`, `regex` and `iri`.

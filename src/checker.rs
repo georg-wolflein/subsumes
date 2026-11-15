@@ -157,18 +157,18 @@ mod tests {
         let counterexample = json!(null);
         assert_eq!(check.verdict, Verdict::No { counterexample });
 
-        // The engine does not model arrays yet, and says which keyword stands in the way.
-        let (list, filled) = (
+        // The engine does not model `uniqueItems`, and says which keyword stands in the way.
+        let (list, set) = (
             json!({"type": "array"}),
-            json!({"type": "array", "minItems": 1}),
+            json!({"type": "array", "uniqueItems": true}),
         );
-        let check = checker.check(&filled, &list).unwrap();
+        let check = checker.check(&set, &list).unwrap();
         assert_eq!(
             check.verdict,
             Verdict::Unknown {
                 reason: Reason::Unsupported {
                     schema: Side::A,
-                    location: "#/minItems".to_owned(),
+                    location: "#/uniqueItems".to_owned(),
                 },
             }
         );
