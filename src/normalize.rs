@@ -68,7 +68,14 @@ pub(crate) enum Cause {
     Leaf(LeafId),
     /// The branch accepts numbers, and none that a JSON number stands for.
     Number,
+    /// The branch accepts an object, and none that is nested no deeper than [`DEEPEST`].
+    Depth,
 }
+
+/// How many objects and arrays an instance may hold inside one another. `serde_json` reads
+/// no deeper text back, and copying or dropping a value recurses once for each level, so
+/// this is also what keeps a deep counterexample from running out of stack.
+pub(crate) const DEEPEST: u32 = 127;
 
 /// What the engine knows of a c-reference: whether an instance satisfies it.
 #[derive(Debug, Clone)]
@@ -86,12 +93,19 @@ pub(crate) struct Witness {
     pub value: Value,
     /// How many values it is made of, itself among them: what it costs to copy.
     pub size: u64,
+    /// How many objects and arrays it holds inside one another, itself among them.
+    pub depth: u32,
 }
 
 impl Witness {
     /// A value that holds no other.
-    fn plain(value: Value) -> Rc<Self> {
-        Rc::new(Self { value, size: 1 })
+    pub(crate) fn plain(value: Value) -> Rc<Self> {
+        let depth = u32::from(value.is_object() || value.is_array());
+        Rc::new(Self {
+            value,
+            size: 1,
+            depth,
+        })
     }
 }
 
@@ -2245,23 +2259,117 @@ mod tests {
             .unwrap();
         assert_eq!(check.verdict, Verdict::Yes);
         assert!(check.steps > 100_000, "{}", check.steps);
-        // The other way an instance holds an object for each level. What it costs to put
-        // one together grows with its depth, so the budget ends a check that goes too deep.
-        let unknown = Verdict::Unknown {
-            reason: Reason::Budget,
-        };
-        assert_eq!(Checker::new().subsumes(&whole, &any).unwrap(), unknown);
+        // The other way an instance holds an object for each level, and one that deep
+        // cannot be given: there is no counterexample, and no stack is used up for one.
+        let check = Checker::new()
+            .budget(10_000_000)
+            .check(&whole, &any)
+            .unwrap();
+        assert_eq!(reason_of(&check.verdict), Some(Reason::Unrepresentable));
         // Dropping a value this deep would recurse, which is no concern of this test.
         std::mem::forget((whole, any));
-        let (whole, any) = (
-            nested(200, json!({"type": "integer"})),
-            nested(200, json!({"type": "number"})),
-        );
-        let mut instance = &counterexample(&whole, &any);
-        for _ in 0..200 {
-            instance = &instance["a"];
+    }
+
+    /// Why a verdict is `Unknown`, if it is.
+    fn reason_of(verdict: &Verdict) -> Option<Reason> {
+        match verdict {
+            Verdict::Unknown { reason } => Some(reason.clone()),
+            _ => None,
         }
-        assert_eq!(instance, &json!(0.1));
+    }
+
+    #[test]
+    fn a_counterexample_is_no_deeper_than_it_can_be_read_back() {
+        let nested = |depth: usize, innermost: Value| {
+            let mut schema = innermost;
+            for _ in 0..depth {
+                schema = json!({"type": "object", "properties": {"a": schema}});
+            }
+            schema
+        };
+        let (integer, number) = (json!({"type": "integer"}), json!({"type": "number"}));
+        // An instance of 127 objects inside one another is given, and `serde_json` reads
+        // it back from its text.
+        let instance = counterexample(&nested(127, integer.clone()), &nested(127, number.clone()));
+        let read: Value = serde_json::from_str(&instance.to_string()).unwrap();
+        assert_eq!(read, instance);
+        let mut innermost = &instance;
+        for _ in 0..127 {
+            innermost = &innermost["a"];
+        }
+        assert_eq!(innermost, &json!(0.1));
+        // One level more is not, and neither is the text of it read.
+        assert_eq!(
+            reason(&nested(128, integer.clone()), &nested(128, number.clone())),
+            Reason::Unrepresentable
+        );
+        let mut too_deep = json!(0.1);
+        for _ in 0..128 {
+            too_deep = json!({"a": too_deep});
+        }
+        assert!(serde_json::from_str::<Value>(&too_deep.to_string()).is_err());
+        // Where another instance tells the two apart, that one is given.
+        let either = json!({"anyOf": [nested(128, number.clone()), {"type": "null"}]});
+        assert_eq!(
+            counterexample(&nested(128, integer.clone()), &either),
+            json!(null)
+        );
+        // A yes holds for instances of any depth.
+        yes(&nested(128, number.clone()), &nested(128, integer.clone()));
+
+        // A chain of schemas that each hold the next in a property, with the steps for a
+        // counterexample of that depth: copying a value recurses once for each level,
+        // which ran out of stack before there was a limit.
+        let mut definitions = Map::new();
+        for at in 0..1_500 {
+            let next = json!({"$ref": format!("#/$defs/d{}", at + 1)});
+            let link = json!({"type": "object", "required": ["a"], "properties": {"a": next}});
+            definitions.insert(format!("d{at}"), link);
+        }
+        definitions.insert("d1500".to_owned(), json!({"type": "null"}));
+        let chain = json!({"$ref": "#/$defs/d0", "$defs": definitions});
+        let check = Checker::new()
+            .budget(2_000_000)
+            .check(&json!(false), &chain)
+            .unwrap();
+        assert_eq!(reason_of(&check.verdict), Some(Reason::Unrepresentable));
+    }
+
+    #[test]
+    fn more_names_than_can_be_counted_are_never_too_few() {
+        // The pattern matches 2^64 names, and one of them may not be there. As many
+        // properties as the largest count are still to be had, so B accepts an object. It
+        // is larger than the budget covers, and the answer is not that there is none.
+        let name = "a".repeat(64);
+        let many = |least: u64| {
+            json!({
+                "type": "object",
+                "propertyNames": {"pattern": "^[ab]{64}$"},
+                "properties": {name.as_str(): false},
+                "minProperties": least,
+            })
+        };
+        assert_eq!(reason(&json!(false), &many(u64::MAX)), Reason::Budget);
+        // With one property to have, it is the plainest name that is left.
+        let other = format!("{}b", "a".repeat(63));
+        assert_eq!(
+            counterexample(&json!(false), &many(1)),
+            json!({other: null})
+        );
+        // Names that can be counted are counted exactly.
+        let few = |least: u64| {
+            json!({
+                "type": "object",
+                "propertyNames": {"pattern": "^[ab]{2}$"},
+                "properties": {"aa": false},
+                "minProperties": least,
+            })
+        };
+        yes(&json!(false), &few(4));
+        assert_eq!(
+            counterexample(&json!(false), &few(3)),
+            json!({"ab": null, "ba": null, "bb": null})
+        );
     }
 
     #[test]

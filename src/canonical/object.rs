@@ -38,7 +38,7 @@ use serde_json::{Map, Value};
 
 use crate::context::{Budget, Exhausted};
 use crate::language::{LanguageId, Languages, Lengths, Shape};
-use crate::normalize::{Cause, Found, Witness};
+use crate::normalize::{Cause, DEEPEST, Found, Witness};
 use crate::term::{CRefId, Term, Terms};
 
 /// The objects that a branch still accepts.
@@ -664,19 +664,32 @@ impl Search<'_> {
             self.depends.get_or_insert(cause);
             return Ok(None);
         }
+        // An object is one level deeper than the deepest of its values. One that would be
+        // too deep to give is passed over for another.
+        let values = self
+            .slots
+            .iter()
+            .filter_map(|slot| slot.value.as_ref().ok());
+        let values = values.chain(more.iter().map(|(_, _, value)| value));
+        let deepest = values.map(|value| value.depth).max().unwrap_or(0);
+        if deepest >= DEEPEST {
+            self.depends.get_or_insert(Cause::Depth);
+            return Ok(None);
+        }
         if !give {
             return Ok(Some(Left::Object(None)));
         }
-        let object = self.given(with, &more)?;
+        let object = self.given(with, &more, deepest + 1)?;
         Ok(Some(Left::Object(Some(object))))
     }
 
     /// The object: a name and a value for each slot, and for each property that was added
-    /// to have enough.
+    /// to have enough. `depth` is how deep it is.
     fn given(
         &self,
         with: &mut Solver,
         more: &[(usize, u64, Rc<Witness>)],
+        depth: u32,
     ) -> Result<Rc<Witness>, Exhausted> {
         let filled = self.slots.iter().map(|slot| {
             let value = slot.value.as_ref().expect("every slot has a value");
@@ -709,6 +722,7 @@ impl Search<'_> {
         Ok(Rc::new(Witness {
             value: Value::Object(members),
             size,
+            depth,
         }))
     }
 }
@@ -846,7 +860,7 @@ mod tests {
                 format!("{sign}{}", variable.index())
             });
             let value = json!(named.collect::<Vec<_>>().join(" "));
-            Found::Instance(Rc::new(Witness { value, size: 1 }))
+            Found::Instance(Witness::plain(value))
         }
 
         /// What is left, with the engine deciding what it is asked for until nothing is
@@ -856,10 +870,7 @@ mod tests {
                 let found = &self.found;
                 let mut ask = |of: CRefId| match of {
                     Terms::NOTHING => Some(Found::Nothing),
-                    Terms::ANYTHING => Some(Found::Instance(Rc::new(Witness {
-                        value: Value::Null,
-                        size: 1,
-                    }))),
+                    Terms::ANYTHING => Some(Found::Instance(Witness::plain(Value::Null))),
                     _ => found.get(&of).cloned(),
                 };
                 let mut solver = Solver {

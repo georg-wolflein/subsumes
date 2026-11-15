@@ -78,7 +78,7 @@ impl Checker {
         let verdict = match outcome {
             Ok(Outcome::Yes) => Verdict::Yes,
             Ok(Outcome::No(counterexample)) => Verdict::No { counterexample },
-            Ok(Outcome::Unknown(Cause::Number)) => Verdict::Unknown {
+            Ok(Outcome::Unknown(Cause::Number | Cause::Depth)) => Verdict::Unknown {
                 reason: Reason::Unrepresentable,
             },
             Ok(Outcome::Unknown(Cause::Leaf(leaf))) => {

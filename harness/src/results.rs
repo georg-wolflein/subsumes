@@ -107,7 +107,7 @@ impl Outcome {
 fn group(reason: &Reason) -> String {
     match reason {
         Reason::Budget => "budget".to_owned(),
-        Reason::Unrepresentable => "unrepresentable number".to_owned(),
+        Reason::Unrepresentable => "unrepresentable instance".to_owned(),
         Reason::Unsupported { location, .. } => keyword(location),
         _ => "other".to_owned(),
     }

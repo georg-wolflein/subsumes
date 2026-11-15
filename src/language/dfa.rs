@@ -328,8 +328,8 @@ impl Dfa {
         self.accepts[state]
     }
 
-    /// How many words are accepted, or `None` if there is no end of them. A count that a
-    /// `u64` does not hold is the largest that it does.
+    /// How many words are accepted, or `None` if there is no end of them, or more than a
+    /// `u64` counts. A count is exact, so that what is taken from it is exact too.
     ///
     /// # Errors
     ///
@@ -380,8 +380,11 @@ impl Dfa {
         for &state in order.iter().rev() {
             let mut from_here = u64::from(self.accepts[state]);
             for (class, to) in row(state).iter().enumerate() {
-                let onward = characters[class].saturating_mul(words[*to as usize]);
-                from_here = from_here.saturating_add(onward);
+                let onward = characters[class].checked_mul(words[*to as usize]);
+                let Some(more) = onward.and_then(|onward| from_here.checked_add(onward)) else {
+                    return Ok(None);
+                };
+                from_here = more;
             }
             words[state] = from_here;
         }

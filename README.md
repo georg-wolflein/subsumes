@@ -16,7 +16,7 @@ Each check returns one of three verdicts:
 
 - **`Yes`**: Every instance valid under B is also valid under A.
 - **`No`**: Some instance is valid under B but invalid under A. The verdict carries such an instance as a counterexample.
-- **`Unknown`**: The library cannot decide and provides a reason: the answer depends on an [unsupported construct](#unsupported-constructs), the check ran out of its work budget, or the schemas differ in a [number](#numbers) that cannot be written exactly.
+- **`Unknown`**: The library cannot decide and provides a reason: the answer depends on an [unsupported construct](#unsupported-constructs), the check ran out of its work budget, or the schemas differ only in instances that cannot be given: a [number](#numbers) that cannot be written exactly, or a value that is nested deeper than 127 levels.
 
 ## Status
 
@@ -59,7 +59,7 @@ Any other format is an [unsupported construct](#unsupported-constructs).
 
 The value of a property is an instance of its own, and is compared as one: its numbers exactly, its strings as languages, and an object inside it the same way again. A schema may hold itself in a property, as a list or a tree does. It then accepts the instances that can be built in finitely many steps, so a list whose every element must have a next one accepts nothing.
 
-A counterexample that is an object has the properties that it must have and no more, such as `{"name": null}` for a `name` that should have been a string. A name that no schema lists is made up: `"a"`, then `"b"`.
+A counterexample that is an object has the properties that it must have and no more, such as `{"name": null}` for a `name` that should have been a string. A name that no schema lists is made up: `"a"`, then `"b"`. A counterexample holds at most 127 objects inside one another, which is as deep as `serde_json` reads a value back from text.
 
 ## Numbers
 

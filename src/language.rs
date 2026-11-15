@@ -506,8 +506,8 @@ impl Languages {
         Ok(self.dfa(id, budget)?.accepts(word))
     }
 
-    /// How many words the language has, or `None` if there is no end of them. A count that
-    /// a `u64` does not hold is the largest that it does.
+    /// How many words the language has, or `None` if there is no end of them, or more than
+    /// a `u64` counts.
     ///
     /// # Errors
     ///
@@ -953,8 +953,12 @@ mod tests {
         assert_eq!(size(&mut store, "^a*$"), None);
         assert_eq!(size(&mut store, "a"), None);
         assert_eq!(size(&mut store, "^a[^a]$"), Some(u64::from(LAST)));
-        // A count that is more than can be held is the most that can.
-        assert_eq!(size(&mut store, "(?s)^.{9}$"), Some(u64::MAX));
+        // More words than can be counted are as good as no end of them. The count is never
+        // rounded: one less than too many is counted exactly.
+        assert_eq!(size(&mut store, "(?s)^.{9}$"), None);
+        assert_eq!(size(&mut store, "^[ab]{64}$"), None);
+        assert_eq!(size(&mut store, "^[ab]{63}$"), Some(1 << 63));
+        assert_eq!(size(&mut store, "^[ab]{1,63}$"), Some(u64::MAX - 1));
         assert_eq!(size(&mut store, "$a"), Some(0));
         let (few, others) = (store.0.words(["a", "b", "c"]), store.0.words(["a"]));
         let others = store.not(others);

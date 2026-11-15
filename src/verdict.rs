@@ -33,10 +33,12 @@ pub enum Reason {
         /// the cycle closes.
         location: String,
     },
-    /// A number is valid under B and invalid under A, but the library found no such number
-    /// that a JSON value holds exactly. A number between two floats that are next to each
-    /// other has more digits than a float keeps, for one. So A does not subsume B, and
-    /// there is no counterexample to give.
+    /// An instance is valid under B and invalid under A, but the library found none that
+    /// it can give. So A does not subsume B, and there is no counterexample.
+    ///
+    /// That is a number that no JSON value holds exactly: one between two floats that are
+    /// next to each other has more digits than a float keeps. Or it is a value of more than
+    /// 127 objects inside one another, which is deeper than `serde_json` reads back.
     Unrepresentable,
     /// The check ran out of its work budget.
     Budget,
@@ -49,7 +51,8 @@ impl fmt::Display for Reason {
                 write!(f, "{location} in schema {schema} is not supported")
             }
             Self::Unrepresentable => f.write_str(
-                "the schemas differ in a number that a JSON value does not hold exactly",
+                "the schemas differ in an instance that cannot be given: a number that a JSON \
+                 value does not hold exactly, or a value that is nested too deep",
             ),
             Self::Budget => f.write_str("the check ran out of its work budget"),
         }
