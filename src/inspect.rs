@@ -85,6 +85,11 @@ fn row(graph: &Graph, terms: &Terms, languages: &Languages, part: TermId) -> Val
         Term::StrConst(word) => json!(["is", format!("{word:?}")]),
         Term::Patt(language) => json!(["string", languages.show(*language)]),
         Term::MinLen(_) | Term::MaxLen(_) => json!(["string", terms.show_with(part, languages)]),
+        Term::PProp(..)
+        | Term::PReq(_)
+        | Term::PNames(_)
+        | Term::MinProps(_)
+        | Term::MaxProps(_) => json!(["object", terms.show_with(part, languages)]),
         Term::Unknown(leaf) => {
             let leaf = terms.leaf(*leaf);
             let about: Vec<&str> = leaf.domain.iter().map(|kind| kind.name()).collect();
@@ -104,8 +109,9 @@ fn row(graph: &Graph, terms: &Terms, languages: &Languages, part: TermId) -> Val
     }
 }
 
-/// The variables that a term refers to, each with how: plainly, under a negation, or in a
-/// `OneOf`, which takes each of its parts both ways.
+/// The variables that a term refers to, each with how: plainly, under a negation, in a
+/// `OneOf`, which takes each of its parts both ways, or for the values or the names of the
+/// properties of an object.
 fn referred(terms: &Terms, term: TermId) -> Vec<(VarId, &'static str)> {
     let mut found: Vec<(VarId, &'static str)> = Vec::new();
     let mut pending = vec![(term, "")];
@@ -134,6 +140,16 @@ fn referred(terms: &Terms, term: TermId) -> Vec<(VarId, &'static str)> {
             Term::NumConst(_) => {}
             Term::Min(_) | Term::ExMin(_) | Term::Max(_) | Term::ExMax(_) | Term::Mof(_) => {}
             Term::StrConst(_) | Term::Patt(_) | Term::MinLen(_) | Term::MaxLen(_) => {}
+            Term::PProp(_, variable) | Term::PNames(variable) => {
+                let how = match terms.term(term) {
+                    Term::PNames(_) => "names",
+                    _ => "properties",
+                };
+                if !found.contains(&(*variable, how)) {
+                    found.push((*variable, how));
+                }
+            }
+            Term::PReq(_) | Term::MinProps(_) | Term::MaxProps(_) => {}
         }
     }
     found
@@ -261,6 +277,44 @@ mod tests {
                 "any of",
                 r#"any(patt(format time), all(patt(format time, where it is open), ?[format "time" where it is open]))"#
             ]])
+        );
+    }
+
+    #[test]
+    fn what_a_term_says_about_objects_is_a_row_each_with_an_edge_to_each_schema() {
+        let schema = json!({
+            "properties": {"a": {"type": "null"}},
+            "additionalProperties": false,
+            "propertyNames": {"maxLength": 3},
+            "required": ["a"],
+            "maxProperties": 2,
+        });
+        let shown = shown(&schema, &json!(true), u64::MAX);
+        let terms = &shown["stages"][1];
+        assert_eq!(
+            terms["nodes"][0]["keywords"],
+            json!([
+                ["object", r#"pprop(one of ["a"]: x2)"#],
+                ["object", r#"pprop(any string but "a": x3)"#],
+                ["object", "pnames(x4)"],
+                ["object", r#"preq(one of ["a"])"#],
+                ["object", "maxprops(2)"],
+            ])
+        );
+        let from_a: Vec<(&Value, &Value)> = terms["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|edge| edge["from"] == 0)
+            .map(|edge| (&edge["to"], &edge["keyword"]))
+            .collect();
+        assert_eq!(
+            from_a,
+            [
+                (&json!(2), &json!("properties")),
+                (&json!(3), &json!("properties")),
+                (&json!(4), &json!("names")),
+            ]
         );
     }
 

@@ -4,12 +4,16 @@
 //! a variable, and the term of the variable says what its keywords say. Schemas that say the
 //! same share a variable, also between A and B.
 //!
-//! The engine models the types, `null`, the booleans, numbers, strings, the connectives and
-//! references. Every other keyword becomes a predicate that it does not model, a leaf, which
-//! keeps the place where it stands. A leaf says something only about the instances its
-//! keyword is about: `minItems` about arrays, and so a number satisfies it. The terms about
-//! numbers and about strings are the same in that: a string satisfies `minimum`, and a
-//! number satisfies `minLength`.
+//! The engine models the types, `null`, the booleans, numbers, strings, objects, the
+//! connectives and references. Every other keyword becomes a predicate that it does not
+//! model, a leaf, which keeps the place where it stands. A leaf says something only about
+//! the instances its keyword is about: `minItems` about arrays, and so a number satisfies
+//! it. The terms about numbers, about strings and about objects are the same in that: a
+//! string satisfies `minimum`, and a number satisfies `minLength` and `required`.
+//!
+//! A schema that is the value of a property is not reached in place: it is asked of a
+//! value inside the instance. It has a variable too, which the term about the property
+//! names.
 
 mod classes;
 
@@ -209,26 +213,18 @@ impl Lowering<'_, '_> {
         }
         // An instance that is no object, or has no such property, or satisfies the schema.
         for (name, schema) in &keywords.dependent_schemas {
-            let absent = self.absent(id, "dependentSchemas", name);
+            let present = self.has_property(name);
             let schema = self.refer(*schema);
-            parts.push(self.context.terms.any_of([absent, schema]));
+            let terms = &mut self.context.terms;
+            let (other, lacks) = (terms.type_is(OBJECT.complement()), terms.not(present));
+            parts.push(terms.any_of([other, lacks, schema]));
         }
     }
 
-    /// The leaf for "an object has this property". An instance that is no object satisfies
-    /// it, as it satisfies `required`.
-    fn has_property(&mut self, id: NodeId, keyword: &'static str, name: &str) -> TermId {
-        self.leaf(OBJECT, id, keyword, format!("required {}", written!(name)))
-    }
-
-    /// The term for "no object, or an object without this property".
-    fn absent(&mut self, id: NodeId, keyword: &'static str, name: &str) -> TermId {
-        let present = self.has_property(id, keyword, name);
-        let (other, lacks) = (
-            self.context.terms.type_is(OBJECT.complement()),
-            self.context.terms.not(present),
-        );
-        self.context.terms.any_of([other, lacks])
+    /// The term for "no object, or an object with this property".
+    fn has_property(&mut self, name: &str) -> TermId {
+        let named = self.context.languages.words([name]);
+        self.context.terms.p_req(named)
     }
 
     fn any_type(&mut self, id: NodeId, keywords: &Keywords, parts: &mut Vec<TermId>) {
@@ -402,52 +398,80 @@ impl Lowering<'_, '_> {
     }
 
     fn objects(&mut self, id: NodeId, keywords: &Keywords, parts: &mut Vec<TermId>) {
-        let named = |lowering: &Self, schemas: &[(&str, NodeId)]| -> Vec<String> {
-            let named = schemas.iter();
-            named
-                .map(|(name, schema)| format!("{} {}", written!(name), lowering.class(*schema)))
-                .collect()
-        };
-        let properties = named(self, &keywords.properties);
-        let patterns = named(self, &keywords.pattern_properties);
-        if let Some(schema) = keywords.additional_properties {
-            // `additionalProperties` is about the properties that the other two do not
-            // name, so the three are one predicate.
-            let key = format!(
-                "properties {{{}}} patternProperties {{{}}} additionalProperties {}",
-                properties.join(", "),
-                patterns.join(", "),
-                self.class(schema)
-            );
-            parts.push(self.leaf(OBJECT, id, "additionalProperties", key));
-        } else {
-            for property in properties {
-                parts.push(self.leaf(OBJECT, id, "properties", format!("properties {property}")));
+        // A property with this name satisfies the schema.
+        for (name, schema) in &keywords.properties {
+            let variable = self.variable(*schema);
+            let named = self.context.languages.words([*name]);
+            parts.push(self.context.terms.p_prop(named, variable));
+        }
+        // So does one whose name the pattern matches. A pattern that is not read as a
+        // language is a leaf.
+        let mut patterns = Vec::with_capacity(keywords.pattern_properties.len());
+        let mut all_read = true;
+        for (pattern, schema) in &keywords.pattern_properties {
+            let variable = self.variable(*schema);
+            match self.context.languages.pattern(pattern) {
+                Ok(matched) => {
+                    patterns.push(matched);
+                    parts.push(self.context.terms.p_prop(matched, variable));
+                }
+                Err(_) => {
+                    all_read = false;
+                    let (pattern, schema) = (written!(pattern), self.class(*schema));
+                    let key = format!("patternProperties {pattern} {schema}");
+                    parts.push(self.leaf(OBJECT, id, "patternProperties", key));
+                }
             }
-            for pattern in patterns {
-                let key = format!("patternProperties {pattern}");
-                parts.push(self.leaf(OBJECT, id, "patternProperties", key));
+        }
+        // `additionalProperties` is about the properties that the other two do not name:
+        // those whose name is none of the names and in none of the languages. With a
+        // pattern that is not read, which properties those are is not known, and the
+        // keyword is a leaf together with what it depends on.
+        if let Some(schema) = keywords.additional_properties {
+            let names: Vec<&str> = keywords.properties.iter().map(|(name, _)| *name).collect();
+            if all_read {
+                let variable = self.variable(schema);
+                let languages = &mut self.context.languages;
+                let named = languages.words(names);
+                let others = languages.outside(patterns.into_iter().chain([named]));
+                parts.push(self.context.terms.p_prop(others, variable));
+            } else {
+                let patterns = keywords.pattern_properties.iter();
+                let patterns: Vec<&str> = patterns.map(|(pattern, _)| *pattern).collect();
+                let key = format!(
+                    "additionalProperties {} but for {} and {}",
+                    self.class(schema),
+                    written!(&names),
+                    written!(&patterns),
+                );
+                parts.push(self.leaf(OBJECT, id, "additionalProperties", key));
             }
         }
         if let Some(schema) = keywords.property_names {
-            let key = format!("propertyNames {}", self.class(schema));
-            parts.push(self.leaf(OBJECT, id, "propertyNames", key));
+            let variable = self.variable(schema);
+            parts.push(self.context.terms.p_names(variable));
         }
         for name in &keywords.required {
-            parts.push(self.has_property(id, "required", name));
+            parts.push(self.has_property(name));
         }
-        // An instance that is no object, or has no such property, or has all the others.
+        // An object without such a property, or an instance that has all the others if it
+        // is an object, which also what is no object does.
         for (name, needed) in &keywords.dependent_required {
-            let absent = self.absent(id, "dependentRequired", name);
-            let needed: Vec<TermId> = needed
-                .iter()
-                .map(|name| self.has_property(id, "dependentRequired", name))
-                .collect();
-            let all = self.context.terms.all_of(needed);
-            parts.push(self.context.terms.any_of([absent, all]));
+            let present = self.has_property(name);
+            let needed: Vec<TermId> = needed.iter().map(|name| self.has_property(name)).collect();
+            let terms = &mut self.context.terms;
+            let (lacks, all) = (terms.not(present), terms.all_of(needed));
+            parts.push(terms.any_of([lacks, all]));
         }
-        self.count(OBJECT, id, "minProperties", keywords.min_properties, parts);
-        self.count(OBJECT, id, "maxProperties", keywords.max_properties, parts);
+        // A count that was too large to keep stays a leaf.
+        match keywords.min_properties {
+            Some(Count::Of(least)) => parts.push(self.context.terms.min_props(least)),
+            beyond => self.count(OBJECT, id, "minProperties", beyond, parts),
+        }
+        match keywords.max_properties {
+            Some(Count::Of(most)) => parts.push(self.context.terms.max_props(most)),
+            beyond => self.count(OBJECT, id, "maxProperties", beyond, parts),
+        }
         if keywords.unevaluated_properties.is_some() {
             let key = format!("unevaluatedProperties of {}", self.class(id));
             parts.push(self.leaf(OBJECT, id, "unevaluatedProperties", key));
@@ -601,19 +625,93 @@ mod tests {
         let no_object = "type(null | boolean | number | string | array)";
         assert_eq!(
             term(&json!({"dependentSchemas": {"a": {"type": "null"}}})),
-            format!(r#"any({no_object}, not ?[required "a"], x2)"#)
+            format!("any({no_object}, not preq(l2), x2)")
         );
+        // What is no object has every property that is asked for, as far as `required`
+        // goes, so it needs no alternative of its own here.
         assert_eq!(
             term(&json!({"dependentRequired": {"a": ["b", "c"]}})),
-            format!(
-                r#"any({no_object}, not ?[required "a"], all(?[required "b"], ?[required "c"]))"#
-            )
+            "any(not preq(l2), all(preq(l3), preq(l4)))"
         );
-        // The leaf is the one that `required` has.
+        assert_eq!(term(&json!({"dependentRequired": {"a": []}})), "true");
+        // The term is the one that `required` has.
         assert_eq!(
             term(&json!({"required": ["a", "b"]})),
-            r#"all(?[required "a"], ?[required "b"])"#
+            "all(preq(l2), preq(l3))"
         );
+        assert_eq!(
+            term(&json!({"required": ["a"], "dependentRequired": {"b": ["a"]}})),
+            "all(preq(l2), any(not preq(l3), preq(l2)))"
+        );
+    }
+
+    #[test]
+    fn a_keyword_about_objects_is_a_term() {
+        let schema = json!({
+            "properties": {"a": {"type": "null"}, "b": {"type": "null"}},
+            "patternProperties": {"^c": {"type": "string"}},
+            "additionalProperties": false,
+            "propertyNames": {"maxLength": 3},
+            "required": ["a"],
+            "minProperties": 1,
+            "maxProperties": 2,
+        });
+        // The two properties are one class, and so one variable.
+        assert_eq!(
+            terms(&schema, &json!(true))[0],
+            "all(pprop(l2: x2), pprop(l3: x2), pprop(l4: x3), pprop(l6: x4), pnames(x5), \
+             preq(l2), minprops(1), maxprops(2))"
+        );
+        assert_eq!(
+            languages(&schema),
+            [
+                r#"one of ["a"]"#,
+                r#"one of ["b"]"#,
+                r#""^c""#,
+                r#"none of ["^c", one of ["a", "b"]]"#,
+            ]
+        );
+        // Without a pattern, what `additionalProperties` is about is every name but a few.
+        let closed = json!({"properties": {"a": {}, "b": {}}, "additionalProperties": false});
+        assert_eq!(languages(&closed)[2], r#"any string but "a", "b""#);
+        assert_eq!(
+            languages(&json!({"additionalProperties": false})),
+            ["any string"]
+        );
+        // A pattern that is one word between `^` and `$` is that word.
+        let (pattern, property) = (
+            json!({"patternProperties": {"^a$": {"type": "null"}}}),
+            json!({"properties": {"a": {"type": "null"}}}),
+        );
+        assert_eq!(term(&pattern), term(&property));
+        // At least no property is what every object has.
+        assert_eq!(term(&json!({"minProperties": 0})), "true");
+        assert_eq!(term(&json!({"maxProperties": 0})), "maxprops(0)");
+    }
+
+    #[test]
+    fn a_pattern_of_names_that_is_not_read_is_a_leaf_and_so_is_what_depends_on_it() {
+        let schema = json!({
+            "properties": {"a": {"type": "null"}},
+            "patternProperties": {r"\bb": {"type": "null"}, "^c": {"type": "null"}},
+            "additionalProperties": false,
+        });
+        let term = term(&schema);
+        assert!(
+            term.starts_with(r#"all(pprop(l2: x2), ?[patternProperties "\\bb" #"#),
+            "{term}"
+        );
+        assert!(
+            term.contains(r#"], pprop(l3: x2), ?[additionalProperties #"#),
+            "{term}"
+        );
+        assert!(
+            term.ends_with(r#" but for ["a"] and ["\\bb","^c"]])"#),
+            "{term}"
+        );
+        // A count that was too large to keep is a leaf too.
+        let huge = self::term(&json!({"minProperties": 1e30}));
+        assert!(huge.starts_with("?[minProperties @"), "{huge}");
     }
 
     /// What the terms of a schema that are about a language are about, as text.
@@ -630,7 +728,9 @@ mod tests {
         let shown = parts
             .iter()
             .filter_map(|part| match context.terms.term(*part) {
-                crate::term::Term::Patt(language) => Some(context.languages.show(*language)),
+                crate::term::Term::Patt(language) | crate::term::Term::PProp(language, _) => {
+                    Some(context.languages.show(*language))
+                }
                 _ => None,
             });
         shown.collect()
@@ -679,12 +779,11 @@ mod tests {
         let schema = json!({
             "minItems": 4,
             "uniqueItems": true,
-            "required": ["a"],
-            "minProperties": 5,
+            "maxItems": 5,
         });
         assert_eq!(
             term(&schema),
-            r#"all(?[minItems 4], ?[uniqueItems], ?[required "a"], ?[minProperties 5])"#
+            "all(?[minItems 4], ?[maxItems 5], ?[uniqueItems])"
         );
         assert_eq!(term(&json!({"uniqueItems": false})), "true");
         // `minContains` says nothing without `contains`.
@@ -732,19 +831,6 @@ mod tests {
         );
         let prefix = term(&json!({"prefixItems": [{}]}));
         assert!(prefix.ends_with("then any]"), "{prefix}");
-        // `additionalProperties` is about what the other two leave.
-        let closed = json!({
-            "properties": {"a": {}},
-            "patternProperties": {"^b": {}},
-            "additionalProperties": false,
-        });
-        let closed = term(&closed);
-        assert!(closed.starts_with(r#"?[properties {"a" #"#), "{closed}");
-        assert!(closed.contains("additionalProperties #") && count(&closed) == 1);
-        // Without it, every property is a leaf of its own.
-        let open =
-            term(&json!({"properties": {"a": {}, "b": {}}, "patternProperties": {"^c": {}}}));
-        assert_eq!(count(&open), 3, "{open}");
         // The bounds of `contains` belong to it.
         let contains = term(&json!({"contains": {}, "minContains": 2}));
         assert!(contains.ends_with("from 2 to unset]"), "{contains}");
@@ -761,10 +847,11 @@ mod tests {
         let (terms, of_a, of_b) = lowered(&a, &b);
         assert_eq!(of_a, of_b);
         assert_eq!(terms.variable(of_a).sides, [true, true]);
-        assert_eq!(terms.variables().count(), 1);
+        // The schema and its two properties. What `items` holds is inside a leaf.
+        assert_eq!(terms.variables().count(), 3);
 
-        // One property changes. The variables of A and B differ, and so does that leaf, but
-        // the leaves of what stayed are shared.
+        // One property changes. The variables of A and B differ, and so does the term of
+        // that property, but the terms of what stayed are shared.
         b["properties"]["age"] = json!({"minimum": 1});
         let (terms, of_a, of_b) = lowered(&a, &b);
         assert_ne!(of_a, of_b);
@@ -779,6 +866,8 @@ mod tests {
         assert_eq!((of_a.len(), of_b.len()), (4, 4));
         let shared = of_a.iter().filter(|part| of_b.contains(part)).count();
         assert_eq!(shared, 3);
+        // A and B, the name, which they share, and the two ages.
+        assert_eq!(terms.variables().count(), 5);
     }
 
     #[test]
@@ -820,6 +909,9 @@ mod tests {
         // What a leaf holds is not opened, so the cycle through `items` ends in the leaf.
         let tree = json!({"items": {"$ref": "#"}});
         assert_eq!(terms(&tree, &json!(true)).len(), 2);
+        // The schema of a property has a variable, and a cycle through it is one of terms.
+        let chain = json!({"properties": {"next": {"$ref": "#"}}});
+        assert_eq!(terms(&chain, &json!(true)), ["pprop(l2: x2)", "true", "x0"]);
     }
 
     #[test]

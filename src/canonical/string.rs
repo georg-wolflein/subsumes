@@ -157,6 +157,27 @@ impl Strings {
         languages.is_empty(self.left, self.lengths, budget)
     }
 
+    /// The language of the strings of the set, unless its bounds on the length are more
+    /// than a pattern says.
+    ///
+    /// # Errors
+    ///
+    /// When the budget does not cover the DFAs.
+    pub fn language(
+        &self,
+        languages: &mut Languages,
+        budget: &mut Budget,
+    ) -> Result<Option<LanguageId>, Exhausted> {
+        if self.none {
+            return Ok(Some(Languages::NOTHING));
+        }
+        let Some(of_length) = languages.of_lengths(self.lengths) else {
+            return Ok(None);
+        };
+        let left = self.settled(languages, budget)?;
+        languages.intersection(left, of_length, budget).map(Some)
+    }
+
     /// The shortest string of the set, if it has one. Of several it is one of plain
     /// characters.
     ///
