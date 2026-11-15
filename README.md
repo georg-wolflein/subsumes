@@ -16,13 +16,13 @@ Each check returns one of three verdicts:
 
 - **`Yes`**: Every instance valid under B is also valid under A.
 - **`No`**: Some instance is valid under B but invalid under A. The verdict carries such an instance as a counterexample.
-- **`Unknown`**: The library cannot decide and provides a reason: the answer depends on an [unsupported construct](#unsupported-constructs), the check ran out of its work budget, or the schemas differ in a [number](#numbers) that cannot be written exactly.
+- **`Unknown`**: The library cannot decide and provides a reason: the answer depends on an [unsupported construct](#unsupported-constructs), the check ran out of its work budget, or the schemas differ only in instances that cannot be given: a [number](#numbers) that cannot be written exactly, or a value that is nested deeper than 127 levels.
 
 ## Status
 
-The engine is being built keyword by keyword. So far it models the types, `null`, the booleans, numbers, strings, `allOf`, `anyOf`, `oneOf`, `not`, `if`/`then`/`else` and `$ref`. For numbers that is `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, `integer`, and a number in `const` or `enum`. For strings it is `minLength`, `maxLength`, `pattern`, `format`, and a string in `const` or `enum`. A check whose answer depends on any other keyword returns `Unknown` and names the keyword. So does every check of a schema that uses a `$dynamicRef`, until the engine models it.
+The engine is being built keyword by keyword. So far it models the types, `null`, the booleans, numbers, strings, objects, `allOf`, `anyOf`, `oneOf`, `not`, `if`/`then`/`else` and `$ref`. For numbers that is `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, `integer`, and a number in `const` or `enum`. For strings it is `minLength`, `maxLength`, `pattern`, `format`, and a string in `const` or `enum`. For objects it is `properties`, `patternProperties`, `additionalProperties`, `propertyNames`, `required`, `dependentRequired`, `dependentSchemas`, `minProperties` and `maxProperties`. A check whose answer depends on any other keyword returns `Unknown` and names the keyword: the keywords about arrays, `unevaluatedProperties`, and an array or an object in `const` or `enum`. So does every check of a schema that uses a `$dynamicRef`, until the engine models it.
 
-Two schemas that share such a keyword with the same value can still be decided, because what both say cancels. That is enough to decide a good third of the checks of the benchmark corpus.
+Two schemas that share such a keyword with the same value can still be decided, because what both say cancels. The engine decides two thirds of the checks of the benchmark corpus.
 
 ## Goals
 
@@ -39,6 +39,8 @@ The dialect changes answers. In ECMA-262, `\d` matches only `0` to `9`; in the `
 
 A pattern matches a string when it matches anywhere in it, as the draft says, so `a` accepts `"banana"`. A counterexample that is a string is the shortest of the alternative in which the library finds one, such as `"A"` for a string of letters that is not one of lower-case letters. Where a schema has several alternatives, as an `enum` has, a later one may hold a shorter string.
 
+The keys of `patternProperties` are read the same way, and so is a `pattern` under `propertyNames`.
+
 Other dialects may be supported later. For now this is the only one.
 
 ## Formats
@@ -52,6 +54,12 @@ A `duration` in lower-case letters, such as `p1d`, is left open too: the grammar
 An `ipv4` address has no number with a zero before it, so `01.2.3.4` is none. The grammar that the draft names would allow it. The library follows the benchmark corpus and validators here, which do not.
 
 Any other format is an [unsupported construct](#unsupported-constructs).
+
+## Objects
+
+The value of a property is an instance of its own, and is compared as one: its numbers exactly, its strings as languages, and an object inside it the same way again. A schema may hold itself in a property, as a list or a tree does. It then accepts the instances that can be built in finitely many steps, so a list whose every element must have a next one accepts nothing.
+
+A counterexample that is an object has the properties that it must have and no more, such as `{"name": null}` for a `name` that should have been a string. A name that no schema lists is made up: `"a"`, then `"b"`. A counterexample holds at most 127 objects inside one another, which is as deep as `serde_json` reads a value back from text.
 
 ## Numbers
 

@@ -2,9 +2,9 @@
 //!
 //! `all[B, not A]` is taken apart into *branches*. A branch is a conjunction of what the
 //! engine knows how to combine: the types an instance may still have, the booleans, the
-//! numbers and the strings it may still be, the leaves that must hold and those that must
-//! not, and the variables taken for true or for false. A disjunction splits a branch in as
-//! many as it has alternatives.
+//! numbers, the strings and the objects it may still be, the leaves that must hold and
+//! those that must not, and the variables taken for true or for false. A disjunction splits
+//! a branch in as many as it has alternatives.
 //!
 //! - A branch that contradicts itself is *refuted*. If every branch is, A subsumes B.
 //! - A branch that is not refuted and has a type that no leaf is about gives an instance of
@@ -15,19 +15,41 @@
 //! about numbers and about strings is exact: when no number satisfies it, the branch has no
 //! number among its instances, and when one does, that number is an instance. So it is with
 //! strings.
+//!
+//! # Values inside an instance
+//!
+//! What a branch says about objects is about the values of their properties, and a value
+//! is an instance of its own. What a value has to satisfy is a *c-reference*: a set of
+//! variables, each as it stands or negated. Whether there is such a value is the question
+//! that the check began with, asked of other schemas, and it is answered the same way: by
+//! a *task*, which takes the c-reference apart into branches. The answer of a task is
+//! kept, so that each c-reference is decided once.
+//!
+//! A branch that needs to know of a c-reference waits while a task decides it. The tasks
+//! that wait are a stack, and none of this recurses, however deep the schemas go.
+//!
+//! A schema may hold itself in a property, and then a task comes to ask for a c-reference
+//! that a task below it on the stack is still deciding. A value is finite, so such a
+//! c-reference accepts what it can be shown to accept without itself: it is taken to accept
+//! nothing. An answer that was found that way holds only as long as the task below is at
+//! work, unless it is an instance, which nothing can take back. So it is kept apart, and
+//! becomes an answer for good when the task below ends without an instance either.
 
 #[cfg(test)]
 mod exhaustive;
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::rc::Rc;
 
 use serde_json::Value;
 
 use crate::canonical::number::Numbers;
+use crate::canonical::object::{Left, Objects, Partitions, Solver};
 use crate::canonical::string::Strings;
 use crate::context::{Context, Exhausted};
 use crate::generate;
-use crate::term::{InstanceType, LeafId, Term, TermId, Terms, TypeSet, VarId};
+use crate::language::{LanguageId, Languages};
+use crate::term::{CRefId, InstanceType, LeafId, Term, TermId, Terms, TypeSet, VarId};
 
 /// What the engine makes of two schemas.
 #[derive(Debug, PartialEq)]
@@ -46,6 +68,45 @@ pub(crate) enum Cause {
     Leaf(LeafId),
     /// The branch accepts numbers, and none that a JSON number stands for.
     Number,
+    /// The branch accepts an object, and none that is nested no deeper than [`DEEPEST`].
+    Depth,
+}
+
+/// How many objects and arrays an instance may hold inside one another. `serde_json` reads
+/// no deeper text back, and copying or dropping a value recurses once for each level, so
+/// this is also what keeps a deep counterexample from running out of stack.
+pub(crate) const DEEPEST: u32 = 127;
+
+/// What the engine knows of a c-reference: whether an instance satisfies it.
+#[derive(Debug, Clone)]
+pub(crate) enum Found {
+    /// None does.
+    Nothing,
+    /// One may, and this stands between the engine and an instance.
+    Unknown(Cause),
+    Instance(Rc<Witness>),
+}
+
+/// An instance that the engine gives.
+#[derive(Debug)]
+pub(crate) struct Witness {
+    pub value: Value,
+    /// How many values it is made of, itself among them: what it costs to copy.
+    pub size: u64,
+    /// How many objects and arrays it holds inside one another, itself among them.
+    pub depth: u32,
+}
+
+impl Witness {
+    /// A value that holds no other.
+    pub(crate) fn plain(value: Value) -> Rc<Self> {
+        let depth = u32::from(value.is_object() || value.is_array());
+        Rc::new(Self {
+            value,
+            size: 1,
+            depth,
+        })
+    }
 }
 
 /// Decides whether the schema of `a` accepts every instance that the schema of `b` accepts.
@@ -54,52 +115,24 @@ pub(crate) enum Cause {
 ///
 /// When the budget does not cover the work.
 pub(crate) fn decide(context: &mut Context, a: VarId, b: VarId) -> Result<Outcome, Exhausted> {
-    let (a, b) = (context.terms.reference(a), context.terms.reference(b));
+    let terms = &mut context.terms;
+    let (accepted, rejected) = (terms.literal(b, false), terms.literal(a, true));
+    let both = terms.both(accepted, rejected);
     let mut engine = Engine {
         context,
         unfoldings: Vec::new(),
-        depends_on: None,
+        tasks: Vec::new(),
+        found: HashMap::new(),
+        assumed: HashMap::new(),
+        at_work: HashMap::new(),
+        answers: 0,
+        names: HashMap::new(),
+        partitions: Partitions::default(),
     };
-    // A branch that was split, with the alternatives of the split that are still to come.
-    // The last split is the one at work: each of its alternatives is followed to its end
-    // before the next is made, so an instance is found without the alternatives after it,
-    // and a long `oneOf` is never written out. The check begins as a split in one.
-    let whole = vec![Item::new(b, false), Item::new(a, true)];
-    let whole: Box<dyn Iterator<Item = Alternative>> = Box::new(std::iter::once(whole));
-    let mut splits = vec![(Branch::default(), whole)];
-    while let Some((split, still_to_come)) = splits.last_mut() {
-        let alternative = if engine.is_hopeless(split) {
-            None
-        } else {
-            still_to_come.next()
-        };
-        let Some(alternative) = alternative else {
-            splits.pop();
-            continue;
-        };
-        engine.context.budget.charge(1 + split.weight() / 32)?;
-        let mut branch = split.clone();
-        branch.todo.extend(alternative);
-        if !engine.settle(&mut branch)? || engine.is_hopeless(&branch) {
-            continue;
-        }
-        let Some(choice) = branch.choices.pop_front() else {
-            // Nothing is left to take in, and the branch stands.
-            match engine.instance(&branch)? {
-                Some(instance) => return Ok(Outcome::No(instance)),
-                None => {
-                    let cause = branch.cause(&engine.context.terms);
-                    engine.depends_on.get_or_insert(cause);
-                }
-            }
-            continue;
-        };
-        let alternatives = alternatives(&engine.context.terms, &choice);
-        splits.push((branch, alternatives));
-    }
-    Ok(match engine.depends_on {
-        Some(cause) => Outcome::Unknown(cause),
-        None => Outcome::Yes,
+    Ok(match engine.decide(both)? {
+        Found::Nothing => Outcome::Yes,
+        Found::Instance(witness) => Outcome::No(witness.value.clone()),
+        Found::Unknown(cause) => Outcome::Unknown(cause),
     })
 }
 
@@ -147,6 +180,11 @@ struct Branch {
     /// The same for the strings.
     strings: Strings,
     strings_asked: bool,
+    /// And for the objects. An object may be left only as far as the engine knows: then
+    /// this stands between the branch and an object.
+    objects: Objects,
+    objects_asked: bool,
+    objects_depend: Option<Cause>,
     /// The leaves that must hold, and the types that they are about.
     holds: BTreeSet<LeafId>,
     covered: TypeSet,
@@ -175,6 +213,9 @@ impl Default for Branch {
             numbers_asked: false,
             strings: Strings::default(),
             strings_asked: false,
+            objects: Objects::default(),
+            objects_asked: false,
+            objects_depend: None,
             holds: BTreeSet::new(),
             covered: TypeSet::NONE,
             fails: BTreeSet::new(),
@@ -189,6 +230,7 @@ impl Default for Branch {
 const BOOLEAN: TypeSet = TypeSet::of(InstanceType::Boolean);
 const NUMBER: TypeSet = TypeSet::of(InstanceType::Number);
 const STRING: TypeSet = TypeSet::of(InstanceType::String);
+const OBJECT: TypeSet = TypeSet::of(InstanceType::Object);
 
 impl Branch {
     /// How much there is to copy when the branch splits.
@@ -196,7 +238,7 @@ impl Branch {
         let leaves = self.holds.len() + self.fails.len();
         let variables = self.taken.len() + self.met.len();
         let copied = (leaves + variables + self.choices.len()) as u64;
-        copied + self.numbers.weight() + self.strings.weight()
+        copied + self.numbers.weight() + self.strings.weight() + self.objects.weight()
     }
 
     /// Keeps only instances of these types. Returns whether any are left.
@@ -214,63 +256,324 @@ impl Branch {
         true
     }
 
-    /// The types of which the branch is known to accept an instance if it stands: no leaf
-    /// that must hold is about them. A leaf that must not hold is about every type that is
-    /// left.
-    fn free(&self) -> TypeSet {
-        if self.fails.is_empty() {
-            self.types.intersection(self.covered.complement())
+    /// Takes in a leaf that must hold, or with `negated` one that must not. Returns whether
+    /// the branch still stands.
+    fn take(&mut self, leaf: LeafId, negated: bool, terms: &Terms) -> bool {
+        let about = terms.leaf(leaf).domain;
+        if negated {
+            // A leaf fails only for an instance that it is about.
+            self.fails.insert(leaf);
+            self.restrict(about) && !self.holds.contains(&leaf)
         } else {
-            TypeSet::NONE
+            self.holds.insert(leaf);
+            self.covered = self.covered.union(about);
+            !self.fails.contains(&leaf)
+        }
+    }
+
+    /// The types of which the branch is known to accept an instance if it stands: no leaf
+    /// that must hold is about them, and the engine knows of nothing else in the way. A
+    /// leaf that must not hold is about every type that is left.
+    fn free(&self) -> TypeSet {
+        if !self.fails.is_empty() {
+            return TypeSet::NONE;
+        }
+        let free = self.types.intersection(self.covered.complement());
+        match self.objects_depend {
+            Some(_) => free.intersection(OBJECT.complement()),
+            None => free,
         }
     }
 
     /// What stands between the branch and an instance: a leaf, if one is about a type that
-    /// is left. Without one, every type that is left is free of leaves, and of those only
-    /// numbers can fail to give an instance.
-    fn cause(&self, terms: &Terms) -> Cause {
+    /// is left. Without one, every type that is left is free of leaves, and it is what
+    /// stood in the way of an object or of a number.
+    fn cause(&self, terms: &Terms, otherwise: Option<Cause>) -> Cause {
         let about_what_is_left = |leaf: &&LeafId| {
             let about = terms.leaf(**leaf).domain;
             !about.intersection(self.types).is_empty()
         };
         let must_not_hold = self.fails.first();
         let leaf = must_not_hold.or_else(|| self.holds.iter().find(about_what_is_left));
-        leaf.map_or(Cause::Number, |leaf| Cause::Leaf(*leaf))
+        let leaf = leaf.map(|leaf| Cause::Leaf(*leaf));
+        leaf.or(self.objects_depend)
+            .or(otherwise)
+            .unwrap_or(Cause::Number)
     }
+}
+
+/// A c-reference that is being decided: the search for an instance that satisfies it.
+struct Task {
+    of: CRefId,
+    /// A branch that was split, with the alternatives of the split that are still to come.
+    /// The last split is the one at work: each of its alternatives is followed to its end
+    /// before the next is made, so an instance is found without the alternatives after it,
+    /// and a long `oneOf` is never written out. The task begins as a split in one.
+    splits: Vec<(Branch, Box<dyn Iterator<Item = Alternative>>)>,
+    /// A branch that waits for the engine to decide the c-references that it asked for.
+    waiting: Option<Branch>,
+    wanted: Vec<CRefId>,
+    /// What some branch depends on, once there is such a branch. From then on the answer
+    /// is not that nothing satisfies the c-reference.
+    depends_on: Option<Cause>,
+    /// The lowest task on the stack whose c-reference this one took to accept nothing
+    /// because it was still at work, if it took any so.
+    lowest: usize,
+    /// How many answers had been found when the task began.
+    began: u64,
+}
+
+/// What a c-reference accepts as long as the tasks at work that it took to accept nothing
+/// accept nothing.
+struct Assumed {
+    /// Nothing, or what stands between the engine and an instance.
+    found: Found,
+    /// The lowest of those tasks.
+    lowest: usize,
+    /// How many answers had been found when this one was.
+    since: u64,
+}
+
+/// Whether a branch stands when it has taken in what needs no split.
+enum Settled {
+    Refuted,
+    Stands,
+    /// That depends on c-references of which the engine knows nothing yet.
+    Needs(Vec<CRefId>),
+}
+
+/// What a branch that stands gives.
+enum Given {
+    Instance(Rc<Witness>),
+    /// No instance, because of this.
+    Depends(Cause),
+    Needs(Vec<CRefId>),
 }
 
 struct Engine<'c> {
     context: &'c mut Context,
     unfoldings: Vec<Unfolding>,
-    /// What some branch depends on, once there is such a branch. From then on the answer is
-    /// not `Yes`.
-    depends_on: Option<Cause>,
+    /// The c-references that are being decided. The last is at work, and each of the
+    /// others waits for the one after it.
+    tasks: Vec<Task>,
+    /// What is known of a c-reference for good.
+    found: HashMap<CRefId, Found>,
+    /// What is known of one for as long as tasks that are at work accept nothing.
+    assumed: HashMap<CRefId, Assumed>,
+    /// Where on the stack the task of a c-reference is.
+    at_work: HashMap<CRefId, usize>,
+    /// How many answers were found so far.
+    answers: u64,
+    /// The language of the strings that the schema of a variable accepts, or `None` if no
+    /// language says it.
+    names: HashMap<VarId, Option<LanguageId>>,
+    partitions: Partitions,
 }
 
 impl Engine<'_> {
-    /// Whether a branch can be left alone: the answer is not `Yes` any more, and the branch
-    /// cannot give an instance. Leaves are never taken back and types never return, so what
-    /// comes out of the branch cannot give one either.
-    fn is_hopeless(&self, branch: &Branch) -> bool {
-        self.depends_on.is_some() && branch.free().is_empty()
+    /// Whether an instance satisfies a c-reference.
+    fn decide(&mut self, of: CRefId) -> Result<Found, Exhausted> {
+        if let Some(known) = self.known(of) {
+            return Ok(known);
+        }
+        self.begin(of)?;
+        loop {
+            // What the task at work asked for comes first.
+            let task = self.tasks.last_mut().expect("a task is at work");
+            if let Some(wanted) = task.wanted.pop() {
+                if self.known(wanted).is_none() {
+                    self.begin(wanted)?;
+                }
+                continue;
+            }
+            let Some(found) = self.step()? else {
+                continue;
+            };
+            self.end(&found);
+            if self.tasks.is_empty() {
+                return Ok(found);
+            }
+        }
     }
 
-    /// Takes in everything that needs no split. Returns whether the branch still stands.
-    fn settle(&mut self, branch: &mut Branch) -> Result<bool, Exhausted> {
+    /// What is known of a c-reference, if it was decided or is being decided.
+    fn known(&self, of: CRefId) -> Option<Found> {
+        match of {
+            Terms::NOTHING => Some(Found::Nothing),
+            Terms::ANYTHING => Some(Found::Instance(Witness::plain(Value::Null))),
+            _ if self.at_work.contains_key(&of) => Some(Found::Nothing),
+            _ => {
+                let assumed = self.assumed.get(&of).map(|assumed| &assumed.found);
+                self.found.get(&of).or(assumed).cloned()
+            }
+        }
+    }
+
+    /// Puts a task for a c-reference on the stack. It begins as one branch that takes in
+    /// the variables: those that stand as they are first.
+    fn begin(&mut self, of: CRefId) -> Result<(), Exhausted> {
+        self.context.budget.charge(1)?;
+        let terms = &mut self.context.terms;
+        let literals = terms.literals(of).to_vec();
+        let mut whole = Vec::with_capacity(literals.len());
+        for negated in [false, true] {
+            let of_a_kind = literals.iter().filter(|literal| literal.1 == negated);
+            for (variable, _) in of_a_kind {
+                whole.push(Item::new(terms.reference(*variable), negated));
+            }
+        }
+        let whole: Box<dyn Iterator<Item = Alternative>> = Box::new(std::iter::once(whole));
+        self.at_work.insert(of, self.tasks.len());
+        self.tasks.push(Task {
+            of,
+            splits: vec![(Branch::default(), whole)],
+            waiting: None,
+            wanted: Vec::new(),
+            depends_on: None,
+            lowest: usize::MAX,
+            began: self.answers,
+        });
+        Ok(())
+    }
+
+    /// Takes the task at work off the stack and keeps what it found.
+    fn end(&mut self, found: &Found) {
+        let task = self.tasks.pop().expect("a task is at work");
+        let at = self.tasks.len();
+        self.at_work.remove(&task.of);
+        self.answers += 1;
+        let nothing = matches!(found, Found::Nothing);
+        if !nothing {
+            // What was found while this task was at work may have taken it to accept
+            // nothing, which it does not.
+            self.assumed
+                .retain(|_, assumed| assumed.since <= task.began);
+        }
+        // An instance is one whatever else was taken to accept nothing. Anything else
+        // holds for good only if no task that is still at work was taken so.
+        let for_good = matches!(found, Found::Instance(_)) || task.lowest >= at;
+        if for_good {
+            if nothing {
+                // And so does everything that only took this task so.
+                let settled = |assumed: &Assumed| assumed.lowest >= at;
+                let ids: Vec<CRefId> = self
+                    .assumed
+                    .iter()
+                    .filter(|(_, assumed)| settled(assumed))
+                    .map(|(of, _)| *of)
+                    .collect();
+                for of in ids {
+                    let assumed = self.assumed.remove(&of).expect("it was just found");
+                    self.found.insert(of, assumed.found);
+                }
+            }
+            self.found.insert(task.of, found.clone());
+            return;
+        }
+        if nothing {
+            // What took this task to accept nothing was right as far as this task was.
+            for assumed in self.assumed.values_mut() {
+                if assumed.lowest >= at {
+                    assumed.lowest = task.lowest;
+                }
+            }
+        }
+        let assumed = Assumed {
+            found: found.clone(),
+            lowest: task.lowest,
+            since: self.answers,
+        };
+        self.assumed.insert(task.of, assumed);
+    }
+
+    /// Follows one alternative of the task at work as far as it goes without a split.
+    /// Returns what the task found, if that ended it.
+    fn step(&mut self) -> Result<Option<Found>, Exhausted> {
+        let task = self.tasks.last_mut().expect("a task is at work");
+        let mut branch = match task.waiting.take() {
+            Some(branch) => branch,
+            None => {
+                let depends = task.depends_on;
+                let Some((split, still_to_come)) = task.splits.last_mut() else {
+                    // Every alternative was followed to its end.
+                    return Ok(Some(depends.map_or(Found::Nothing, Found::Unknown)));
+                };
+                let alternative = if depends.is_some() && split.free().is_empty() {
+                    None
+                } else {
+                    still_to_come.next()
+                };
+                let Some(alternative) = alternative else {
+                    task.splits.pop();
+                    return Ok(None);
+                };
+                self.context.budget.charge(1 + split.weight() / 32)?;
+                let mut branch = split.clone();
+                branch.todo.extend(alternative);
+                branch
+            }
+        };
+        match self.settle(&mut branch)? {
+            Settled::Refuted => return Ok(None),
+            Settled::Needs(wanted) => {
+                self.wait(branch, wanted);
+                return Ok(None);
+            }
+            Settled::Stands => {}
+        }
+        if self.is_hopeless(&branch) {
+            return Ok(None);
+        }
+        if let Some(choice) = branch.choices.pop_front() {
+            let alternatives = alternatives(&self.context.terms, &choice);
+            let task = self.tasks.last_mut().expect("a task is at work");
+            task.splits.push((branch, alternatives));
+            return Ok(None);
+        }
+        // Nothing is left to take in, and the branch stands.
+        match self.instance(&branch)? {
+            Given::Instance(witness) => return Ok(Some(Found::Instance(witness))),
+            Given::Needs(wanted) => self.wait(branch, wanted),
+            Given::Depends(cause) => {
+                let task = self.tasks.last_mut().expect("a task is at work");
+                task.depends_on.get_or_insert(cause);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Lets a branch of the task at work wait for c-references to be decided.
+    fn wait(&mut self, branch: Branch, wanted: Vec<CRefId>) {
+        let task = self.tasks.last_mut().expect("a task is at work");
+        (task.waiting, task.wanted) = (Some(branch), wanted);
+    }
+
+    /// Whether a branch of the task at work can be left alone: the task will not find that
+    /// nothing satisfies its c-reference any more, and the branch cannot give an instance.
+    /// Leaves are never taken back and types never return, so what comes out of the branch
+    /// cannot give one either.
+    fn is_hopeless(&self, branch: &Branch) -> bool {
+        let task = self.tasks.last().expect("a task is at work");
+        task.depends_on.is_some() && branch.free().is_empty()
+    }
+
+    /// Takes in everything that needs no split, and says whether the branch still stands.
+    fn settle(&mut self, branch: &mut Branch) -> Result<Settled, Exhausted> {
         while let Some(item) = branch.todo.pop_front() {
             self.context.budget.charge(1)?;
             if !self.take(branch, item)? {
-                return Ok(false);
+                return Ok(Settled::Refuted);
             }
         }
         // What was asked of numbers may have left none. Then the branch has no number among
-        // its instances, and stands by what else it accepts. So it is with strings.
+        // its instances, and stands by what else it accepts. So it is with strings and with
+        // objects.
         if std::mem::take(&mut branch.numbers_asked)
             && branch.types.contains(InstanceType::Number)
             && branch.numbers.is_empty(&mut self.context.budget)?
             && !branch.restrict(NUMBER.complement())
         {
-            return Ok(false);
+            return Ok(Settled::Refuted);
         }
         let Context {
             languages, budget, ..
@@ -278,30 +581,113 @@ impl Engine<'_> {
         if std::mem::take(&mut branch.strings_asked)
             && branch.types.contains(InstanceType::String)
             && branch.strings.is_empty(languages, budget)?
+            && !branch.restrict(STRING.complement())
         {
-            return Ok(branch.restrict(STRING.complement()));
+            return Ok(Settled::Refuted);
         }
-        Ok(true)
-    }
-
-    /// An instance that the branch accepts, if it is known to accept one that can be given:
-    /// one of the first type that no leaf is about and that has one.
-    fn instance(&mut self, branch: &Branch) -> Result<Option<Value>, Exhausted> {
-        let Context {
-            languages, budget, ..
-        } = &mut *self.context;
-        let of = generate::Left {
-            may_be_true: branch.booleans[1],
-            numbers: &branch.numbers,
-            strings: &branch.strings,
-        };
-        for kind in branch.free().iter() {
-            let instance = generate::instance(kind, &of, languages, budget)?;
-            if instance.is_some() {
-                return Ok(instance);
+        // The objects come last: a branch that waits for the engine to decide what the
+        // value of a property satisfies is asked again from here.
+        if branch.objects_asked && branch.types.contains(InstanceType::Object) {
+            match self.objects(branch, false)? {
+                Left::Needs(wanted) => return Ok(Settled::Needs(wanted)),
+                Left::Nothing => {
+                    if !branch.restrict(OBJECT.complement()) {
+                        return Ok(Settled::Refuted);
+                    }
+                }
+                Left::Unknown(cause) => branch.objects_depend = Some(cause),
+                Left::Object(_) => branch.objects_depend = None,
             }
         }
-        Ok(None)
+        branch.objects_asked = false;
+        Ok(Settled::Stands)
+    }
+
+    /// Whether the branch leaves an object, and with `give` such an object.
+    fn objects(&mut self, branch: &Branch, give: bool) -> Result<Left, Exhausted> {
+        let Self {
+            context,
+            tasks,
+            found,
+            assumed,
+            at_work,
+            partitions,
+            ..
+        } = self;
+        let Context {
+            terms,
+            languages,
+            budget,
+        } = &mut **context;
+        // The task at work. The language of the names of an object is worked out with none.
+        let mut lowest = tasks.last().map_or(usize::MAX, |task| task.lowest);
+        // What the engine knows of a c-reference. One that a task is deciding, or that was
+        // found to accept nothing only as long as tasks are at work, is taken to accept
+        // nothing, and the task at work notes the lowest of those tasks.
+        let mut ask = |of: CRefId| match of {
+            Terms::NOTHING => Some(Found::Nothing),
+            Terms::ANYTHING => Some(Found::Instance(Witness::plain(Value::Null))),
+            _ => {
+                if let Some(known) = found.get(&of) {
+                    return Some(known.clone());
+                }
+                if let Some(at) = at_work.get(&of) {
+                    lowest = lowest.min(*at);
+                    return Some(Found::Nothing);
+                }
+                let assumed = assumed.get(&of)?;
+                lowest = lowest.min(assumed.lowest);
+                Some(assumed.found.clone())
+            }
+        };
+        let mut solver = Solver {
+            terms,
+            languages,
+            budget,
+            partitions,
+        };
+        let left = branch.objects.left(&mut solver, &mut ask, give)?;
+        if let Some(task) = tasks.last_mut() {
+            task.lowest = lowest;
+        }
+        Ok(left)
+    }
+
+    /// What the branch gives: an instance, if it is known to accept one that can be given.
+    /// That is one of the first type that no leaf is about and that has one.
+    fn instance(&mut self, branch: &Branch) -> Result<Given, Exhausted> {
+        let mut in_the_way = None;
+        for kind in branch.free().iter() {
+            if kind == InstanceType::Object {
+                match self.objects(branch, true)? {
+                    Left::Object(Some(object)) => return Ok(Given::Instance(object)),
+                    Left::Needs(wanted) => return Ok(Given::Needs(wanted)),
+                    Left::Unknown(cause) => {
+                        in_the_way.get_or_insert(cause);
+                    }
+                    Left::Nothing | Left::Object(None) => {}
+                }
+                continue;
+            }
+            let Context {
+                languages, budget, ..
+            } = &mut *self.context;
+            let of = generate::Left {
+                may_be_true: branch.booleans[1],
+                numbers: &branch.numbers,
+                strings: &branch.strings,
+            };
+            match generate::instance(kind, &of, languages, budget)? {
+                Some(instance) => return Ok(Given::Instance(Witness::plain(instance))),
+                None if kind == InstanceType::Number => {
+                    in_the_way.get_or_insert(Cause::Number);
+                }
+                None => {}
+            }
+        }
+        Ok(Given::Depends(
+            branch.cause(&self.context.terms, in_the_way),
+        ))
     }
 
     /// Takes one term into a branch. Returns whether the branch still stands.
@@ -353,17 +739,24 @@ impl Engine<'_> {
                 }
                 stands
             }
-            (Term::Unknown(leaf), false) => {
-                branch.holds.insert(*leaf);
-                branch.covered = branch.covered.union(self.context.terms.leaf(*leaf).domain);
-                !branch.fails.contains(leaf)
+            // What is no object satisfies every term about objects, so only an object
+            // fails one.
+            (
+                Term::PProp(..)
+                | Term::PReq(_)
+                | Term::PNames(_)
+                | Term::MinProps(_)
+                | Term::MaxProps(_),
+                _,
+            ) => {
+                let stands = !negated || branch.restrict(OBJECT);
+                if !stands || !branch.types.contains(InstanceType::Object) {
+                    return Ok(stands);
+                }
+                let found = found.clone();
+                return self.take_about_objects(branch, &found, negated);
             }
-            // A leaf fails only for an instance that it is about.
-            (Term::Unknown(leaf), true) => {
-                branch.fails.insert(*leaf);
-                let about = self.context.terms.leaf(*leaf).domain;
-                branch.restrict(about) && !branch.holds.contains(leaf)
-            }
+            (Term::Unknown(leaf), _) => branch.take(*leaf, negated, &self.context.terms),
             (Term::AllOf(parts), false) | (Term::AnyOf(parts), true) => {
                 let parts = parts.iter();
                 branch.todo.extend(parts.map(|part| Item {
@@ -388,6 +781,83 @@ impl Engine<'_> {
             (Term::Ref(_), _) => unreachable!("a reference was unfolded above"),
         };
         Ok(stands)
+    }
+
+    /// Takes a term about objects into a branch that may still be an object. Returns
+    /// whether the branch still stands.
+    fn take_about_objects(
+        &mut self,
+        branch: &mut Branch,
+        term: &Term,
+        negated: bool,
+    ) -> Result<bool, Exhausted> {
+        let Term::PNames(variable) = term else {
+            branch.objects.take(term, negated, &mut self.context.terms);
+            branch.objects_asked = true;
+            return Ok(true);
+        };
+        // Every name is of the language of the strings that the schema accepts: none is
+        // outside it. Where no language says which strings those are, this is a leaf.
+        let Some(names) = self.names(*variable)? else {
+            let leaf = self.context.terms.names(*variable);
+            return Ok(branch.take(leaf, negated, &self.context.terms));
+        };
+        let Context {
+            terms, languages, ..
+        } = &mut *self.context;
+        let outside = languages.outside([names]);
+        branch.objects.names(outside, negated, terms);
+        branch.objects_asked = true;
+        Ok(true)
+    }
+
+    /// The language of the strings that the schema of a variable accepts, or `None` if no
+    /// language says it: the schema holds a leaf about strings, or a bound on the length
+    /// that is more than a pattern says.
+    ///
+    /// The schema is taken apart as a c-reference is, only that every branch is followed
+    /// to its end: each gives the strings that it leaves, and those of all are the
+    /// language. A branch about strings waits for nothing, so this is done at once.
+    fn names(&mut self, variable: VarId) -> Result<Option<LanguageId>, Exhausted> {
+        if let Some(known) = self.names.get(&variable) {
+            return Ok(*known);
+        }
+        let terms = &mut self.context.terms;
+        let whole = vec![
+            Item::new(terms.type_is(STRING), false),
+            Item::new(terms.reference(variable), false),
+        ];
+        let whole: Box<dyn Iterator<Item = Alternative>> = Box::new(std::iter::once(whole));
+        let mut splits = vec![(Branch::default(), whole)];
+        let mut all = Some(Languages::NOTHING);
+        while let Some((split, still_to_come)) = splits.last_mut() {
+            let (Some(alternative), Some(so_far)) = (still_to_come.next(), all) else {
+                splits.pop();
+                continue;
+            };
+            self.context.budget.charge(1 + split.weight() / 32)?;
+            let mut branch = split.clone();
+            branch.todo.extend(alternative);
+            if !matches!(self.settle(&mut branch)?, Settled::Stands) {
+                continue;
+            }
+            if let Some(choice) = branch.choices.pop_front() {
+                let alternatives = alternatives(&self.context.terms, &choice);
+                splits.push((branch, alternatives));
+                continue;
+            }
+            let Context {
+                languages, budget, ..
+            } = &mut *self.context;
+            all = match branch.strings.language(languages, budget)? {
+                Some(left) if branch.free().contains(InstanceType::String) => {
+                    Some(languages.union(so_far, left, budget)?)
+                }
+                _ => None,
+            };
+        }
+        self.names.insert(variable, all);
+        Ok(all)
     }
 
     /// Puts the term of a variable in the place of a reference to it, once in a branch.
@@ -687,16 +1157,12 @@ mod tests {
         // The other way, an instance that is no array tells them apart.
         assert_eq!(counterexample(&long_list, &long), json!(null));
         // Subschemas of one class make one leaf.
-        let person = json!({"type": "object", "properties": {"name": {"type": "string"}}});
-        let named = json!({
-            "type": "object",
-            "properties": {"name": {"type": "string"}},
-            "required": ["name"],
-        });
-        yes(&person, &named);
+        let list = json!({"type": "array", "items": {"type": "string"}});
+        let filled = json!({"type": "array", "items": {"type": "string"}, "minItems": 1});
+        yes(&list, &filled);
         assert_eq!(
-            depends_on(&named, &person),
-            (Side::A, "#/required".to_owned())
+            depends_on(&filled, &list),
+            (Side::A, "#/minItems".to_owned())
         );
     }
 
@@ -1308,30 +1774,637 @@ mod tests {
     }
 
     #[test]
-    fn dependencies_use_the_leaf_of_required() {
+    fn a_property_that_there_has_to_be_is_there() {
+        let (a, both) = (json!({"required": ["a"]}), json!({"required": ["b", "a"]}));
+        yes(&a, &both);
+        assert_eq!(counterexample(&both, &a), json!({"a": null}));
+        // What is no object has to have no property.
+        assert_eq!(counterexample(&json!({"type": "object"}), &a), json!(null));
+        yes(&a, &json!({"type": "string"}));
+        let object = json!({"type": "object"});
+        assert_eq!(
+            counterexample(&json!({"type": "object", "required": ["a"]}), &object),
+            json!({})
+        );
+        // An object without the property is all that the negation accepts.
+        let without = json!({"not": {"required": ["a"]}});
+        yes(&object, &without);
         yes(
-            &json!({"required": ["a"]}),
-            &json!({"required": ["b", "a"]}),
+            &without,
+            &json!({"type": "object", "properties": {"a": false}}),
         );
         yes(
-            &json!({"dependentRequired": {"a": ["b"]}}),
-            &json!({"required": ["b"]}),
+            &json!({"properties": {"a": false}}),
+            &json!({"type": "object", "not": {"required": ["a"]}}),
+        );
+        assert_eq!(counterexample(&without, &object), json!({"a": null}));
+        yes(&json!(false), &json!({"allOf": [without, a]}));
+    }
+
+    #[test]
+    fn dependencies_are_about_the_properties_that_there_are() {
+        let needs = json!({"dependentRequired": {"a": ["b"]}});
+        yes(&needs, &json!({"required": ["b"]}));
+        yes(&needs, &json!({"properties": {"a": false}}));
+        yes(&needs, &json!({"type": "string"}));
+        assert_eq!(
+            counterexample(&json!({"required": ["b"]}), &needs),
+            json!({})
+        );
+        assert_eq!(
+            counterexample(&needs, &json!({"required": ["a"]})),
+            json!({"a": null})
+        );
+        // The same as a condition says.
+        let condition = json!({"if": {"required": ["a"]}, "then": {"required": ["b"]}});
+        yes(&needs, &condition);
+        yes(&condition, &needs);
+        let schemas = json!({"dependentSchemas": {"a": {"required": ["b"]}}});
+        yes(&needs, &schemas);
+        yes(&schemas, &needs);
+        // A schema that depends on a property is asked of the whole instance.
+        let typed = json!({"dependentSchemas": {"a": {"properties": {"b": {"type": "null"}}}}});
+        yes(&typed, &json!({"properties": {"b": {"type": "null"}}}));
+        assert_eq!(
+            counterexample(&typed, &json!({"type": "object"})),
+            json!({"a": null, "b": true})
         );
         yes(
             &json!({"dependentSchemas": {"a": {"type": "object"}}}),
             &json!({"type": "object"}),
         );
-        // What is no object satisfies a dependency.
-        yes(
-            &json!({"dependentRequired": {"a": ["b"]}}),
-            &json!({"type": "string"}),
+    }
+
+    #[test]
+    fn a_property_is_compared_by_the_schema_of_its_value() {
+        let named = |schema: Value| json!({"properties": {"name": schema}});
+        let (text, optional) = (
+            named(json!({"type": "string"})),
+            named(json!({"type": ["string", "null"]})),
+        );
+        yes(&optional, &text);
+        assert_eq!(counterexample(&text, &optional), json!({"name": null}));
+        // The property need not be there, and what is no object has none.
+        yes(&text, &json!({"type": "string"}));
+        yes(&text, &json!({"properties": {"name": false}}));
+        assert_eq!(
+            counterexample(&text, &json!({"properties": {"other": {"type": "null"}}})),
+            json!({"name": null})
         );
         assert_eq!(
-            depends_on(
-                &json!({"required": ["b"]}),
-                &json!({"dependentRequired": {"a": ["b"]}})
+            counterexample(&text, &json!({"required": ["name"]})),
+            json!({"name": null})
+        );
+        yes(
+            &text,
+            &json!({"required": ["name"], "properties": {"name": {"minLength": 2, "type": "string"}}}),
+        );
+        // A value is an instance of its own, with numbers, strings and objects in it.
+        yes(
+            &named(json!({"minimum": 0})),
+            &named(json!({"type": "integer", "minimum": 1})),
+        );
+        assert_eq!(
+            counterexample(
+                &named(json!({"type": "integer", "minimum": 1})),
+                &named(json!({"type": "number", "minimum": 0.5}))
             ),
-            (Side::A, "#/required".to_owned())
+            json!({"name": 0.5})
+        );
+        let deep = |schema: Value| named(named(named(schema)));
+        yes(
+            &deep(json!({"pattern": "^[a-z]"})),
+            &deep(json!({"pattern": "^[a-f]"})),
+        );
+        assert_eq!(
+            counterexample(
+                &deep(json!({"pattern": "^[a-f]"})),
+                &deep(json!({"pattern": "^[a-z]"}))
+            ),
+            json!({"name": {"name": {"name": "g"}}})
+        );
+        // Two schemas for one property are asked of one value.
+        let both = json!({"allOf": [named(json!({"minimum": 0})), named(json!({"maximum": 9}))]});
+        let range = named(json!({"minimum": 0, "maximum": 9}));
+        yes(&both, &range);
+        yes(&range, &both);
+        // A property that cannot have a value cannot be there.
+        let never = json!({"properties": {"name": false}});
+        yes(&never, &json!({"not": {"required": ["name"]}}));
+        yes(
+            &json!(false),
+            &json!({"type": "object", "required": ["name"], "properties": {"name": false}}),
+        );
+        yes(
+            &json!(false),
+            &json!({
+                "type": "object",
+                "required": ["name"],
+                "properties": {"name": {"type": "string", "maxLength": 1, "pattern": "^ab"}},
+            }),
+        );
+    }
+
+    #[test]
+    fn names_are_told_apart_by_the_patterns_that_match_them() {
+        let (narrow, wide) = (
+            json!({"patternProperties": {"^x-": {"type": "string"}}}),
+            json!({"patternProperties": {"^x": {"type": "string"}}}),
+        );
+        yes(&narrow, &wide);
+        assert_eq!(counterexample(&wide, &narrow), json!({"x": null}));
+        // A name that a pattern matches satisfies what the pattern asks and what the name
+        // itself is asked.
+        let both = json!({
+            "properties": {"x-a": {"minLength": 1}},
+            "patternProperties": {"^x-": {"type": "string"}},
+        });
+        yes(&narrow, &both);
+        yes(
+            &json!({"properties": {"x-a": {"type": "string", "minLength": 1}}}),
+            &both,
+        );
+        assert_eq!(counterexample(&both, &narrow), json!({"x-a": ""}));
+        // Two patterns that are written differently and match the same names.
+        let again = json!({"patternProperties": {"(?s)^x-.*$": {"type": "string"}}});
+        yes(&again, &narrow);
+        yes(&narrow, &again);
+        // Without the flag, the dot stops at the end of a line.
+        let lines = json!({"patternProperties": {"^x-.*$": {"type": "string"}}});
+        assert_eq!(counterexample(&narrow, &lines), json!({"x-\n": null}));
+        // A name that two patterns match satisfies both.
+        let two = json!({"patternProperties": {"^a": {"minimum": 0}, "b$": {"maximum": 9}}});
+        yes(
+            &json!({"properties": {"ab": {"minimum": 0, "maximum": 9}}}),
+            &two,
+        );
+        assert_eq!(
+            counterexample(&json!({"properties": {"ab": {"minimum": 1}}}), &two),
+            json!({"ab": 0})
+        );
+        // A pattern of a few words asks of those names what `properties` would, and so
+        // does a pattern of one word.
+        let words = json!({"patternProperties": {"^(a|b)$": {"type": "null"}}});
+        let named = json!({"properties": {"a": {"type": "null"}, "b": {"type": "null"}}});
+        yes(&words, &named);
+        yes(&named, &words);
+        let word = json!({"patternProperties": {"^a$": {"type": "null"}}});
+        let name = json!({"properties": {"a": {"type": "null"}}});
+        yes(&word, &name);
+        yes(&name, &word);
+        yes(&word, &named);
+        assert_eq!(counterexample(&named, &word), json!({"b": true}));
+    }
+
+    #[test]
+    fn what_no_name_and_no_pattern_is_about_is_additional() {
+        let closed = |names: &[&str]| {
+            let properties: Map<String, Value> = names
+                .iter()
+                .map(|name| ((*name).to_owned(), json!({})))
+                .collect();
+            json!({"properties": properties, "additionalProperties": false})
+        };
+        yes(&closed(&["a", "b"]), &closed(&["a"]));
+        assert_eq!(
+            counterexample(&closed(&["a"]), &closed(&["a", "b"])),
+            json!({"b": null})
+        );
+        assert_eq!(
+            counterexample(&closed(&[]), &json!({"type": "object"})),
+            json!({"a": null})
+        );
+        yes(&closed(&[]), &json!({"maxProperties": 0}));
+        yes(&json!({"maxProperties": 0}), &closed(&[]));
+        // A schema for the other properties.
+        let texts = json!({"properties": {"a": {}}, "additionalProperties": {"type": "string"}});
+        yes(&texts, &closed(&["a"]));
+        yes(
+            &texts,
+            &json!({"additionalProperties": {"type": "string", "minLength": 1}}),
+        );
+        assert_eq!(
+            counterexample(&json!({"additionalProperties": {"type": "string"}}), &texts),
+            json!({"a": null})
+        );
+        assert_eq!(
+            counterexample(&texts, &json!({"properties": {"a": {}}})),
+            json!({"b": null})
+        );
+        // What a pattern matches is not additional.
+        let extended = json!({
+            "properties": {"a": {}},
+            "patternProperties": {"^x-": {}},
+            "additionalProperties": false,
+        });
+        yes(&extended, &closed(&["a"]));
+        assert_eq!(
+            counterexample(&closed(&["a"]), &extended),
+            json!({"x-": null})
+        );
+        yes(
+            &json!({"propertyNames": {"pattern": "^(a$|x-)"}}),
+            &extended,
+        );
+        // The keyword is about the names of its own schema, and of no schema next to it.
+        let apart = json!({"allOf": [{"properties": {"a": {}}}, {"additionalProperties": false}]});
+        yes(&apart, &closed(&[]));
+        yes(&closed(&[]), &apart);
+    }
+
+    #[test]
+    fn the_names_of_an_object_are_strings_that_a_schema_accepts() {
+        let names = |schema: Value| json!({"propertyNames": schema});
+        let (lower, few) = (
+            names(json!({"pattern": "^[a-z]+$"})),
+            names(json!({"pattern": "^[a-c]+$"})),
+        );
+        yes(&lower, &few);
+        assert_eq!(counterexample(&few, &lower), json!({"d": null}));
+        yes(&lower, &names(json!({"enum": ["a", "bc"]})));
+        assert_eq!(
+            counterexample(
+                &names(json!({"maxLength": 3})),
+                &names(json!({"enum": ["a", "abcd"]}))
+            ),
+            json!({"abcd": null})
+        );
+        // The names that the properties may have, said in two ways.
+        let closed = json!({"properties": {"a": {}, "b": {}}, "additionalProperties": false});
+        yes(&names(json!({"enum": ["a", "b", "c"]})), &closed);
+        yes(&closed, &names(json!({"enum": ["a", "b"]})));
+        assert_eq!(
+            counterexample(&closed, &names(json!({"enum": ["a", "b", "c"]}))),
+            json!({"c": null})
+        );
+        // The schema is taken apart like any other, and a name is no number.
+        let either = names(json!({"anyOf": [{"maxLength": 1}, {"pattern": "^x"}]}));
+        yes(&either, &names(json!({"enum": ["a", "xyz"]})));
+        assert_eq!(
+            counterexample(&either, &json!({"type": "object"})),
+            json!({"aa": null})
+        );
+        yes(
+            &names(json!({"type": "string"})),
+            &json!({"type": "object"}),
+        );
+        yes(
+            &names(json!({"type": "number"})),
+            &json!({"maxProperties": 0}),
+        );
+        yes(&json!({"maxProperties": 0}), &names(json!(false)));
+        // A schema that says of strings what the engine does not model is a leaf.
+        let hosts = names(json!({"format": "hostname"}));
+        yes(&hosts, &hosts.clone());
+        assert_eq!(
+            depends_on(&hosts, &json!({"type": "object"})),
+            (Side::A, "#/propertyNames".to_owned())
+        );
+    }
+
+    #[test]
+    fn properties_are_counted() {
+        let (two, three) = (json!({"minProperties": 2}), json!({"minProperties": 3}));
+        yes(&two, &three);
+        assert_eq!(counterexample(&three, &two), json!({"a": null, "b": null}));
+        yes(&json!({"maxProperties": 3}), &json!({"maxProperties": 2}));
+        assert_eq!(
+            counterexample(&json!({"maxProperties": 1}), &json!({"maxProperties": 2})),
+            json!({"a": null, "b": null})
+        );
+        // The properties that there have to be are counted, each once.
+        let both = json!({"required": ["a", "b"]});
+        yes(&two, &both);
+        assert_eq!(counterexample(&three, &both), json!({"a": null, "b": null}));
+        assert_eq!(
+            counterexample(&json!({"maxProperties": 1}), &both),
+            json!({"a": null, "b": null})
+        );
+        yes(
+            &json!(false),
+            &json!({"type": "object", "required": ["a", "b"], "maxProperties": 1}),
+        );
+        yes(
+            &json!({"required": ["a"]}),
+            &json!({"required": ["a"], "maxProperties": 1, "minProperties": 1}),
+        );
+        // Only so many names are there to be had.
+        let closed = json!({
+            "type": "object",
+            "properties": {"a": {}, "b": {}, "c": false},
+            "additionalProperties": false,
+        });
+        yes(&json!({"maxProperties": 2}), &closed);
+        yes(&json!(false), &json!({"allOf": [closed, three]}));
+        assert_eq!(
+            counterexample(&json!(false), &json!({"allOf": [closed, two]})),
+            json!({"a": null, "b": null})
+        );
+        let few = json!({
+            "type": "object",
+            "patternProperties": {"^[ab]$": {}, "^c": false},
+            "additionalProperties": false,
+        });
+        yes(&json!(false), &json!({"allOf": [few, three]}));
+        // With room for one property, the two that there have to be are one.
+        let one = json!({
+            "type": "object",
+            "maxProperties": 1,
+            "allOf": [
+                {"not": {"additionalProperties": {"type": "string"}}},
+                {"not": {"additionalProperties": {"minimum": 5}}},
+            ],
+        });
+        assert_eq!(counterexample(&json!(false), &one), json!({"a": 0}));
+        // What is no object has no count.
+        yes(&three, &json!({"type": "array"}));
+        assert_eq!(
+            counterexample(
+                &json!({"not": {"minProperties": 1}}),
+                &json!({"type": "object"})
+            ),
+            json!({"a": null})
+        );
+        yes(
+            &json!({"not": {"minProperties": 1}}),
+            &json!({"type": "object", "maxProperties": 0}),
+        );
+    }
+
+    #[test]
+    fn a_schema_that_holds_itself_in_a_property_accepts_what_is_built_in_finitely_many_steps() {
+        let list = |value: Value| {
+            json!({
+                "type": "object",
+                "properties": {"value": value, "next": {"$ref": "#"}},
+                "required": ["value"],
+            })
+        };
+        let (whole, any) = (
+            list(json!({"type": "integer"})),
+            list(json!({"type": "number"})),
+        );
+        yes(&any, &whole);
+        assert_eq!(counterexample(&whole, &any), json!({"value": 0.1}));
+        // A list that has to go on has no end, and so there is none.
+        let endless =
+            json!({"type": "object", "required": ["next"], "properties": {"next": {"$ref": "#"}}});
+        yes(&json!(false), &endless);
+        yes(&json!({"type": "string"}), &endless);
+        // With a way to end it, there is one, and the shortest is given.
+        let ends = json!({
+            "type": ["object", "null"],
+            "required": ["next"],
+            "properties": {"next": {"$ref": "#"}},
+        });
+        assert_eq!(counterexample(&json!(false), &ends), json!(null));
+        assert_eq!(
+            counterexample(&json!({"type": "null"}), &ends),
+            json!({"next": null})
+        );
+        // Two schemas that hold each other.
+        let pair = json!({
+            "$ref": "#/$defs/even",
+            "$defs": {
+                "even": {"type": "object", "properties": {"next": {"$ref": "#/$defs/odd"}}, "additionalProperties": false},
+                "odd": {"type": "object", "properties": {"next": {"$ref": "#/$defs/even"}}, "required": ["next"], "additionalProperties": false},
+            },
+        });
+        let chain = json!({"type": "object", "properties": {"next": {"$ref": "#"}}, "additionalProperties": false});
+        yes(&chain, &pair);
+        assert_eq!(counterexample(&pair, &chain), json!({"next": {}}));
+    }
+
+    #[test]
+    fn what_is_found_while_a_schema_is_being_decided_holds_only_as_long_as_that() {
+        let never = |least: u32| json!({"type": "string", "minLength": least, "maxLength": 1});
+        let with = |name: &str, schema: Value| json!({"type": "object", "required": [name], "properties": {name: schema}});
+        let reference = |name: &str| json!({"$ref": format!("#/$defs/{name}")});
+        // `x` is `null` or holds a `y`, and `y` holds an `x`. While `x` is being decided,
+        // `y` is found to accept nothing, since `x` accepts nothing yet. That must not be
+        // kept: `x` turns out to accept `null`, and so `y` accepts an object. B asks for
+        // `x` first, in an alternative that then comes to nothing, and for `y` after it.
+        let b = json!({
+            "anyOf": [
+                {
+                    "type": "object",
+                    "required": ["p", "r"],
+                    "properties": {"p": reference("x"), "r": never(2)},
+                },
+                with("q", reference("y")),
+            ],
+            "$defs": {
+                "x": {"anyOf": [with("a", reference("y")), {"type": "null"}]},
+                "y": with("b", reference("x")),
+            },
+        });
+        assert_eq!(counterexample(&json!(false), &b), json!({"q": {"b": null}}));
+
+        // The same one level further in. `e` holds an `x2`, which holds an `e` or an `x`.
+        // While `x` and `x2` are being decided, `e` is found to accept nothing, and then
+        // so is `x2`. When `x2` is done, what was found of `e` holds as long as `x` is
+        // being decided, and no longer: the next schema that is found to accept nothing in
+        // the place of `x2`, which is `m`, must not make it hold for good.
+        let b = json!({
+            "anyOf": [
+                {
+                    "type": "object",
+                    "required": ["p", "r"],
+                    "properties": {"p": reference("x"), "r": never(2)},
+                },
+                with("q", reference("e")),
+            ],
+            "$defs": {
+                "x": {
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "required": ["m", "n"],
+                            "properties": {"m": never(3), "n": reference("x2")},
+                        },
+                        {"type": "null"},
+                    ],
+                },
+                "x2": {"anyOf": [with("b", reference("e")), with("c", reference("x"))]},
+                "e": with("d", reference("x2")),
+            },
+        });
+        assert_eq!(
+            counterexample(&json!(false), &b),
+            json!({"q": {"d": {"c": null}}})
+        );
+    }
+
+    #[test]
+    fn a_schema_that_is_nested_deep_in_properties_is_decided_without_recursion() {
+        let nested = |depth: usize, innermost: Value| {
+            let mut schema = innermost;
+            for _ in 0..depth {
+                let properties = Map::from_iter([("a".to_owned(), schema)]);
+                schema = Value::Object(Map::from_iter([
+                    ("type".to_owned(), json!("object")),
+                    ("properties".to_owned(), Value::Object(properties)),
+                ]));
+            }
+            schema
+        };
+        // Each level is a value of the level above, and a task of its own.
+        let (whole, any) = (
+            nested(20_000, json!({"type": "integer"})),
+            nested(20_000, json!({"type": "number"})),
+        );
+        let check = Checker::new()
+            .budget(10_000_000)
+            .check(&any, &whole)
+            .unwrap();
+        assert_eq!(check.verdict, Verdict::Yes);
+        assert!(check.steps > 100_000, "{}", check.steps);
+        // The other way an instance holds an object for each level, and one that deep
+        // cannot be given: there is no counterexample, and no stack is used up for one.
+        let check = Checker::new()
+            .budget(10_000_000)
+            .check(&whole, &any)
+            .unwrap();
+        assert_eq!(reason_of(&check.verdict), Some(Reason::Unrepresentable));
+        // Dropping a value this deep would recurse, which is no concern of this test.
+        std::mem::forget((whole, any));
+    }
+
+    /// Why a verdict is `Unknown`, if it is.
+    fn reason_of(verdict: &Verdict) -> Option<Reason> {
+        match verdict {
+            Verdict::Unknown { reason } => Some(reason.clone()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_counterexample_is_no_deeper_than_it_can_be_read_back() {
+        let nested = |depth: usize, innermost: Value| {
+            let mut schema = innermost;
+            for _ in 0..depth {
+                schema = json!({"type": "object", "properties": {"a": schema}});
+            }
+            schema
+        };
+        let (integer, number) = (json!({"type": "integer"}), json!({"type": "number"}));
+        // An instance of 127 objects inside one another is given, and `serde_json` reads
+        // it back from its text.
+        let instance = counterexample(&nested(127, integer.clone()), &nested(127, number.clone()));
+        let read: Value = serde_json::from_str(&instance.to_string()).unwrap();
+        assert_eq!(read, instance);
+        let mut innermost = &instance;
+        for _ in 0..127 {
+            innermost = &innermost["a"];
+        }
+        assert_eq!(innermost, &json!(0.1));
+        // One level more is not, and neither is the text of it read.
+        assert_eq!(
+            reason(&nested(128, integer.clone()), &nested(128, number.clone())),
+            Reason::Unrepresentable
+        );
+        let mut too_deep = json!(0.1);
+        for _ in 0..128 {
+            too_deep = json!({"a": too_deep});
+        }
+        assert!(serde_json::from_str::<Value>(&too_deep.to_string()).is_err());
+        // Where another instance tells the two apart, that one is given.
+        let either = json!({"anyOf": [nested(128, number.clone()), {"type": "null"}]});
+        assert_eq!(
+            counterexample(&nested(128, integer.clone()), &either),
+            json!(null)
+        );
+        // A yes holds for instances of any depth.
+        yes(&nested(128, number.clone()), &nested(128, integer.clone()));
+
+        // A chain of schemas that each hold the next in a property, with the steps for a
+        // counterexample of that depth: copying a value recurses once for each level,
+        // which ran out of stack before there was a limit.
+        let mut definitions = Map::new();
+        for at in 0..1_500 {
+            let next = json!({"$ref": format!("#/$defs/d{}", at + 1)});
+            let link = json!({"type": "object", "required": ["a"], "properties": {"a": next}});
+            definitions.insert(format!("d{at}"), link);
+        }
+        definitions.insert("d1500".to_owned(), json!({"type": "null"}));
+        let chain = json!({"$ref": "#/$defs/d0", "$defs": definitions});
+        let check = Checker::new()
+            .budget(2_000_000)
+            .check(&json!(false), &chain)
+            .unwrap();
+        assert_eq!(reason_of(&check.verdict), Some(Reason::Unrepresentable));
+    }
+
+    #[test]
+    fn more_names_than_can_be_counted_are_never_too_few() {
+        // The pattern matches 2^64 names, and one of them may not be there. As many
+        // properties as the largest count are still to be had, so B accepts an object. It
+        // is larger than the budget covers, and the answer is not that there is none.
+        let name = "a".repeat(64);
+        let many = |least: u64| {
+            json!({
+                "type": "object",
+                "propertyNames": {"pattern": "^[ab]{64}$"},
+                "properties": {name.as_str(): false},
+                "minProperties": least,
+            })
+        };
+        assert_eq!(reason(&json!(false), &many(u64::MAX)), Reason::Budget);
+        // With one property to have, it is the plainest name that is left.
+        let other = format!("{}b", "a".repeat(63));
+        assert_eq!(
+            counterexample(&json!(false), &many(1)),
+            json!({other: null})
+        );
+        // Names that can be counted are counted exactly.
+        let few = |least: u64| {
+            json!({
+                "type": "object",
+                "propertyNames": {"pattern": "^[ab]{2}$"},
+                "properties": {"aa": false},
+                "minProperties": least,
+            })
+        };
+        yes(&json!(false), &few(4));
+        assert_eq!(
+            counterexample(&json!(false), &few(3)),
+            json!({"ab": null, "ba": null, "bb": null})
+        );
+    }
+
+    #[test]
+    fn what_stands_in_the_way_of_a_value_stands_in_the_way_of_the_object() {
+        let listed = |schema: Value| json!({"type": "object", "properties": {"a": schema}});
+        assert_eq!(
+            depends_on(
+                &listed(json!({"minItems": 1})),
+                &listed(json!({"type": "array"}))
+            ),
+            (Side::A, "#/properties/a/minItems".to_owned())
+        );
+        // What cancels inside the value cancels.
+        yes(
+            &listed(json!({"minItems": 1})),
+            &listed(json!({"type": "array", "minItems": 1})),
+        );
+        // A value of another type is an instance.
+        assert_eq!(
+            counterexample(
+                &listed(json!({"type": "array", "minItems": 1})),
+                &listed(json!({}))
+            ),
+            json!({"a": null})
+        );
+        // Another object is given where there is one, and types refute as ever.
+        let filled =
+            json!({"type": "object", "properties": {"a": {"minItems": 1}}, "required": ["b"]});
+        assert_eq!(
+            counterexample(&filled, &listed(json!({"type": "array"}))),
+            json!({})
+        );
+        yes(
+            &json!({"type": "object"}),
+            &listed(json!({"uniqueItems": true})),
         );
     }
 

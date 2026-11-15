@@ -21,9 +21,9 @@
 //! specification describes: each file goes under `$defs` with its URI as its `$id`.
 //!
 //! The engine is being built keyword by keyword. So far it models the types, `null`, the
-//! booleans, numbers, strings, `allOf`, `anyOf`, `oneOf`, `not`, `if`/`then`/`else` and
-//! `$ref`. A check whose answer depends on another keyword returns [`Verdict::Unknown`] and
-//! names the keyword.
+//! booleans, numbers, strings, objects, `allOf`, `anyOf`, `oneOf`, `not`, `if`/`then`/`else`
+//! and `$ref`. A check whose answer depends on another keyword, such as one about arrays,
+//! returns [`Verdict::Unknown`] and names the keyword.
 //! Two schemas that share such a keyword with the same value can still be decided, because
 //! what both say cancels. A schema that uses a `$dynamicRef` is not decided yet, whatever
 //! else it says.
@@ -34,6 +34,10 @@
 //! A `pattern` is read in the dialect of the [`regex`](https://docs.rs/regex) crate and
 //! matches anywhere in a string. `format` is asserted for the formats whose strings are a
 //! regular language that can be written down exactly, such as `date`, `uuid` and `uri`.
+//!
+//! The value of a property is compared as an instance of its own. A schema that holds
+//! itself in a property, as that of a list or a tree does, accepts the instances that can
+//! be built in finitely many steps.
 
 mod canonical;
 mod checker;
