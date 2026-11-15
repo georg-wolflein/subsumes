@@ -5,10 +5,10 @@
 //! crate, built from the grammar of the document that defines the format. Any other format is
 //! a predicate that the engine does not model.
 //!
-//! Four formats are modelled in part: of some strings the pattern says that the format accepts
-//! them, a second pattern holds the strings that it may accept, and all the rest it rejects.
-//! That is for strings of which no grammar says whether they are of the format, and for
-//! strings that the grammar of the format allows and that validators do not take.
+//! Three formats are modelled in part: of some strings the pattern says that the format
+//! accepts them, a second pattern holds the strings that it may accept, and all the rest it
+//! rejects. That is for strings of which no grammar says whether they are of the format, and
+//! for strings that the grammar of the format allows and that validators do not take.
 //!
 //! A digit is one of ASCII in every format, so the patterns say `[0-9]` and never `\d`.
 
@@ -44,10 +44,7 @@ pub(crate) fn modelled(format: &str) -> Option<Format> {
             open: Some(DURATION_IN_EITHER_CASE),
         },
         "uuid" => whole(UUID),
-        "ipv4" => Format {
-            accepted: IPV4,
-            open: Some(IPV4_WITH_ZEROS_BEFORE_A_NUMBER),
-        },
+        "ipv4" => whole(IPV4),
         "ipv6" => whole(IPV6),
         "uri" => whole(URI),
         "uri-reference" => whole(URI_REFERENCE),
@@ -179,19 +176,16 @@ const UUID: &str =
 // what RFC 3986 takes for an address inside an IPv6 address and inside a URI.
 //
 // The grammar of RFC 2673 gives a number one to three digits, so by the letter `01.2.3.4`
-// is an address too. Validators do not take a number with a zero before it, which some
-// programs read as octal. So of an address with such a number it is left open whether it is
-// one, and the second pattern holds four numbers up to 255 of one to three digits each.
+// is an address too. The pattern is narrower than the grammar here, and it is the one place
+// where a pattern is: the corpus has `087.10.0.1` as no address, as the test suite that it
+// is made from, and validators do not take a number with a zero before it, which some
+// programs read as octal. The library follows them.
 macro_rules! ipv4 {
     () => {
         r"(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])"
     };
 }
 const IPV4: &str = whole!(ipv4!());
-const IPV4_WITH_ZEROS_BEFORE_A_NUMBER: &str = whole!(
-    r"(?:(?:25[0-5]|2[0-4][0-9]|[01][0-9]{2}|[0-9]{1,2})\.){3}",
-    "(?:25[0-5]|2[0-4][0-9]|[01][0-9]{2}|[0-9]{1,2})"
-);
 
 // RFC 4291, section 2.2, as RFC 3986 writes it out in `IPv6address`: eight groups, of which
 // `::` stands for one or more, and the last two may be an IPv4 address.
@@ -671,13 +665,8 @@ mod tests {
                 "0001.2.3.4",
                 "1.2.3.0o7",
                 "00.1.1.256",
-            ],
-        );
-        // By the letter of the grammar a number may have zeros before it, and validators
-        // do not take one that has.
-        leaves_open(
-            "ipv4",
-            &[
+                // By the letter of the grammar a number may have zeros before it. The
+                // corpus and validators take no such address, and neither does the library.
                 "087.10.0.1",
                 "1.2.3.00",
                 "01.2.3.4",
@@ -686,7 +675,7 @@ mod tests {
                 "255.255.255.099",
             ],
         );
-        // Inside an IPv6 address and a URI the number has no zero before it.
+        // Inside an IPv6 address and a URI the number has no zero before it either.
         accepts("ipv6", &["::1.2.3.4"], &["::01.2.3.4"]);
     }
 

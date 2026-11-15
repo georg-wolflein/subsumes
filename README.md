@@ -47,7 +47,9 @@ Other dialects may be supported later. For now this is the only one.
 
 A time may have the second 60 only where a leap second was, which no grammar says. So the library leaves open whether a `time` or a `date-time` with the second 60 is one, and a check whose answer depends on such a string returns `Unknown`.
 
-Two more kinds of string are left open, because the grammar that the draft names allows them and validators do not take them: an `ipv4` address in which a number has a zero before it, such as `01.2.3.4`, and a `duration` in lower-case letters, such as `p1d`.
+A `duration` in lower-case letters, such as `p1d`, is left open too: the grammar that the draft names allows it, and validators do not take it.
+
+An `ipv4` address has no number with a zero before it, so `01.2.3.4` is none. The grammar that the draft names would allow it. The library follows the benchmark corpus and validators here, which do not.
 
 Any other format is an [unsupported construct](#unsupported-constructs).
 

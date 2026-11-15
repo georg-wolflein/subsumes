@@ -974,9 +974,8 @@ mod tests {
             counterexample(&json!({"maxLength": 9}), &time),
             json!("00:00:00.0z")
         );
-        // Where the grammar of a format allows what validators do not take, that is left
-        // open too: a number of an address with a zero before it, and a duration in small
-        // letters.
+        // A number of an address has no zero before it, as the corpus and validators have
+        // it, although the grammar that the draft names would let it.
         let address = json!({"format": "ipv4"});
         yes(&address, &json!({"enum": ["1.2.3.4", "0.0.0.0", 1]}));
         assert_eq!(
@@ -984,16 +983,15 @@ mod tests {
             json!("1.2.3.256")
         );
         assert_eq!(
-            depends_on(&address, &json!({"const": "01.2.3.4"})),
-            (Side::A, "#/format".to_owned())
+            counterexample(&address, &json!({"const": "087.10.0.1"})),
+            json!("087.10.0.1")
         );
-        assert_eq!(
-            depends_on(
-                &json!(false),
-                &json!({"format": "ipv4", "const": "01.2.3.4"})
-            ),
-            (Side::B, "#/format".to_owned())
+        yes(
+            &json!(false),
+            &json!({"format": "ipv4", "const": "01.2.3.4"}),
         );
+        // A duration in small letters is left open: the grammar allows it by the letter,
+        // validators do not take it, and the corpus has no such duration.
         let duration = json!({"format": "duration"});
         yes(&duration, &json!({"enum": ["P1D", "PT0S"]}));
         assert_eq!(
