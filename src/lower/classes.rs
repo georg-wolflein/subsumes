@@ -539,22 +539,24 @@ mod tests {
             let truth = json!(true);
             let graph = parse(schema, &truth).unwrap().link().unwrap();
             let mut budget = Budget::new(u64::MAX);
-            reached(&graph, &mut budget).unwrap();
-            (budget.spent(), graph.len() as u64)
+            let (scopes, _) = reached(&graph, &mut budget).unwrap();
+            (budget.spent(), scopes.len() as u64)
         };
         let plain = json!({"properties": {"a": {"items": {"not": {}}}}});
         assert_eq!(rounds(&plain).0, 0);
 
         // Three of the four schemas on the cycle say the same by themselves. Each round tells
         // one more of them apart, by what it leads to, and a round that tells nothing apart
-        // ends the work. Every round but the first costs a step for each node.
+        // ends the work. Every round but the first costs a step for each schema that is
+        // classed: the four on the cycle and `true`.
         let cycle = json!({"not": {"not": {"not": {"$ref": "#"}}}});
         assert_eq!(rounds(&cycle), (3 * 5, 5));
-        // Schemas that nothing leads to are classed with the others.
+        // Schemas that nothing leads to are not classed. Here the root and `true` are, and
+        // the four on the cycle are not.
         let unused = json!({
             "$defs": {"cycle": {"not": {"not": {"not": {"$ref": "#/$defs/cycle"}}}}},
         });
-        assert_eq!(rounds(&unused), (3 * 6, 6));
+        assert_eq!(rounds(&unused), (0, 2));
 
         let truth = json!(true);
         let graph = parse(&cycle, &truth).unwrap().link().unwrap();

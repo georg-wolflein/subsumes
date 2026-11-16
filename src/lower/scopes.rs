@@ -14,6 +14,9 @@
 //!
 //! Only the names that some `$dynamicRef` looks for are bound. So for schemas without one
 //! there is one scope, which binds nothing, and every schema is reached in it once.
+//!
+//! A schema that neither A nor B leads to, such as a definition that no reference names, is
+//! not reached. It has no scope, and no part in the check.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -54,6 +57,8 @@ pub(super) struct Scopes<'g> {
     scope_ids: HashMap<Bound<'g>, ScopeId>,
     reached: Vec<Reached>,
     places: HashMap<Reached, usize>,
+    /// The schemas that have been reached, in whichever scope.
+    seen: HashSet<NodeId>,
     /// For each schema as it is reached, the schemas that it leads to, as they are reached
     /// from it: those of its keywords, the target of its `$ref`, and what its `$dynamicRef`
     /// leads to in its scope.
@@ -72,9 +77,9 @@ impl<'g> Scopes<'g> {
     ///
     /// # Errors
     ///
-    /// When there are more schemas and scopes than the budget covers. A schema that is
-    /// reached in a second scope costs a step, so without a `$dynamicRef` the work costs
-    /// nothing.
+    /// When there are more schemas and scopes than the budget covers. A schema costs a step
+    /// for each scope that it is reached in beyond its first, so without a `$dynamicRef` the
+    /// work costs nothing.
     pub fn of(graph: &'g Graph<'g>, budget: &mut Budget) -> Result<Self, Exhausted> {
         let nodes = || (0..graph.len()).map(NodeId::new);
         let looked_for: HashSet<&str> = nodes()
@@ -95,29 +100,18 @@ impl<'g> Scopes<'g> {
             scope_ids: HashMap::from([(Bound::new(), ScopeId::NOTHING)]),
             reached: Vec::new(),
             places: HashMap::new(),
+            seen: HashSet::new(),
             leads_to: Vec::new(),
         };
-        // Where no name is looked for, every schema is in the one scope whichever way leads
-        // to it, and they are taken in the order of the nodes, reached or not. Otherwise
-        // only what A and B lead to is.
-        let begin: Vec<NodeId> = if looked_for.is_empty() {
-            nodes().collect()
-        } else {
-            vec![graph.a, graph.b]
-        };
-        for root in begin {
-            scopes.enter(root, ScopeId::NOTHING);
+        for root in [graph.a, graph.b] {
+            scopes.enter(root, ScopeId::NOTHING, budget)?;
         }
         let mut next = 0;
         while let Some(&Reached { node, scope }) = scopes.reached.get(next) {
             next += 1;
             let mut leads_to = Vec::new();
             for to in scopes.applied(node, scope) {
-                let known = scopes.reached.len();
-                leads_to.push(scopes.enter(to, scope));
-                if scopes.reached.len() > known {
-                    budget.charge(1)?;
-                }
+                leads_to.push(scopes.enter(to, scope, budget)?);
             }
             scopes.leads_to.push(leads_to);
         }
@@ -185,7 +179,16 @@ impl<'g> Scopes<'g> {
 
     /// Reaches a node from a schema in a scope, and says which of the reached schemas it
     /// is.
-    fn enter(&mut self, node: NodeId, from: ScopeId) -> usize {
+    ///
+    /// # Errors
+    ///
+    /// When the budget does not cover a further scope of the schema.
+    fn enter(
+        &mut self,
+        node: NodeId,
+        from: ScopeId,
+        budget: &mut Budget,
+    ) -> Result<usize, Exhausted> {
         let scope = match self.entering(node, from) {
             None => from,
             Some(bound) => {
@@ -202,7 +205,10 @@ impl<'g> Scopes<'g> {
         let place = *self.places.entry(reached).or_insert(next);
         if place == next {
             self.reached.push(reached);
+            if !self.seen.insert(node) {
+                budget.charge(1)?;
+            }
         }
-        place
+        Ok(place)
     }
 }

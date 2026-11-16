@@ -1257,11 +1257,11 @@ mod tests {
         let mut unused = lists();
         unused["$defs"]["list"]["items"] = json!({"$ref": "#item"});
         assert_eq!(steps(&unused, u64::MAX), (true, 0));
-        // With one, every schema that the root leads to costs one for each scope: nine
-        // besides the root, the list and what is in it twice.
-        assert_eq!(steps(&lists(), u64::MAX), (true, 9));
-        assert_eq!(steps(&lists(), 9), (true, 9));
-        assert_eq!(steps(&lists(), 8), (false, 8));
+        // With one, a schema costs a step for each scope that it is reached in beyond its
+        // first: the list and what is in it are reached in two.
+        assert_eq!(steps(&lists(), u64::MAX), (true, 2));
+        assert_eq!(steps(&lists(), 2), (true, 2));
+        assert_eq!(steps(&lists(), 1), (false, 1));
 
         // Twelve names, each bound by one of two resources on the way, are 4,096 scopes
         // for the last resource to be reached in.
