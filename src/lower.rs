@@ -617,14 +617,17 @@ impl<'g> Lowering<'g, '_> {
     ///
     /// # Errors
     ///
-    /// When there are more ways than the budget covers. A way that joins a list is held
-    /// against every way of the list, which costs a step for each.
+    /// When the budget does not cover the schemas that are looked at, or the ways. A
+    /// schema costs a step each time it is looked at, which is once for every way in place
+    /// that leads to it. And a way that joins a list is held against every way of the
+    /// list, which costs a step for each.
     fn evaluated(
         &mut self,
         reached: usize,
         outermost: bool,
         above: &mut Vec<usize>,
     ) -> Result<Option<Vec<Evaluated<'g>>>, Exhausted> {
+        self.context.budget.charge(1)?;
         let graph = self.graph;
         let Reached { node, scope } = self.scopes.at(reached);
         let Schema::Object(keywords) = &graph.node(node).schema else {
@@ -1543,31 +1546,54 @@ mod tests {
             })
         };
         // A way that joins a list is held against every way of the list, at a step each.
-        // One choice costs a few, and each one more doubles the ways.
-        assert_eq!(steps(&choices(1), u64::MAX), (true, 5));
-        assert_eq!(steps(&choices(2), u64::MAX), (true, 15));
-        assert_eq!(steps(&choices(4), u64::MAX), (true, 171));
-        assert_eq!(steps(&choices(8), u64::MAX), (true, 43_467));
-        assert_eq!(steps(&choices(4), 170), (false, 170));
+        // One choice costs a few, and each one more doubles the ways. Each schema that is
+        // looked at costs a step besides: the outermost one, and three for each choice.
+        assert_eq!(steps(&choices(1), u64::MAX), (true, 5 + 4));
+        assert_eq!(steps(&choices(2), u64::MAX), (true, 15 + 7));
+        assert_eq!(steps(&choices(4), u64::MAX), (true, 171 + 13));
+        assert_eq!(steps(&choices(8), u64::MAX), (true, 43_467 + 25));
+        assert_eq!(steps(&choices(4), 183), (false, 183));
         assert_eq!(steps(&choices(40), 100_000), (false, 100_000));
         // A schema that leads back to itself in place is found at once, and not by going
         // round until it is too deep.
         // Telling the schemas of the cycle apart costs steps too, and with the keyword
-        // there is one schema more to tell apart. The other two steps are for the way of
-        // `a`.
+        // there is one schema more to tell apart. Two steps are for the way of `a`, and
+        // four for the schemas that are looked at until the root is met again.
         let mut round = json!({"anyOf": [{"properties": {"a": {}}}, {"$ref": "#"}]});
         let (_, without) = steps(&round, u64::MAX);
         round["unevaluatedProperties"] = json!(false);
         let (_, with) = steps(&round, u64::MAX);
-        assert_eq!(with - without, 1 + 2);
-        // Without a choice there is one way, which is held against nothing.
+        assert_eq!(with - without, 1 + 2 + 4);
+        // Without a choice there is one way, which is held against nothing: the four
+        // steps are for the four schemas that are looked at.
         let plain = json!({
             "allOf": [{"properties": {"a": {}}}, {"$ref": "#/$defs/d"}],
             "properties": {"b": {}},
             "unevaluatedProperties": false,
             "$defs": {"d": {"patternProperties": {"^c": {}}}},
         });
-        assert_eq!(steps(&plain, u64::MAX), (true, 0));
+        assert_eq!(steps(&plain, u64::MAX), (true, 4));
+
+        // A schema is looked at once for every way in place that leads to it. Each
+        // definition here is two references to the one before, so the first is reached in
+        // two ways, in four, in eight: with three definitions above it, 30 looks in all.
+        let doubled = |levels: usize| {
+            let mut definitions = Map::new();
+            definitions.insert("d0".to_owned(), json!({"properties": {"a": {}}}));
+            for level in 1..=levels {
+                let before = json!({"$ref": format!("#/$defs/d{}", level - 1)});
+                definitions.insert(format!("d{level}"), json!({"allOf": [before, before]}));
+            }
+            json!({
+                "$ref": format!("#/$defs/d{levels}"),
+                "unevaluatedProperties": false,
+                "$defs": definitions,
+            })
+        };
+        assert_eq!(steps(&doubled(3), u64::MAX), (true, 30));
+        // So thirty such definitions, which are 2^32 looks, end at the budget. More of them
+        // are deeper in place than is followed.
+        assert_eq!(steps(&doubled(30), 100_000), (false, 100_000));
     }
 
     #[test]
