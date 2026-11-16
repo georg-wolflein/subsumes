@@ -3072,6 +3072,121 @@ mod tests {
     }
 
     #[test]
+    fn unevaluated_properties_are_those_that_no_schema_in_place_evaluates() {
+        let same = |one: &Value, other: &Value| {
+            yes(one, other);
+            yes(other, one);
+        };
+        let closed = |mut schema: Value| {
+            schema["unevaluatedProperties"] = json!(false);
+            schema
+        };
+        let only =
+            |properties: Value| json!({"properties": properties, "additionalProperties": false});
+        let text = json!({"type": "string"});
+
+        // Next to nothing in place it is `additionalProperties`.
+        same(
+            &closed(json!({"properties": {"a": text}})),
+            &only(json!({"a": text})),
+        );
+        // It sees into the schemas in place, which `additionalProperties` does not.
+        let parts = json!({"allOf": [{"properties": {"a": text}}, {"properties": {"b": {}}}]});
+        same(&closed(parts.clone()), &only(json!({"a": text, "b": {}})));
+        let mut blind = parts;
+        blind["additionalProperties"] = json!(false);
+        same(&blind, &json!({"maxProperties": 0}));
+        // And not into a schema beside it.
+        let beside =
+            json!({"allOf": [{"properties": {"a": {}}}, {"unevaluatedProperties": false}]});
+        same(&beside, &json!({"maxProperties": 0}));
+
+        // A branch of `anyOf` evaluates its properties where the instance satisfies it. So
+        // a property that makes its branch fail is evaluated by nothing.
+        let number = json!({"type": "number"});
+        let either = closed(json!({
+            "anyOf": [{"properties": {"a": text}}, {"properties": {"b": number}}],
+        }));
+        same(&either, &only(json!({"a": text, "b": number})));
+        // A branch that the instance does not satisfy evaluates nothing, also not the
+        // properties that are as it asks.
+        let needed = closed(json!({
+            "anyOf": [
+                {"properties": {"a": text, "c": {}}, "required": ["c"]},
+                {"properties": {"b": number}},
+            ],
+        }));
+        assert_eq!(
+            counterexample(&needed, &only(json!({"a": text, "b": number}))),
+            json!({"a": "", "b": 0})
+        );
+
+        // What the condition names is evaluated only where the condition is met.
+        let kind = json!({"properties": {"kind": {"const": "a"}}, "required": ["kind"]});
+        let conditional = closed(json!({
+            "if": kind,
+            "then": {"properties": {"x": {}}},
+            "else": {"properties": {"y": {}}},
+        }));
+        let mut met = only(json!({"kind": {"const": "a"}, "x": {}}));
+        met["required"] = json!(["kind"]);
+        same(
+            &conditional,
+            &json!({"anyOf": [met, only(json!({"y": {}}))]}),
+        );
+        assert_eq!(
+            counterexample(&conditional, &only(json!({"kind": {}, "x": {}, "y": {}}))),
+            json!({"kind": null, "x": null, "y": null})
+        );
+
+        // A schema of `dependentSchemas` evaluates where the object has the property.
+        let dependent = closed(json!({
+            "properties": {"a": {}},
+            "dependentSchemas": {"a": {"properties": {"b": text}}},
+        }));
+        let mut with_a = only(json!({"a": {}, "b": text}));
+        with_a["required"] = json!(["a"]);
+        same(
+            &dependent,
+            &json!({"anyOf": [with_a, {"maxProperties": 0}]}),
+        );
+
+        // A schema in place with an `unevaluatedProperties` of its own evaluates every
+        // property, so the one around it has nothing left.
+        let inner = closed(json!({
+            "allOf": [{"properties": {"a": text}, "unevaluatedProperties": {"type": "null"}}],
+        }));
+        let mut open = only(json!({"a": text}));
+        open["additionalProperties"] = json!({"type": "null"});
+        same(&inner, &open);
+
+        // What a `$dynamicRef` leads to evaluates as well, and that is another schema by
+        // another way: with the anchor of the root on the way it is `b`, and without it
+        // nothing.
+        let extended = |anchor: &str| {
+            json!({
+                "$id": "https://example.com/root",
+                "$ref": "base",
+                "$defs": {
+                    "more": {anchor: "more", "properties": {"b": {}}},
+                    "base": {
+                        "$id": "base",
+                        "properties": {"a": {}},
+                        "allOf": [{"$dynamicRef": "#more"}],
+                        "unevaluatedProperties": false,
+                        "$defs": {"more": {"$dynamicAnchor": "more"}},
+                    },
+                },
+            })
+        };
+        same(
+            &extended("$dynamicAnchor"),
+            &only(json!({"a": {}, "b": {}})),
+        );
+        same(&extended("$anchor"), &only(json!({"a": {}})));
+    }
+
+    #[test]
     fn a_tree_that_is_extended_is_extended_at_every_node() {
         // The children of a node are whatever the outermost schema with the anchor says a
         // node is. So a tree that asks for a name asks for it at every node.

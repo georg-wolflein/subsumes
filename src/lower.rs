@@ -27,7 +27,7 @@
 mod classes;
 mod scopes;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use serde_json::Value;
 
@@ -35,6 +35,7 @@ use self::classes::written;
 use self::scopes::{Reached, ScopeId, Scopes};
 use crate::context::{Context, Exhausted};
 use crate::formats;
+use crate::language::LanguageId;
 use crate::normalize::DEEPEST;
 use crate::rational::{Rational, exact};
 use crate::schema::{Count, Graph, Keywords, NodeId, Schema, Type};
@@ -66,7 +67,7 @@ pub(crate) fn lower<'g>(
     while let Some((variable, reached)) = lowering.pending.pop_front() {
         let Reached { node, scope } = scopes.at(reached);
         lowering.scope = scope;
-        let body = lowering.body(node);
+        let body = lowering.body(node)?;
         lowering.context.terms.variable_mut(variable).body = body;
     }
 
@@ -105,17 +106,24 @@ const STRING: TypeSet = TypeSet::of(InstanceType::String);
 const ARRAY: TypeSet = TypeSet::of(InstanceType::Array);
 const OBJECT: TypeSet = TypeSet::of(InstanceType::Object);
 
-impl Lowering<'_, '_> {
+impl<'g> Lowering<'g, '_> {
     /// The variable of a schema, as it is reached from the schema whose term is being
-    /// made. The first schema of a class to ask gives the variable its term, and every
-    /// schema of a class would give the same.
+    /// made.
     fn variable(&mut self, node: NodeId) -> VarId {
-        let reached = self.scopes.from(node, self.scope);
+        self.variable_of(self.scopes.from(node, self.scope))
+    }
+
+    /// The variable of a schema as it is reached. The first schema of a class to ask gives
+    /// the variable its term, and every schema of a class would give the same.
+    fn variable_of(&mut self, reached: usize) -> VarId {
         let class = self.classes[reached];
         if let Some(&variable) = self.variables.get(&class) {
             return variable;
         }
-        let variable = self.context.terms.new_variable(node);
+        let variable = self
+            .context
+            .terms
+            .new_variable(self.scopes.at(reached).node);
         self.variables.insert(class, variable);
         self.pending.push_back((variable, reached));
         variable
@@ -133,11 +141,16 @@ impl Lowering<'_, '_> {
     }
 
     /// The term of a schema: the conjunction of what its keywords say.
-    fn body(&mut self, id: NodeId) -> TermId {
+    ///
+    /// # Errors
+    ///
+    /// When the budget does not cover the ways in which the properties of an instance may
+    /// be evaluated.
+    fn body(&mut self, id: NodeId) -> Result<TermId, Exhausted> {
         let graph = self.graph;
         let keywords = match &graph.node(id).schema {
-            Schema::Bool(true) => return self.context.terms.truth(),
-            Schema::Bool(false) => return self.context.terms.falsity(),
+            Schema::Bool(true) => return Ok(self.context.terms.truth()),
+            Schema::Bool(false) => return Ok(self.context.terms.falsity()),
             Schema::Object(keywords) => keywords,
         };
         let mut parts = Vec::new();
@@ -146,8 +159,8 @@ impl Lowering<'_, '_> {
         self.numbers(keywords, &mut parts);
         self.strings(id, keywords, &mut parts);
         self.arrays(id, keywords, &mut parts);
-        self.objects(id, keywords, &mut parts);
-        self.context.terms.all_of(parts)
+        self.objects(id, keywords, &mut parts)?;
+        Ok(self.context.terms.all_of(parts))
     }
 
     /// A predicate that the engine does not model. `key` is the keyword with what it holds;
@@ -471,7 +484,12 @@ impl Lowering<'_, '_> {
         }
     }
 
-    fn objects(&mut self, id: NodeId, keywords: &Keywords, parts: &mut Vec<TermId>) {
+    fn objects(
+        &mut self,
+        id: NodeId,
+        keywords: &Keywords,
+        parts: &mut Vec<TermId>,
+    ) -> Result<(), Exhausted> {
         // A property with this name satisfies the schema.
         for (name, schema) in &keywords.properties {
             let variable = self.variable(*schema);
@@ -546,10 +564,275 @@ impl Lowering<'_, '_> {
             Some(Count::Of(most)) => parts.push(self.context.terms.max_props(most)),
             beyond => self.count(OBJECT, id, "maxProperties", beyond, parts),
         }
-        if keywords.unevaluated_properties.is_some() {
-            let key = format!("unevaluatedProperties of {}", self.class(id));
-            parts.push(self.leaf(OBJECT, id, "unevaluatedProperties", key));
+        if let Some(schema) = keywords.unevaluated_properties {
+            parts.push(self.unevaluated_properties(id, schema)?);
         }
+        Ok(())
+    }
+
+    /// What `unevaluatedProperties` says: every property that the schema around it has not
+    /// evaluated satisfies its schema.
+    ///
+    /// Which properties are evaluated depends on the instance: a branch of `anyOf` that
+    /// the instance satisfies evaluates the properties that it names, and one that it does
+    /// not satisfy evaluates none. So the term is one of several ways: in each, the
+    /// instance satisfies some of the schemas in place, and every property that those do
+    /// not evaluate satisfies the schema of the keyword. The schemas that it does not
+    /// satisfy are not named: with more of them satisfied, more is evaluated and less is
+    /// asked, so the way that names all of them holds whenever one that names fewer does.
+    ///
+    /// Where the ways are not to be found, the keyword is a leaf of the class of the schema
+    /// around it, on which everything that it says depends.
+    fn unevaluated_properties(&mut self, id: NodeId, schema: NodeId) -> Result<TermId, Exhausted> {
+        let here = self.scopes.from(id, self.scope);
+        let Some(ways) = self.evaluated(here, true, &mut Vec::new())? else {
+            let key = format!("unevaluatedProperties of {}", self.class(id));
+            return Ok(self.leaf(OBJECT, id, "unevaluatedProperties", key));
+        };
+        let variable = self.variable(schema);
+        let mut terms = Vec::with_capacity(ways.len());
+        for way in ways {
+            let mut parts: Vec<TermId> = way.given.into_iter().collect();
+            // As `additionalProperties` is about the names that `properties` and
+            // `patternProperties` leave.
+            if let Some(names) = way.names {
+                let languages = &mut self.context.languages;
+                let named = languages.words(names.words);
+                let others = languages.outside(names.patterns.into_iter().chain([named]));
+                parts.push(self.context.terms.p_prop(others, variable));
+            }
+            terms.push(self.context.terms.all_of(parts));
+        }
+        Ok(self.context.terms.any_of(terms))
+    }
+
+    /// The ways in which a schema that an instance satisfies evaluates the properties of
+    /// the instance, or `None` if they are not to be found: with a pattern that is not
+    /// read as a language, with a schema that leads back to itself in place, and deeper in
+    /// place than [`IN_PLACE`].
+    ///
+    /// `outermost` is the schema whose `unevaluatedProperties` is being lowered: that
+    /// keyword is the one thing in it that evaluates nothing here. `above` holds the
+    /// schemas on the way down to this one.
+    ///
+    /// # Errors
+    ///
+    /// When the budget does not cover the schemas that are looked at, or the ways. A
+    /// schema costs a step each time it is looked at, which is once for every way in place
+    /// that leads to it. And a way that joins a list is held against every way of the
+    /// list, which costs a step for each.
+    fn evaluated(
+        &mut self,
+        reached: usize,
+        outermost: bool,
+        above: &mut Vec<usize>,
+    ) -> Result<Option<Vec<Evaluated<'g>>>, Exhausted> {
+        self.context.budget.charge(1)?;
+        let graph = self.graph;
+        let Reached { node, scope } = self.scopes.at(reached);
+        let Schema::Object(keywords) = &graph.node(node).schema else {
+            return Ok(Some(vec![Evaluated::nothing()]));
+        };
+        if above.contains(&reached) || above.len() >= IN_PLACE {
+            return Ok(None);
+        }
+        // What the schema evaluates by itself. `additionalProperties` is about every
+        // property that the other two keywords leave, and so is `unevaluatedProperties`
+        // about every one that anything leaves.
+        let all = keywords.additional_properties.is_some()
+            || (!outermost && keywords.unevaluated_properties.is_some());
+        let mut names = Names::default();
+        if !all {
+            names.words = keywords.properties.iter().map(|(name, _)| *name).collect();
+            for (pattern, _) in &keywords.pattern_properties {
+                let Ok(matched) = self.context.languages.pattern(pattern) else {
+                    return Ok(None);
+                };
+                names.patterns.insert(matched);
+            }
+        }
+        let mut ways = vec![Evaluated {
+            given: BTreeSet::new(),
+            names: (!all).then_some(names),
+        }];
+
+        above.push(reached);
+        // The term that says that the instance satisfies a schema in place, and the ways
+        // of that schema.
+        let below = |lowering: &mut Self, schema: NodeId, above: &mut Vec<usize>| {
+            let reached = lowering.scopes.from(schema, scope);
+            let variable = lowering.variable_of(reached);
+            let satisfied = lowering.context.terms.reference(variable);
+            Ok::<_, Exhausted>((satisfied, lowering.evaluated(reached, false, above)?))
+        };
+        // Whatever the instance satisfies, nothing more is evaluated.
+        let nothing = || vec![Evaluated::nothing()];
+        macro_rules! found {
+            ($ways:expr) => {
+                match $ways {
+                    Some(ways) => ways,
+                    None => {
+                        above.pop();
+                        return Ok(None);
+                    }
+                }
+            };
+        }
+
+        // What an instance that satisfies the schema satisfies in any case.
+        let dynamic = keywords.dynamic_reference;
+        let dynamic = dynamic.map(|dynamic| self.scopes.resolved(dynamic, scope));
+        let always = keywords.all_of.iter().copied();
+        for schema in always.chain(keywords.reference).chain(dynamic) {
+            let (_, of_schema) = below(self, schema, above)?;
+            ways = self.together(ways, found!(of_schema))?;
+        }
+        // A branch of `anyOf` that the instance satisfies or not. Of `oneOf` it satisfies
+        // one, so the ways of two of its branches are never put together.
+        for schema in &keywords.any_of {
+            let (satisfied, of_schema) = below(self, *schema, above)?;
+            let either = self.or(nothing(), found!(of_schema), satisfied)?;
+            ways = self.together(ways, either)?;
+        }
+        if !keywords.one_of.is_empty() {
+            let mut either = nothing();
+            for schema in &keywords.one_of {
+                let (satisfied, of_schema) = below(self, *schema, above)?;
+                either = self.or(either, found!(of_schema), satisfied)?;
+            }
+            ways = self.together(ways, either)?;
+        }
+        // The condition evaluates what it does where the instance satisfies it, and
+        // `then` with it. Where the instance does not, `else` does.
+        if let Some(condition) = keywords.if_ {
+            let (satisfied, of_condition) = below(self, condition, above)?;
+            let mut met = found!(of_condition);
+            if let Some(then) = keywords.then {
+                let (_, of_then) = below(self, then, above)?;
+                met = self.together(met, found!(of_then))?;
+            }
+            let mut either = self.or(nothing(), met, satisfied)?;
+            if let Some(otherwise) = keywords.else_ {
+                let (_, of_else) = below(self, otherwise, above)?;
+                let unmet = self.context.terms.not(satisfied);
+                either = self.or(either, found!(of_else), unmet)?;
+            }
+            ways = self.together(ways, either)?;
+        }
+        // A schema of `dependentSchemas` is asked of an object that has the property.
+        for (name, schema) in &keywords.dependent_schemas {
+            let present = self.has_property(name);
+            let (_, of_schema) = below(self, *schema, above)?;
+            let either = self.or(nothing(), found!(of_schema), present)?;
+            ways = self.together(ways, either)?;
+        }
+        above.pop();
+        Ok(Some(ways))
+    }
+
+    /// Every way of the one list with every way of the other.
+    fn together(
+        &mut self,
+        one: Vec<Evaluated<'g>>,
+        other: Vec<Evaluated<'g>>,
+    ) -> Result<Vec<Evaluated<'g>>, Exhausted> {
+        let mut ways = Vec::new();
+        for first in &one {
+            for second in &other {
+                self.add(&mut ways, first.with(second))?;
+            }
+        }
+        Ok(ways)
+    }
+
+    /// The ways of `either`, or else those of `ways` where the instance satisfies `term`.
+    fn or(
+        &mut self,
+        mut either: Vec<Evaluated<'g>>,
+        ways: Vec<Evaluated<'g>>,
+        term: TermId,
+    ) -> Result<Vec<Evaluated<'g>>, Exhausted> {
+        for way in ways {
+            self.add(&mut either, way.given(term))?;
+        }
+        Ok(either)
+    }
+
+    /// Adds a way to a list, unless a way of the list says as much. The ways of the list
+    /// that say no more than the new one go. Each way that the new one is held against
+    /// costs a step.
+    fn add(&mut self, ways: &mut Vec<Evaluated<'g>>, way: Evaluated<'g>) -> Result<(), Exhausted> {
+        self.context.budget.charge(ways.len() as u64)?;
+        if ways.iter().any(|other| way.says_no_more_than(other)) {
+            return Ok(());
+        }
+        ways.retain(|other| !other.says_no_more_than(&way));
+        ways.push(way);
+        Ok(())
+    }
+}
+
+/// How many schemas deep in place the properties that a schema evaluates are looked for.
+const IN_PLACE: usize = 64;
+
+/// The names of the properties that a schema evaluates: these words, and what these
+/// patterns match.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Names<'g> {
+    words: BTreeSet<&'g str>,
+    patterns: BTreeSet<LanguageId>,
+}
+
+/// One way in which a schema evaluates the properties of an instance that it accepts: where
+/// the instance satisfies every term of `given`, the properties with these names are
+/// evaluated, or every property where there are no names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Evaluated<'g> {
+    given: BTreeSet<TermId>,
+    names: Option<Names<'g>>,
+}
+
+impl<'g> Evaluated<'g> {
+    /// Whatever the instance satisfies, nothing is evaluated.
+    fn nothing() -> Self {
+        Self {
+            given: BTreeSet::new(),
+            names: Some(Names::default()),
+        }
+    }
+
+    fn given(mut self, term: TermId) -> Self {
+        self.given.insert(term);
+        self
+    }
+
+    /// Both ways at once: the instance satisfies what both ask, and what either evaluates
+    /// is evaluated.
+    fn with(&self, other: &Self) -> Self {
+        let names = match (&self.names, &other.names) {
+            (Some(one), Some(other)) => Some(Names {
+                words: one.words.union(&other.words).copied().collect(),
+                patterns: one.patterns.union(&other.patterns).copied().collect(),
+            }),
+            _ => None,
+        };
+        Self {
+            given: self.given.union(&other.given).copied().collect(),
+            names,
+        }
+    }
+
+    /// Whether the other way asks no more of the instance and evaluates no less. Then
+    /// this one adds nothing to a list that has the other.
+    fn says_no_more_than(&self, other: &Self) -> bool {
+        let evaluates_no_more = match (&self.names, &other.names) {
+            (_, None) => true,
+            (None, Some(_)) => false,
+            (Some(names), Some(others)) => {
+                names.words.is_subset(&others.words) && names.patterns.is_subset(&others.patterns)
+            }
+        };
+        other.given.is_subset(&self.given) && evaluates_no_more
     }
 }
 
@@ -1085,9 +1368,9 @@ mod tests {
 
     #[test]
     fn some_leaves_are_like_no_other() {
-        // What `unevaluatedProperties` is about depends on the rest of its schema.
-        let a = json!({"properties": {"a": {}}, "unevaluatedProperties": false});
-        let b = json!({"properties": {"b": {}}, "unevaluatedProperties": false});
+        // What `unevaluatedItems` is about depends on the rest of its schema.
+        let a = json!({"prefixItems": [{}], "unevaluatedItems": false});
+        let b = json!({"prefixItems": [{}, {}], "unevaluatedItems": false});
         let (terms, of_a, of_b) = lowered(&a, &b);
         let last = |variable| match terms.term(terms.variable(variable).body) {
             crate::term::Term::AllOf(parts) => *parts.last().unwrap(),
@@ -1097,7 +1380,7 @@ mod tests {
         assert!(
             terms
                 .show(last(of_a))
-                .starts_with("?[unevaluatedProperties of #")
+                .starts_with("?[unevaluatedItems of #")
         );
         // In two schemas that say the same, it is the same.
         let (_, of_a, of_b) = lowered(&a, &a);
@@ -1110,6 +1393,207 @@ mod tests {
         let (of_a, of_b) = (terms.variable(of_a).body, terms.variable(of_b).body);
         assert_ne!(terms.show(of_a), terms.show(of_b));
         assert!(terms.show(of_a).starts_with("?[minLength @"));
+    }
+
+    #[test]
+    fn unevaluated_properties_is_about_the_properties_that_nothing_evaluates() {
+        // Next to nothing in place it says what `additionalProperties` says, in the same
+        // term.
+        let beside = |keyword: &str| {
+            let mut schema = json!({"properties": {"a": {}}, "patternProperties": {"^b": {}}});
+            schema[keyword] = json!(false);
+            term(&schema)
+        };
+        assert_eq!(
+            beside("unevaluatedProperties"),
+            beside("additionalProperties")
+        );
+        assert_eq!(
+            beside("unevaluatedProperties"),
+            "all(pprop(l2: x2), pprop(l3: x2), pprop(l4: x3))"
+        );
+        // `additionalProperties` evaluates every property, so nothing is left to say.
+        let both = json!({
+            "properties": {"a": {}},
+            "additionalProperties": {"type": "null"},
+            "unevaluatedProperties": false,
+        });
+        assert_eq!(term(&both), "all(pprop(l2: x2), pprop(l3: x3))");
+        // What a schema of `allOf` or the target of a reference evaluates is evaluated
+        // whatever the instance is: `l4` is every name but `a` and `b`.
+        let always = json!({
+            "allOf": [{"properties": {"a": {}}}],
+            "properties": {"b": {}},
+            "unevaluatedProperties": false,
+        });
+        assert_eq!(term(&always), "all(x2, pprop(l2: x3), pprop(l4: x4))");
+        let referred = json!({
+            "$ref": "#/$defs/d",
+            "unevaluatedProperties": false,
+            "$defs": {"d": {"properties": {"a": {}}}},
+        });
+        assert_eq!(term(&referred), "all(x2, pprop(l3: x3))");
+        // Neither a negated schema nor one beside it evaluates anything: `l1` is every
+        // name.
+        let negated = json!({"not": {"properties": {"a": {}}}, "unevaluatedProperties": false});
+        assert_eq!(term(&negated), "all(not x2, pprop(l1: x3))");
+        let cousins =
+            json!({"allOf": [{"properties": {"a": {}}}, {"unevaluatedProperties": false}]});
+        assert_eq!(terms(&cousins, &json!(true))[3], "pprop(l1: x5)");
+    }
+
+    #[test]
+    fn what_is_evaluated_depends_on_the_schemas_that_the_instance_satisfies() {
+        // The last part of the term: one way for each choice of schemas in place that
+        // evaluate something. `l1` is every name, so the first way is an object of which
+        // every property satisfies the schema of the keyword.
+        let ways = |mut schema: Value| {
+            schema["unevaluatedProperties"] = json!(false);
+            let shown = term(&schema);
+            let (_, ways) = shown.split_once(", any(pprop(l1: ").expect(&shown);
+            ways.strip_suffix("))").expect(&shown).to_owned()
+        };
+        // A branch of `anyOf` that the instance satisfies. One that evaluates nothing is no
+        // way of its own.
+        let any = json!({"anyOf": [{"properties": {"a": {}}}, {"required": ["b"]}]});
+        assert_eq!(ways(any), "x4), all(x2, pprop(l3: x4))");
+        // Two that are both satisfied evaluate no more than the second of these does, so
+        // that is no way of its own either.
+        let within = json!({
+            "anyOf": [{"properties": {"a": {}}}, {"properties": {"a": {}, "b": {}}}],
+        });
+        assert_eq!(
+            ways(within),
+            "x4), all(x3, pprop(l3: x4)), all(x2, pprop(l5: x4))"
+        );
+        // Two with other names are a way together.
+        let apart = json!({"anyOf": [{"properties": {"a": {}}}, {"properties": {"b": {}}}]});
+        assert_eq!(
+            ways(apart),
+            "x4), all(x3, pprop(l3: x4)), all(x2, pprop(l5: x4)), all(x2, x3, pprop(l7: x4))"
+        );
+        // Of `oneOf` an instance satisfies one.
+        let one = json!({"oneOf": [{"properties": {"a": {}}}, {"properties": {"b": {}}}]});
+        assert_eq!(
+            ways(one),
+            "x4), all(x2, pprop(l3: x4)), all(x3, pprop(l5: x4))"
+        );
+        // The condition and `then` where it is met, and `else` where it is not.
+        let condition = json!({
+            "if": {"properties": {"a": {"type": "null"}}},
+            "then": {"properties": {"b": {}}},
+            "else": {"properties": {"c": {}}},
+        });
+        assert_eq!(
+            ways(condition),
+            "x5), all(x2, pprop(l3: x5)), all(not x2, pprop(l5: x5))"
+        );
+        // A schema of `dependentSchemas` where the object has the property.
+        let dependent = json!({"dependentSchemas": {"a": {"properties": {"b": {}}}}});
+        assert_eq!(ways(dependent), "x3), all(preq(l2), pprop(l4: x3))");
+        // A branch with an `unevaluatedProperties` of its own evaluates everything.
+        let inner = json!({"anyOf": [{"properties": {"a": {}}, "unevaluatedProperties": {}}]});
+        assert_eq!(ways(inner), "x3), x2");
+        let inner = json!({"allOf": [{"unevaluatedProperties": true}]});
+        assert_eq!(
+            term(&json!({"allOf": inner["allOf"], "unevaluatedProperties": false})),
+            "x2"
+        );
+    }
+
+    #[test]
+    fn unevaluated_properties_is_a_leaf_where_what_is_evaluated_is_not_found() {
+        let leaf = |schema: &Value| {
+            let shown = term(schema);
+            assert!(shown.contains("?[unevaluatedProperties of #"), "{shown}");
+        };
+        // A schema that leads back to itself in place.
+        leaf(&json!({"allOf": [{"$ref": "#"}], "unevaluatedProperties": false}));
+        // A pattern that is not read as a language, here or in a schema in place.
+        leaf(&json!({"patternProperties": {"\\bword": {}}, "unevaluatedProperties": false}));
+        leaf(&json!({
+            "anyOf": [{"patternProperties": {"\\bword": {}}}],
+            "unevaluatedProperties": false,
+        }));
+        // Schemas in place, one in the other, deeper than they are followed.
+        let nested = |depth: usize| {
+            let mut schema = json!({"properties": {"a": {}}});
+            for _ in 0..depth {
+                schema = json!({"allOf": [schema]});
+            }
+            schema["unevaluatedProperties"] = json!(false);
+            schema
+        };
+        leaf(&nested(IN_PLACE));
+        assert!(!term(&nested(IN_PLACE - 1)).contains('?'));
+    }
+
+    #[test]
+    fn the_ways_of_evaluating_cost_steps_where_they_multiply() {
+        let steps = |schema: &Value, budget: u64| {
+            let truth = json!(true);
+            let graph = parse(schema, &truth).unwrap().link().unwrap();
+            let mut context = Context::new(budget);
+            let lowered = lower(&graph, &mut context);
+            (lowered.is_ok(), context.budget.spent())
+        };
+        // So many schemas of `anyOf`, each with a property of its own, in one `allOf`.
+        let choices = |count: usize| {
+            let choice = |name: usize| json!({"anyOf": [{"properties": {format!("p{name}"): {}}}, {"type": "object"}]});
+            json!({
+                "allOf": (0..count).map(choice).collect::<Vec<_>>(),
+                "unevaluatedProperties": false,
+            })
+        };
+        // A way that joins a list is held against every way of the list, at a step each.
+        // One choice costs a few, and each one more doubles the ways. Each schema that is
+        // looked at costs a step besides: the outermost one, and three for each choice.
+        assert_eq!(steps(&choices(1), u64::MAX), (true, 5 + 4));
+        assert_eq!(steps(&choices(2), u64::MAX), (true, 15 + 7));
+        assert_eq!(steps(&choices(4), u64::MAX), (true, 171 + 13));
+        assert_eq!(steps(&choices(8), u64::MAX), (true, 43_467 + 25));
+        assert_eq!(steps(&choices(4), 183), (false, 183));
+        assert_eq!(steps(&choices(40), 100_000), (false, 100_000));
+        // A schema that leads back to itself in place is found at once, and not by going
+        // round until it is too deep.
+        // Telling the schemas of the cycle apart costs steps too, and with the keyword
+        // there is one schema more to tell apart. Two steps are for the way of `a`, and
+        // four for the schemas that are looked at until the root is met again.
+        let mut round = json!({"anyOf": [{"properties": {"a": {}}}, {"$ref": "#"}]});
+        let (_, without) = steps(&round, u64::MAX);
+        round["unevaluatedProperties"] = json!(false);
+        let (_, with) = steps(&round, u64::MAX);
+        assert_eq!(with - without, 1 + 2 + 4);
+        // Without a choice there is one way, which is held against nothing: the four
+        // steps are for the four schemas that are looked at.
+        let plain = json!({
+            "allOf": [{"properties": {"a": {}}}, {"$ref": "#/$defs/d"}],
+            "properties": {"b": {}},
+            "unevaluatedProperties": false,
+            "$defs": {"d": {"patternProperties": {"^c": {}}}},
+        });
+        assert_eq!(steps(&plain, u64::MAX), (true, 4));
+
+        // A schema is looked at once for every way in place that leads to it. Each
+        // definition here is two references to the one before, so the first is reached in
+        // two ways, in four, in eight: with three definitions above it, 30 looks in all.
+        let doubled = |levels: usize| {
+            let mut definitions = Map::new();
+            definitions.insert("d0".to_owned(), json!({"properties": {"a": {}}}));
+            for level in 1..=levels {
+                let before = json!({"$ref": format!("#/$defs/d{}", level - 1)});
+                definitions.insert(format!("d{level}"), json!({"allOf": [before, before]}));
+            }
+            json!({
+                "$ref": format!("#/$defs/d{levels}"),
+                "unevaluatedProperties": false,
+                "$defs": definitions,
+            })
+        };
+        assert_eq!(steps(&doubled(3), u64::MAX), (true, 30));
+        // So thirty such definitions, which are 2^32 looks, end at the budget. More of them
+        // are deeper in place than is followed.
+        assert_eq!(steps(&doubled(30), 100_000), (false, 100_000));
     }
 
     #[test]
