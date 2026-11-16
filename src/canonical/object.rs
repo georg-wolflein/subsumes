@@ -36,7 +36,8 @@ use std::rc::Rc;
 
 use serde_json::{Map, Value};
 
-use super::{Left, State, state};
+use super::search::{self, Place, Placed, Places, Slot};
+use super::{Left, Solver, State, state};
 use crate::context::{Budget, Exhausted};
 use crate::language::{LanguageId, Languages, Lengths, Shape};
 use crate::normalize::{Cause, DEEPEST, Found, Witness};
@@ -182,22 +183,10 @@ impl Objects {
             partition: &partition,
             every: &every,
             some: &some,
-            slots: Vec::new(),
             used: vec![Vec::new(); partition.fragments.len()],
-            wanted: Vec::new(),
-            depends: None,
         };
-        search.run(with, ask, give)
+        search::run(search, with, ask, give)
     }
-}
-
-/// What the search for an object works with: the terms, for the c-references, the languages
-/// and the budget of the check, and the partitions that were made before.
-pub(crate) struct Solver<'s> {
-    pub terms: &'s mut Terms,
-    pub languages: &'s mut Languages,
-    pub budget: &'s mut Budget,
-    pub partitions: &'s mut Partitions,
 }
 
 /// The names of all properties, cut into fragments by a list of languages.
@@ -404,42 +393,8 @@ fn number(fragment: usize) -> u32 {
     u32::try_from(fragment).expect("fewer than 2^32 fragments")
 }
 
-/// A property of the object that is being put together: a name of a fragment, which is not
-/// chosen yet, and what its value satisfies.
-#[derive(Debug)]
-struct Slot {
-    fragment: u32,
-    of: CRefId,
-    /// A value. Without one: what stands in the way, or nothing if the engine has yet to
-    /// decide whether there is one.
-    value: Result<Rc<Witness>, Option<Cause>>,
-}
-
-/// Where a property that there has to be may go: to a property that is there already, or
-/// to a new one of a fragment.
-#[derive(Debug, Clone, Copy)]
-enum Place {
-    Join(usize),
-    Open(u32),
-}
-
-/// What was done for one property that there has to be, and what else can be tried.
-struct Level {
-    places: Vec<Place>,
-    next: usize,
-    /// What the place that was tried last did, if it stands.
-    done: Option<Done>,
-}
-
-/// What putting a property in a place did, to take it back.
-enum Done {
-    /// The property joined this slot, which was this before.
-    Joined(usize, Slot),
-    /// The property opened the last slot.
-    Opened,
-}
-
-/// The search for an object: a place for every property that there has to be.
+/// The search for an object: a place for every property that there has to be. A place is a
+/// fragment, of which the property has a name that is not chosen yet.
 struct Search<'s> {
     objects: &'s Objects,
     partition: &'s Partition,
@@ -448,103 +403,34 @@ struct Search<'s> {
     /// The properties that there have to be: the fragments that each may be in, and what
     /// its value satisfies.
     some: &'s [(&'s [u32], CRefId)],
-    slots: Vec<Slot>,
     /// The slots of each fragment.
     used: Vec<Vec<usize>>,
-    /// The c-references that the engine has yet to decide.
-    wanted: Vec<CRefId>,
-    /// What stood in the way of an object that was put together without a value for every
-    /// property. Once there is such an object, only one with every value is looked for.
-    depends: Option<Cause>,
 }
 
-impl Search<'_> {
-    /// Tries the places of each property that there has to be, one after the other, and
-    /// goes back to the one before where none is left to try.
-    fn run(
-        mut self,
-        with: &mut Solver,
-        ask: &mut dyn FnMut(CRefId) -> Option<Found>,
-        give: bool,
-    ) -> Result<Left, Exhausted> {
-        let mut levels: Vec<Level> = Vec::new();
-        let mut onward = true;
-        loop {
-            if onward && levels.len() == self.some.len() {
-                // Every one of them has a place.
-                if let Some(left) = self.fill(with, ask, give)? {
-                    return Ok(left);
-                }
-            } else if onward {
-                let places = self.places(levels.len());
-                levels.push(Level {
-                    places,
-                    next: 0,
-                    done: None,
-                });
-            }
-            let Some(level) = levels.last_mut() else {
-                break;
-            };
-            match level.done.take() {
-                Some(Done::Joined(slot, was)) => self.slots[slot] = was,
-                Some(Done::Opened) => {
-                    let slot = self.slots.pop().expect("the slot that was opened is there");
-                    self.used[slot.fragment as usize].pop();
-                }
-                None => {}
-            }
-            let Some(place) = level.places.get(level.next).copied() else {
-                levels.pop();
-                onward = false;
-                continue;
-            };
-            level.next += 1;
-            with.budget.charge(1)?;
-            let (_, asked) = self.some[levels.len() - 1];
-            let (fragment, of) = match place {
-                Place::Join(slot) => (self.slots[slot].fragment, self.slots[slot].of),
-                Place::Open(fragment) => (fragment, self.every[fragment as usize]),
-            };
-            let of = with.terms.both(of, asked);
-            let value = match state(of, ask, &mut self.wanted) {
-                State::Nothing => None,
-                State::Possible(_) if self.depends.is_some() => None,
-                State::Possible(cause) => Some(Err(Some(cause))),
-                State::Sure(witness) => Some(Ok(witness)),
-                State::Wanted => Some(Err(None)),
-            };
-            onward = value.is_some();
-            let Some(value) = value else {
-                continue;
-            };
-            let slot = Slot {
-                fragment,
-                of,
-                value,
-            };
-            let done = match place {
-                Place::Join(at) => Done::Joined(at, std::mem::replace(&mut self.slots[at], slot)),
-                Place::Open(fragment) => {
-                    self.used[fragment as usize].push(self.slots.len());
-                    self.slots.push(slot);
-                    Done::Opened
-                }
-            };
-            levels.last_mut().expect("a level is at work").done = Some(done);
-        }
-        Ok(match self.depends {
-            _ if !self.wanted.is_empty() => Left::Needs(self.wanted),
-            Some(cause) => Left::Unknown(cause),
-            None => Left::Nothing,
-        })
+impl Places for Search<'_> {
+    type At = u32;
+
+    fn asked(&self, which: usize) -> Option<CRefId> {
+        self.some.get(which).map(|(_, of)| *of)
+    }
+
+    fn at(&self, fragment: u32) -> CRefId {
+        self.every[fragment as usize]
+    }
+
+    fn open(&mut self, fragment: u32, slot: usize) {
+        self.used[fragment as usize].push(slot);
+    }
+
+    fn close(&mut self, fragment: u32) {
+        self.used[fragment as usize].pop();
     }
 
     /// Where one of the properties that there have to be may go.
-    fn places(&self, which: usize) -> Vec<Place> {
+    fn places(&self, placed: &Placed<u32>, which: usize) -> Vec<Place<u32>> {
         let (fragments, _) = self.some[which];
         let most = self.objects.max;
-        let room = most.is_none_or(|most| (self.slots.len() as u64) < most);
+        let room = most.is_none_or(|most| (placed.slots.len() as u64) < most);
         let (mut join, mut open) = (Vec::new(), Vec::new());
         // The fragments that are not of one name come last and are tried first: what their
         // properties satisfy is the least.
@@ -576,13 +462,14 @@ impl Search<'_> {
     /// `None` if the object stands only as far as the engine knows, which is noted.
     fn fill(
         &mut self,
+        placed: &mut Placed<u32>,
         with: &mut Solver,
         ask: &mut dyn FnMut(CRefId) -> Option<Found>,
         give: bool,
     ) -> Result<Option<Left>, Exhausted> {
-        let need = self.objects.min.saturating_sub(self.slots.len() as u64);
-        let in_the_way = |slot: &Slot| slot.value.as_ref().err().copied().flatten();
-        let mut cause = self.slots.iter().find_map(in_the_way);
+        let need = self.objects.min.saturating_sub(placed.slots.len() as u64);
+        let in_the_way = |slot: &Slot<u32>| slot.value.as_ref().err().copied().flatten();
+        let mut cause = placed.slots.iter().find_map(in_the_way);
         // The properties that are known to have a value, and those that may have one.
         let (mut sure, mut possible) = (0_u64, 0_u64);
         let mut more: Vec<(usize, u64, Rc<Witness>)> = Vec::new();
@@ -600,7 +487,7 @@ impl Search<'_> {
             }
             with.budget.charge(1)?;
             let taken = spare.min(need - sure);
-            match state(self.every[fragment], ask, &mut self.wanted) {
+            match state(self.every[fragment], ask, &mut placed.wanted) {
                 State::Nothing => {}
                 State::Possible(why) => {
                     possible = possible.saturating_add(spare);
@@ -613,8 +500,8 @@ impl Search<'_> {
                 State::Wanted => sure += taken,
             }
         }
-        if !self.wanted.is_empty() {
-            return Ok(Some(Left::Needs(std::mem::take(&mut self.wanted))));
+        if !placed.wanted.is_empty() {
+            return Ok(Some(Left::Needs(std::mem::take(&mut placed.wanted))));
         }
         // However the properties that there have to be are placed, the names of the same
         // fragments are there to be had. So without names enough here, there are none.
@@ -622,41 +509,44 @@ impl Search<'_> {
             return Ok(Some(Left::Nothing));
         }
         if let Some(cause) =
-            cause.filter(|_| sure < need || self.slots.iter().any(|slot| slot.value.is_err()))
+            cause.filter(|_| sure < need || placed.slots.iter().any(|slot| slot.value.is_err()))
         {
-            self.depends.get_or_insert(cause);
+            placed.depends.get_or_insert(cause);
             return Ok(None);
         }
         // An object is one level deeper than the deepest of its values. One that would be
         // too deep to give is passed over for another.
-        let values = self
+        let values = placed
             .slots
             .iter()
             .filter_map(|slot| slot.value.as_ref().ok());
         let values = values.chain(more.iter().map(|(_, _, value)| value));
         let deepest = values.map(|value| value.depth).max().unwrap_or(0);
         if deepest >= DEEPEST {
-            self.depends.get_or_insert(Cause::Depth);
+            placed.depends.get_or_insert(Cause::Depth);
             return Ok(None);
         }
         if !give {
             return Ok(Some(Left::Value(None)));
         }
-        let object = self.given(with, &more, deepest + 1)?;
+        let object = self.given(&placed.slots, with, &more, deepest + 1)?;
         Ok(Some(Left::Value(Some(object))))
     }
+}
 
+impl Search<'_> {
     /// The object: a name and a value for each slot, and for each property that was added
     /// to have enough. `depth` is how deep it is.
     fn given(
         &self,
+        slots: &[Slot<u32>],
         with: &mut Solver,
         more: &[(usize, u64, Rc<Witness>)],
         depth: u32,
     ) -> Result<Rc<Witness>, Exhausted> {
-        let filled = self.slots.iter().map(|slot| {
+        let filled = slots.iter().map(|slot| {
             let value = slot.value.as_ref().expect("every slot has a value");
-            (slot.fragment as usize, 1, value)
+            (slot.at as usize, 1, value)
         });
         let added = more
             .iter()

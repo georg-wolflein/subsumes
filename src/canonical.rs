@@ -3,17 +3,32 @@
 //!
 //! An object and an array hold values, and a value is an instance of its own. What it has to
 //! satisfy is a c-reference, and whether a value can satisfy one is not decided here: the
-//! engine is asked, and what it does not know yet it is told to find out first.
+//! engine is asked, and what it does not know yet it is told to find out first. Whether an
+//! object or an array is left is one search for both, in `search`.
 
 pub(crate) mod array;
 pub(crate) mod number;
 pub(crate) mod object;
+mod search;
 pub(crate) mod string;
 
 use std::rc::Rc;
 
+use self::object::Partitions;
+use crate::context::Budget;
+use crate::language::Languages;
 use crate::normalize::{Cause, Found, Witness};
-use crate::term::CRefId;
+use crate::term::{CRefId, Terms};
+
+/// What the search for an object or an array works with: the terms, for the c-references,
+/// the languages and the budget of the check, and the partitions of the names of objects
+/// that were made before.
+pub(crate) struct Solver<'s> {
+    pub terms: &'s mut Terms,
+    pub languages: &'s mut Languages,
+    pub budget: &'s mut Budget,
+    pub partitions: &'s mut Partitions,
+}
 
 /// What is left of the objects of a branch, or of its arrays.
 #[derive(Debug)]
