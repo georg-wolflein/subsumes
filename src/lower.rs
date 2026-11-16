@@ -4,6 +4,10 @@
 //! a variable, and the term of the variable says what its keywords say. Schemas that say the
 //! same share a variable, also between A and B.
 //!
+//! A `$dynamicRef` is a reference to the schema that it leads to in the dynamic scope that
+//! it is reached in. A schema that is reached in two scopes has a variable for each, unless
+//! it says the same in both.
+//!
 //! The engine models the types, `null`, the booleans, numbers, strings, objects, arrays, the
 //! connectives and references. Every other keyword becomes a predicate that it does not
 //! model, a leaf, which keeps the place where it stands. A leaf says something only about
@@ -21,12 +25,14 @@
 //! inside, whose term is that the instance is that value.
 
 mod classes;
+mod scopes;
 
 use std::collections::{HashMap, VecDeque};
 
 use serde_json::Value;
 
 use self::classes::written;
+use self::scopes::{Reached, ScopeId, Scopes};
 use crate::context::{Context, Exhausted};
 use crate::formats;
 use crate::normalize::DEEPEST;
@@ -39,20 +45,27 @@ use crate::term::{InstanceType, TermId, TypeSet, VarId};
 /// # Errors
 ///
 /// When the budget does not cover the work.
-pub(crate) fn lower(graph: &Graph, context: &mut Context) -> Result<(VarId, VarId), Exhausted> {
-    let classes = classes::classes(graph, &mut context.budget)?;
+pub(crate) fn lower<'g>(
+    graph: &'g Graph<'g>,
+    context: &mut Context,
+) -> Result<(VarId, VarId), Exhausted> {
+    let scopes = Scopes::of(graph, &mut context.budget)?;
+    let classes = classes::classes(graph, &scopes, &mut context.budget)?;
     let mut lowering = Lowering {
         graph,
+        scopes: &scopes,
         classes: &classes,
         context,
         variables: HashMap::new(),
         constants: HashMap::new(),
         pending: VecDeque::new(),
+        scope: ScopeId::NOTHING,
     };
     let a = lowering.variable(graph.a);
     let b = lowering.variable(graph.b);
-    while let Some(variable) = lowering.pending.pop_front() {
-        let node = lowering.context.terms.variable(variable).node;
+    while let Some((variable, reached)) = lowering.pending.pop_front() {
+        let Reached { node, scope } = scopes.at(reached);
+        lowering.scope = scope;
         let body = lowering.body(node);
         lowering.context.terms.variable_mut(variable).body = body;
     }
@@ -60,40 +73,17 @@ pub(crate) fn lower(graph: &Graph, context: &mut Context) -> Result<(VarId, VarI
     // A variable stands for every schema of its class, on whichever side it is.
     for (index, class) in classes.iter().enumerate() {
         if let Some(&variable) = lowering.variables.get(class) {
-            let side = graph.node(NodeId::new(index)).side as usize;
+            let side = graph.node(scopes.at(index).node).side as usize;
             lowering.context.terms.variable_mut(variable).sides[side] = true;
         }
     }
     Ok((a, b))
 }
 
-/// The first `$dynamicRef` that A or B leads to, if either leads to one.
-///
-/// What a `$dynamicRef` accepts depends on the schemas that led to it, and a term says the
-/// same wherever it stands. So the terms of a schema that leads to one are not to be trusted:
-/// the same schema, reached in two ways, would cancel against its own negation. That holds
-/// wherever in the schema the reference is, because a leaf holds schemas too.
-pub(crate) fn dynamic_reference(graph: &Graph) -> Option<NodeId> {
-    let mut seen = vec![false; graph.len()];
-    let mut pending = VecDeque::from([graph.a, graph.b]);
-    while let Some(id) = pending.pop_front() {
-        if std::mem::replace(&mut seen[id.index()], true) {
-            continue;
-        }
-        let Schema::Object(keywords) = &graph.node(id).schema else {
-            continue;
-        };
-        if keywords.dynamic_reference.is_some() {
-            return Some(id);
-        }
-        let applied = keywords.subschemas().into_iter().map(|(_, _, to)| to);
-        pending.extend(applied.chain(keywords.reference));
-    }
-    None
-}
-
 struct Lowering<'g, 'c> {
     graph: &'g Graph<'g>,
+    scopes: &'c Scopes<'g>,
+    /// The class of each schema as it is reached, in the order of `scopes`.
     classes: &'c [u32],
     context: &'c mut Context,
     /// The variable of each class that has one.
@@ -101,8 +91,12 @@ struct Lowering<'g, 'c> {
     /// The variable of each value inside a constant, by the term that says "the instance
     /// is this value".
     constants: HashMap<TermId, VarId>,
-    /// The variables that have no term yet, in the order in which they were made.
-    pending: VecDeque<VarId>,
+    /// The variables that have no term yet, in the order in which they were made, each
+    /// with the schema that gives it its term, as it is reached.
+    pending: VecDeque<(VarId, usize)>,
+    /// The dynamic scope of the schema whose term is being made. Every schema that the
+    /// term names is reached from it.
+    scope: ScopeId,
 }
 
 const NULL: TypeSet = TypeSet::of(InstanceType::Null);
@@ -112,16 +106,18 @@ const ARRAY: TypeSet = TypeSet::of(InstanceType::Array);
 const OBJECT: TypeSet = TypeSet::of(InstanceType::Object);
 
 impl Lowering<'_, '_> {
-    /// The variable of a schema. The first schema of a class to ask gives the variable its
-    /// term, and every schema of a class would give the same.
+    /// The variable of a schema, as it is reached from the schema whose term is being
+    /// made. The first schema of a class to ask gives the variable its term, and every
+    /// schema of a class would give the same.
     fn variable(&mut self, node: NodeId) -> VarId {
-        let class = self.classes[node.index()];
+        let reached = self.scopes.from(node, self.scope);
+        let class = self.classes[reached];
         if let Some(&variable) = self.variables.get(&class) {
             return variable;
         }
         let variable = self.context.terms.new_variable(node);
         self.variables.insert(class, variable);
-        self.pending.push_back(variable);
+        self.pending.push_back((variable, reached));
         variable
     }
 
@@ -133,7 +129,7 @@ impl Lowering<'_, '_> {
 
     /// The name of the class of a schema, for the key of a leaf that holds the schema.
     fn class(&self, node: NodeId) -> String {
-        format!("#{}", self.classes[node.index()])
+        format!("#{}", self.classes[self.scopes.from(node, self.scope)])
     }
 
     /// The term of a schema: the conjunction of what its keywords say.
@@ -145,7 +141,7 @@ impl Lowering<'_, '_> {
             Schema::Object(keywords) => keywords,
         };
         let mut parts = Vec::new();
-        self.connectives(id, keywords, &mut parts);
+        self.connectives(keywords, &mut parts);
         self.any_type(id, keywords, &mut parts);
         self.numbers(keywords, &mut parts);
         self.strings(id, keywords, &mut parts);
@@ -161,8 +157,11 @@ impl Lowering<'_, '_> {
     }
 
     /// A leaf that is unlike every other, for a keyword whose meaning is not in its value.
+    /// It is one leaf for each class that the schema is of: a schema that says one thing in
+    /// one dynamic scope and another in the next may hold a schema in the keyword that does
+    /// so too.
     fn leaf_of_its_own(&mut self, domain: TypeSet, id: NodeId, keyword: &'static str) -> TermId {
-        let key = format!("{keyword} @{}", id.index());
+        let key = format!("{keyword} @{} of {}", id.index(), self.class(id));
         self.leaf(domain, id, keyword, key)
     }
 
@@ -185,14 +184,13 @@ impl Lowering<'_, '_> {
         }
     }
 
-    fn connectives(&mut self, id: NodeId, keywords: &Keywords, parts: &mut Vec<TermId>) {
+    fn connectives(&mut self, keywords: &Keywords, parts: &mut Vec<TermId>) {
         if let Some(target) = keywords.reference {
             parts.push(self.refer(target));
         }
-        // No check gets this far with one; see `dynamic_reference`. The leaf is what a
-        // picture of the terms shows in its place.
-        if keywords.dynamic_reference.is_some() {
-            parts.push(self.leaf_of_its_own(TypeSet::ALL, id, "$dynamicRef"));
+        if let Some(dynamic) = keywords.dynamic_reference {
+            let target = self.scopes.resolved(dynamic, self.scope);
+            parts.push(self.refer(target));
         }
         for schema in &keywords.all_of {
             parts.push(self.refer(*schema));
@@ -995,7 +993,7 @@ mod tests {
     #[test]
     fn a_leaf_says_which_types_it_is_about_and_where_it_was_first() {
         let a = json!({"type": "array", "uniqueItems": true});
-        let b = json!({"uniqueItems": true, "$dynamicRef": "#here", "$dynamicAnchor": "here"});
+        let b = json!({"uniqueItems": true, "format": "hostname"});
         let graph = parse(&a, &b).unwrap().link().unwrap();
         let mut context = Context::new(u64::MAX);
         let (_, of_b) = lower(&graph, &mut context).unwrap();
@@ -1014,9 +1012,9 @@ mod tests {
             let side = graph.node(leaf.node).side;
             (side, leaf.location(&graph))
         };
-        // A dynamic reference may be about any instance, and no other is like it.
-        assert_eq!(leaves[0].domain, TypeSet::ALL);
-        assert_eq!(place(leaves[0]), (Side::B, "#/$dynamicRef".to_owned()));
+        // A format that is not modelled is about strings.
+        assert_eq!(leaves[0].domain, STRING);
+        assert_eq!(place(leaves[0]), (Side::B, "#/format".to_owned()));
         // The leaf of `uniqueItems` is about arrays. A has it too, and A is lowered first.
         assert_eq!(leaves[1].domain, ARRAY);
         assert_eq!(place(leaves[1]), (Side::A, "#/uniqueItems".to_owned()));
@@ -1133,40 +1131,173 @@ mod tests {
         assert_eq!(terms(&tree, &json!(true)), ["addits(0: x2)", "true", "x0"]);
     }
 
+    /// A list whose items are what the schema that led to it says they are: by way of
+    /// `strings` they are strings, and by itself it takes any item.
+    fn lists() -> Value {
+        json!({
+            "$id": "https://example.com/root",
+            "properties": {"a": {"$ref": "strings"}, "b": {"$ref": "list"}},
+            "$defs": {
+                "strings": {
+                    "$id": "strings",
+                    "$ref": "list",
+                    "$defs": {"item": {"$dynamicAnchor": "item", "type": "string"}},
+                },
+                "list": {
+                    "$id": "list",
+                    "items": {"$dynamicRef": "#item"},
+                    "$defs": {"item": {"$dynamicAnchor": "item"}},
+                },
+            },
+        })
+    }
+
     #[test]
-    fn a_dynamic_reference_is_found_wherever_a_schema_leads_to_it() {
-        let found = |a: &Value, b: &Value| {
-            let graph = parse(a, b).unwrap().link().unwrap();
-            let node = dynamic_reference(&graph)?;
-            let location = graph.keyword_location(node, "$dynamicRef");
-            Some((graph.node(node).side, location))
+    fn a_dynamic_reference_is_a_reference_to_what_it_leads_to_in_its_scope() {
+        // The list has a variable for each of the two ways to it. `x2` and `x3` are the
+        // schemas of the two properties, and `x4` is `strings`. `x6` is the list by way of
+        // `strings`: its items are `x8`, which refers to the anchor of `strings`, `x10`.
+        // `x5` is the list by itself: its items are `x7`, which refers to its own anchor.
+        assert_eq!(
+            terms(&lists(), &json!(true)),
+            [
+                "all(pprop(l2: x2), pprop(l3: x3))",
+                "true",
+                "x4",
+                "x5",
+                "x6",
+                "addits(0: x7)",
+                "addits(0: x8)",
+                "x9",
+                "x10",
+                "true",
+                "type(string)",
+            ]
+        );
+
+        // Where both ways lead to schemas that say the same, the list is one variable,
+        // `x4`. `strings` is `x3` together with the schema of `b`: both refer to the list
+        // and say nothing else.
+        let mut alike = lists();
+        alike["$defs"]["strings"]["$defs"]["item"] = json!({"$dynamicAnchor": "item"});
+        assert_eq!(
+            terms(&alike, &json!(true)),
+            [
+                "all(pprop(l2: x2), pprop(l3: x3))",
+                "true",
+                "x3",
+                "x4",
+                "addits(0: x5)",
+                "x6",
+                "true",
+            ]
+        );
+
+        // A name that is bound stays bound: the outermost resource with the anchor is the
+        // one that is meant, not the last one. Here that is the root, by either way.
+        let mut outermost = lists();
+        outermost["$defs"]["item"] = json!({"$dynamicAnchor": "item", "type": "null"});
+        assert_eq!(
+            terms(&outermost, &json!(true)),
+            [
+                "all(pprop(l2: x2), pprop(l3: x3))",
+                "true",
+                "x3",
+                "x4",
+                "addits(0: x5)",
+                "x6",
+                "type(null)",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_dynamic_reference_that_names_no_dynamic_anchor_is_a_reference() {
+        // The fragment names an `$anchor`, is a JSON Pointer, or is not there. The dynamic
+        // anchor of the same name in the resource around is not looked for then.
+        for reference in ["inner#item", "inner#/$defs/item", "inner"] {
+            let schema = json!({
+                "$id": "https://example.com/root",
+                "$ref": "inner",
+                "$defs": {
+                    "item": {"$dynamicAnchor": "item", "type": "null"},
+                    "inner": {
+                        "$id": "inner",
+                        "$anchor": "item",
+                        "items": {"$dynamicRef": reference},
+                        "$defs": {"item": {"type": "string"}},
+                    },
+                },
+            });
+            let shown = terms(&schema, &json!(true));
+            let last = shown.last().unwrap();
+            let expected = if reference == "inner#/$defs/item" {
+                "type(string)"
+            } else {
+                // The resource itself. Its items refer to it, as the root does, and so
+                // they are the variable of the root.
+                "addits(0: x0)"
+            };
+            assert_eq!(last, expected, "{reference}: {shown:?}");
+            assert!(!shown.contains(&"type(null)".to_owned()), "{shown:?}");
+        }
+    }
+
+    #[test]
+    fn a_schema_in_a_second_scope_costs_a_step() {
+        let steps = |schema: &Value, budget: u64| {
+            let truth = json!(true);
+            let graph = parse(schema, &truth).unwrap().link().unwrap();
+            let mut context = Context::new(budget);
+            let lowered = lower(&graph, &mut context);
+            (lowered.is_ok(), context.budget.spent())
         };
-        let at = |side, location: &str| Some((side, location.to_owned()));
-        let plain = json!({"type": "null"});
-        assert_eq!(found(&plain, &plain), None);
+        // Without a `$dynamicRef` that looks for an anchor, nothing is bound and nothing
+        // costs a step, whatever anchors there are.
+        let mut unused = lists();
+        unused["$defs"]["list"]["items"] = json!({"$ref": "#item"});
+        assert_eq!(steps(&unused, u64::MAX), (true, 0));
+        // With one, every schema that the root leads to costs one for each scope: nine
+        // besides the root, the list and what is in it twice.
+        assert_eq!(steps(&lists(), u64::MAX), (true, 9));
+        assert_eq!(steps(&lists(), 9), (true, 9));
+        assert_eq!(steps(&lists(), 8), (false, 8));
 
-        // Under a keyword that is a leaf, and behind a reference.
-        let inside = json!({
-            "$dynamicAnchor": "node",
-            "properties": {"child": {"items": {"$dynamicRef": "#node"}}},
+        // Twelve names, each bound by one of two resources on the way, are 4,096 scopes
+        // for the last resource to be reached in.
+        let mut definitions = Map::new();
+        let names: Vec<String> = (0..12).map(|level| format!("n{level}")).collect();
+        for (level, name) in names.iter().enumerate() {
+            for side in ["a", "b"] {
+                let next = |side: &str| json!({"$ref": format!("r{}{side}", level + 1)});
+                let resource = json!({
+                    "$id": format!("r{level}{side}"),
+                    "anyOf": [next("a"), next("b")],
+                    "$defs": {"anchor": {"$dynamicAnchor": name}},
+                });
+                definitions.insert(format!("r{level}{side}"), resource);
+            }
+        }
+        for side in ["a", "b"] {
+            let anchors = names.iter().map(|name| json!({"$dynamicAnchor": name}));
+            let references = names
+                .iter()
+                .map(|name| json!({"$dynamicRef": format!("#{name}")}));
+            let last = json!({
+                "$id": format!("r12{side}"),
+                "allOf": references.collect::<Vec<_>>(),
+                "$defs": {"anchors": {"allOf": anchors.collect::<Vec<_>>()}},
+            });
+            definitions.insert(format!("r12{side}"), last);
+        }
+        let many = json!({
+            "$id": "https://example.com/root",
+            "$ref": "r0a",
+            "$defs": definitions,
         });
-        let place = "#/properties/child/items/$dynamicRef";
-        assert_eq!(found(&plain, &inside), at(Side::B, place));
-        let behind = json!({
-            "$ref": "#/$defs/tree",
-            "$defs": {"tree": {"$dynamicAnchor": "node", "not": {"$dynamicRef": "#node"}}},
-        });
-        let place = "#/$defs/tree/not/$dynamicRef";
-        assert_eq!(found(&behind, &plain), at(Side::A, place));
-        // The one of A comes first.
-        assert_eq!(found(&behind, &inside), at(Side::A, place));
-
-        // A definition that nothing leads to is not in the way, and neither is an anchor.
-        let unused = json!({
-            "$dynamicAnchor": "node",
-            "$defs": {"tree": {"$dynamicRef": "#node"}},
-        });
-        assert_eq!(found(&unused, &plain), None);
+        let (done, spent) = steps(&many, u64::MAX);
+        assert!(done && spent > 4096 * 12, "{spent} steps");
+        assert_eq!(steps(&many, 1000), (false, 1000));
     }
 
     #[test]

@@ -134,6 +134,8 @@ pub(crate) struct Keywords<'a> {
     /// The target of `$ref`.
     pub reference: Option<NodeId>,
     pub dynamic_reference: Option<DynamicReference<'a>>,
+    /// The name of its `$dynamicAnchor`, if a reference can name the schema by it: not where
+    /// the schema stands in a place where the draft puts none.
     pub dynamic_anchor: Option<&'a str>,
 
     pub all_of: Vec<NodeId>,
@@ -237,10 +239,14 @@ impl<'a> Keywords<'a> {
 /// A `$dynamicRef`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DynamicReference<'a> {
-    /// The reference as written. Its fragment names the dynamic anchor to look for.
+    /// The reference as written.
     pub reference: &'a str,
     /// What it resolves to before any dynamic scope is taken into account.
     pub target: NodeId,
+    /// The dynamic anchor that it looks for in the dynamic scope: the name in its fragment,
+    /// if that is the `$dynamicAnchor` of the target. Without one it is a `$ref`, as the
+    /// draft has it.
+    pub anchor: Option<&'a str>,
 }
 
 /// One of the seven names that `type` takes.

@@ -239,7 +239,14 @@ impl<'a> Builder<'a> {
                         });
                     };
                     match keywords(map, &mut names, &mut child, &mut reference) {
-                        Ok(keywords) => Schema::Object(Box::new(keywords)),
+                        Ok(mut keywords) => {
+                            // Where the draft puts no schema it looks for no anchor, so
+                            // this one names nothing, to a `$dynamicRef` either.
+                            if !named {
+                                keywords.dynamic_anchor = None;
+                            }
+                            Schema::Object(Box::new(keywords))
+                        }
                         Err((keyword, Problem::Shape(message))) => {
                             return Err(self.invalid(side, &entry.origin, keyword, message));
                         }
