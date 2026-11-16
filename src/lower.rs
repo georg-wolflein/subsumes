@@ -1258,10 +1258,11 @@ mod tests {
         unused["$defs"]["list"]["items"] = json!({"$ref": "#item"});
         assert_eq!(steps(&unused, u64::MAX), (true, 0));
         // With one, a schema costs a step for each scope that it is reached in beyond its
-        // first: the list and what is in it are reached in two.
-        assert_eq!(steps(&lists(), u64::MAX), (true, 2));
-        assert_eq!(steps(&lists(), 2), (true, 2));
-        assert_eq!(steps(&lists(), 1), (false, 1));
+        // first: the list and what is in it are reached in two. And each of the two scopes
+        // costs one for the name that it binds.
+        assert_eq!(steps(&lists(), u64::MAX), (true, 4));
+        assert_eq!(steps(&lists(), 4), (true, 4));
+        assert_eq!(steps(&lists(), 3), (false, 3));
 
         // Twelve names, each bound by one of two resources on the way, are 4,096 scopes
         // for the last resource to be reached in.
@@ -1298,6 +1299,52 @@ mod tests {
         let (done, spent) = steps(&many, u64::MAX);
         assert!(done && spent > 4096 * 12, "{spent} steps");
         assert_eq!(steps(&many, 1000), (false, 1000));
+    }
+
+    #[test]
+    fn a_scope_costs_a_step_for_each_name_that_it_binds() {
+        // Each resource binds a name of its own and leads to the next, so the scope of
+        // the last binds all of them. No schema is reached in a second scope.
+        let chain = |resources: u64| {
+            let mut definitions = Map::new();
+            for index in 0..resources {
+                let mut resource = json!({
+                    "$id": format!("r{index}"),
+                    "$dynamicRef": format!("#n{index}"),
+                    "$defs": {"anchor": {"$dynamicAnchor": format!("n{index}")}},
+                });
+                if index + 1 < resources {
+                    resource["$ref"] = json!(format!("r{}", index + 1));
+                }
+                definitions.insert(format!("r{index}"), resource);
+            }
+            json!({"$id": "https://example.com/root", "$ref": "r0", "$defs": definitions})
+        };
+        let steps = |schema: &Value, budget: u64| {
+            let truth = json!(true);
+            let graph = parse(schema, &truth).unwrap().link().unwrap();
+            let mut context = Context::new(budget);
+            let lowered = lower(&graph, &mut context);
+            (lowered.is_ok(), context.budget.spent())
+        };
+        // The scopes bind one name, two, three and four.
+        assert_eq!(steps(&chain(4), u64::MAX), (true, 1 + 2 + 3 + 4));
+        assert_eq!(steps(&chain(4), 9), (false, 9));
+        // A scope is worked out once, however many references lead into its resource.
+        let often = json!({
+            "$id": "https://example.com/root",
+            "allOf": [{"$ref": "list"}, {"$ref": "list"}, {"$ref": "list#/items"}],
+            "$defs": {"list": {
+                "$id": "list",
+                "items": {"$dynamicRef": "#item"},
+                "$defs": {"item": {"$dynamicAnchor": "item"}},
+            }},
+        });
+        assert_eq!(steps(&often, u64::MAX), (true, 1));
+        // So a long chain ends at the budget before its scopes take the memory: they
+        // would hold two million names here.
+        let (done, spent) = steps(&chain(2000), 10_000);
+        assert!(!done && spent <= 10_000, "{spent} steps");
     }
 
     #[test]

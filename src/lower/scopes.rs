@@ -55,6 +55,9 @@ pub(super) struct Scopes<'g> {
     anchors: HashMap<NodeId, Vec<(&'g str, NodeId)>>,
     bound: Vec<Bound<'g>>,
     scope_ids: HashMap<Bound<'g>, ScopeId>,
+    /// The scope that entering a resource from a scope leads to, by the two, for every
+    /// resource with an anchor to bind that has been entered.
+    entered: HashMap<(ScopeId, NodeId), ScopeId>,
     reached: Vec<Reached>,
     places: HashMap<Reached, usize>,
     /// The schemas that have been reached, in whichever scope.
@@ -77,9 +80,9 @@ impl<'g> Scopes<'g> {
     ///
     /// # Errors
     ///
-    /// When there are more schemas and scopes than the budget covers. A schema costs a step
-    /// for each scope that it is reached in beyond its first, so without a `$dynamicRef` the
-    /// work costs nothing.
+    /// When there are more schemas and scopes than the budget covers. A scope costs a step
+    /// for each name that it binds, and a schema one for each scope that it is reached in
+    /// beyond its first. So without a `$dynamicRef` the work costs nothing.
     pub fn of(graph: &'g Graph<'g>, budget: &mut Budget) -> Result<Self, Exhausted> {
         let nodes = || (0..graph.len()).map(NodeId::new);
         let looked_for: HashSet<&str> = nodes()
@@ -98,6 +101,7 @@ impl<'g> Scopes<'g> {
             anchors,
             bound: vec![Bound::new()],
             scope_ids: HashMap::from([(Bound::new(), ScopeId::NOTHING)]),
+            entered: HashMap::new(),
             reached: Vec::new(),
             places: HashMap::new(),
             seen: HashSet::new(),
@@ -136,9 +140,11 @@ impl<'g> Scopes<'g> {
     /// A node as it is reached from a schema in this scope. The way to it has been
     /// followed: it is one that [`applied`](Self::applied) names for that schema.
     pub fn from(&self, node: NodeId, scope: ScopeId) -> usize {
-        let scope = match self.entering(node, scope) {
-            Some(bound) => self.scope_ids[&bound],
-            None => scope,
+        let resource = self.graph.node(node).resource;
+        let scope = if self.anchors.contains_key(&resource) {
+            self.entered[&(scope, resource)]
+        } else {
+            scope
         };
         self.places[&Reached { node, scope }]
     }
@@ -166,15 +172,51 @@ impl<'g> Scopes<'g> {
             .collect()
     }
 
-    /// What is bound once the resource of a node is entered from a scope, or `None` if the
-    /// resource has no anchor to bind. A name that is bound stays as it is.
-    fn entering(&self, node: NodeId, from: ScopeId) -> Option<Bound<'g>> {
-        let anchors = self.anchors.get(&self.graph.node(node).resource)?;
-        let mut bound = self.bound[from.index()].clone();
-        for (name, anchor) in anchors {
-            bound.entry(name).or_insert(*anchor);
+    /// The scope once the resource of a node is entered from a scope. A name that is bound
+    /// stays as it is, so a resource that has no anchor of a new name leaves the scope as
+    /// it is. This is worked out once for a scope and a resource.
+    ///
+    /// # Errors
+    ///
+    /// When the budget does not cover the names that the scope binds. A scope with a new
+    /// name costs a step for each of its names, before it is made.
+    fn entering(
+        &mut self,
+        node: NodeId,
+        from: ScopeId,
+        budget: &mut Budget,
+    ) -> Result<ScopeId, Exhausted> {
+        let resource = self.graph.node(node).resource;
+        let Some(anchors) = self.anchors.get(&resource) else {
+            return Ok(from);
+        };
+        if let Some(&scope) = self.entered.get(&(from, resource)) {
+            return Ok(scope);
         }
-        Some(bound)
+        let before = &self.bound[from.index()];
+        let new: Vec<(&str, NodeId)> = anchors
+            .iter()
+            .filter(|(name, _)| !before.contains_key(name))
+            .copied()
+            .collect();
+        let scope = if new.is_empty() {
+            from
+        } else {
+            budget.charge((before.len() + new.len()) as u64)?;
+            let mut bound = before.clone();
+            bound.extend(new);
+            match self.scope_ids.get(&bound) {
+                Some(&scope) => scope,
+                None => {
+                    let next = u32::try_from(self.bound.len()).expect("fewer than 2^32 scopes");
+                    self.scope_ids.insert(bound.clone(), ScopeId(next));
+                    self.bound.push(bound);
+                    ScopeId(next)
+                }
+            }
+        };
+        self.entered.insert((from, resource), scope);
+        Ok(scope)
     }
 
     /// Reaches a node from a schema in a scope, and says which of the reached schemas it
@@ -182,24 +224,14 @@ impl<'g> Scopes<'g> {
     ///
     /// # Errors
     ///
-    /// When the budget does not cover a further scope of the schema.
+    /// When the budget does not cover the scope, or a further scope of the schema.
     fn enter(
         &mut self,
         node: NodeId,
         from: ScopeId,
         budget: &mut Budget,
     ) -> Result<usize, Exhausted> {
-        let scope = match self.entering(node, from) {
-            None => from,
-            Some(bound) => {
-                let next = u32::try_from(self.bound.len()).expect("fewer than 2^32 scopes");
-                let scope = *self.scope_ids.entry(bound.clone()).or_insert(ScopeId(next));
-                if scope.index() == self.bound.len() {
-                    self.bound.push(bound);
-                }
-                scope
-            }
-        };
+        let scope = self.entering(node, from, budget)?;
         let reached = Reached { node, scope };
         let next = self.reached.len();
         let place = *self.places.entry(reached).or_insert(next);
