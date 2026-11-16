@@ -7,12 +7,17 @@
 //! the same instances, so the engine gives them one variable, and `x` and `not x` cancel
 //! without anything inside being opened. A and B are classed together, so what two versions
 //! of a schema share is found here.
+//!
+//! A schema is classed as it is reached: once for each dynamic scope, since a `$dynamicRef`
+//! below it may lead to one schema in one scope and to another in the next. Where it leads
+//! to in a scope is a reference target like any other.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 use serde_json::{Number, Value};
 
+use super::scopes::Scopes;
 use super::too_deep;
 use crate::context::{Budget, Exhausted};
 use crate::rational::exact;
@@ -26,25 +31,29 @@ macro_rules! written {
 }
 pub(super) use written;
 
-/// The class of every node, by node id.
+/// The class of every schema as it is reached, in the order in which `scopes` has them.
 ///
 /// # Errors
 ///
 /// When schemas that refer to themselves take more rounds to tell apart than the budget
 /// covers. Without such schemas the work is one pass and costs nothing.
-pub(super) fn classes(graph: &Graph, budget: &mut Budget) -> Result<Vec<u32>, Exhausted> {
-    let count = graph.len();
-    // What each node says by itself, as a number, and the nodes it leads to.
+pub(super) fn classes(
+    graph: &Graph,
+    scopes: &Scopes,
+    budget: &mut Budget,
+) -> Result<Vec<u32>, Exhausted> {
+    let count = scopes.len();
+    // What each schema says by itself, as a number. What it leads to is in `scopes`.
     let mut texts: HashMap<String, u32> = HashMap::new();
-    let (mut own, mut successors) = (Vec::with_capacity(count), Vec::with_capacity(count));
+    let mut own = Vec::with_capacity(count);
     for index in 0..count {
-        let id = NodeId::new(index);
-        let (text, leads_to) = described(id, graph.node(id));
+        let id = scopes.at(index).node;
+        let text = described(id, graph.node(id));
         let next = number(texts.len());
         own.push(*texts.entry(text).or_insert(next));
-        successors.push(leads_to);
     }
-    let (order, cyclic) = components(&successors);
+    let successors = scopes.leads_to();
+    let (order, cyclic) = components(successors);
 
     // A node that is on no cycle gets its class from the classes of the nodes it leads to,
     // which are known before it. The nodes on cycles are told apart in rounds: all are one
@@ -87,29 +96,32 @@ fn number(count: usize) -> u32 {
 }
 
 /// What a node says by itself, as text that is equal for two nodes exactly when they say the
-/// same apart from the nodes they lead to, and those nodes in the order the text names them.
-fn described(id: NodeId, node: &Node) -> (String, Vec<usize>) {
+/// same apart from the schemas they lead to. The text names those in the order in which
+/// `Scopes` has them: the subschemas of the keywords, the target of `$ref`, and what
+/// `$dynamicRef` leads to, which is a reference target as that of `$ref` is.
+fn described(id: NodeId, node: &Node) -> String {
     let keywords = match &node.schema {
-        Schema::Bool(value) => return (value.to_string(), Vec::new()),
+        Schema::Bool(value) => return value.to_string(),
         Schema::Object(keywords) => keywords,
     };
     let mut text = String::new();
-    let mut leads_to = Vec::new();
-    for (keyword, part, to) in keywords.subschemas() {
+    for (keyword, part, _) in keywords.subschemas() {
         match part {
             Part::Whole => write!(text, "{keyword};"),
             Part::Name(name) => write!(text, "{keyword}{};", quoted(name)),
             Part::Index(_) => write!(text, "{keyword}[];"),
         }
         .expect("a string takes any text");
-        leads_to.push(to.index());
     }
-    if let Some(target) = keywords.reference {
+    let references = [
+        keywords.reference.is_some(),
+        keywords.dynamic_reference.is_some(),
+    ];
+    for _ in references.into_iter().filter(|there| *there) {
         text.push_str("$ref;");
-        leads_to.push(target.index());
     }
     assertions(id, keywords, &mut text);
-    (text, leads_to)
+    text
 }
 
 /// The keywords of a schema that hold no schema, each with its value.
@@ -119,8 +131,7 @@ fn assertions(id: NodeId, keywords: &Keywords, text: &mut String) {
             write!(text, "{keyword}={value};").expect("a string takes any text");
         }
     };
-    // What a `$dynamicRef` leads to depends on the schemas around it, so no two are alike. A
-    // count that was too large to keep is not known to equal another one either.
+    // A count that was too large to keep is not known to equal another one.
     let unlike_any_other = || format!("@{}", id.index());
     let count = |count: Option<Count>| {
         count.map(|count| match count {
@@ -129,11 +140,7 @@ fn assertions(id: NodeId, keywords: &Keywords, text: &mut String) {
         })
     };
 
-    put(
-        "$dynamicRef",
-        keywords.dynamic_reference.map(|_| unlike_any_other()),
-    );
-    put("$dynamicAnchor", keywords.dynamic_anchor.map(quoted));
+    // `$dynamicAnchor` says nothing of an instance: it is a name, as `$anchor` is.
     put("type", keywords.types.map(|types| format!("{types:?}")));
     // A number is the number that it stands for, however it is written: `1.0` says what `1`
     // says, also inside an array or an object. A value that is nested deeper than an
@@ -280,19 +287,32 @@ mod tests {
     use serde_json::{Map, Value, json};
 
     use super::*;
+    use crate::lower::scopes::ScopeId;
     use crate::schema::parse;
 
     /// The class of each node of one schema, by its location.
     type Classed = Vec<(String, u32)>;
 
-    /// The classes of the nodes of A, and those of the nodes of B.
+    /// The schemas as they are reached, and the class of each.
+    fn reached<'g>(
+        graph: &'g Graph<'g>,
+        budget: &mut Budget,
+    ) -> Result<(Scopes<'g>, Vec<u32>), Exhausted> {
+        let scopes = Scopes::of(graph, budget)?;
+        let classes = classes(graph, &scopes, budget)?;
+        Ok((scopes, classes))
+    }
+
+    /// The classes of the nodes of A, and those of the nodes of B. A node that is reached
+    /// in several scopes is there once for each.
     fn classed(a: &Value, b: &Value) -> (Classed, Classed) {
         let graph = parse(a, b).unwrap().link().unwrap();
-        let classes = classes(&graph, &mut Budget::new(u64::MAX)).unwrap();
+        let (scopes, classes) = reached(&graph, &mut Budget::new(u64::MAX)).unwrap();
         let of = |side| {
-            let ids = (0..graph.len()).map(NodeId::new);
-            ids.filter(|id| graph.node(*id).side == side)
-                .map(|id| (graph.location(id), classes[id.index()]))
+            let nodes = (0..scopes.len()).map(|index| (scopes.at(index).node, classes[index]));
+            nodes
+                .filter(|(id, _)| graph.node(*id).side == side)
+                .map(|(id, class)| (graph.location(id), class))
                 .collect()
         };
         (of(crate::Side::A), of(crate::Side::B))
@@ -355,7 +375,6 @@ mod tests {
             (json!({"items": {}}), json!({"contains": {}})),
             (json!({"required": ["a"]}), json!({"required": ["a", "b"]})),
             (json!({"uniqueItems": true}), json!({})),
-            (json!({"$dynamicAnchor": "a"}), json!({})),
             (json!({"minimum": 1}), json!({"minimum": 1.5})),
             (json!({"minimum": 1}), json!({"exclusiveMinimum": 1})),
             (json!({"const": 1}), json!({"const": "1"})),
@@ -450,15 +469,68 @@ mod tests {
 
     #[test]
     fn some_schemas_are_like_no_other() {
-        // What a `$dynamicRef` leads to depends on the schemas around it.
-        let dynamic = json!({"$dynamicAnchor": "x", "items": {"$dynamicRef": "#x"}});
-        let (of_a, of_b) = classed(&dynamic, &dynamic);
-        assert_ne!(at(&of_a, "#/items"), at(&of_b, "#/items"));
-        assert_ne!(at(&of_a, "#"), at(&of_b, "#"));
         // A count that was too large to keep is not known to equal another.
         let huge = json!({"properties": {"a": {"minLength": 1e30}, "b": {"minLength": 1e30}}});
         let (of_a, _) = classed(&huge, &json!(true));
         assert_ne!(at(&of_a, "#/properties/a"), at(&of_a, "#/properties/b"));
+    }
+
+    #[test]
+    fn a_dynamic_reference_is_classed_by_what_it_leads_to() {
+        // An anchor is a name and says nothing, and a `$dynamicRef` says what a `$ref` to
+        // the schema that it leads to says.
+        let dynamic = json!({"$dynamicAnchor": "x", "items": {"$dynamicRef": "#x"}});
+        let plain = json!({"items": {"$ref": "#"}});
+        let (of_a, of_b) = classed(&dynamic, &plain);
+        assert_eq!(at(&of_a, "#"), at(&of_b, "#"));
+        assert_eq!(at(&of_a, "#/items"), at(&of_b, "#/items"));
+
+        // `list` is reached from `strings` and from `numbers`, and its items are what the
+        // one that led to it says they are. So it is of two classes, one for each way.
+        let lists = |of_strings: &str, of_numbers: &str| {
+            json!({
+                "$id": "https://example.com/root",
+                "properties": {"a": {"$ref": "strings"}, "b": {"$ref": "numbers"}},
+                "$defs": {
+                    "strings": {
+                        "$id": "strings",
+                        "$ref": "list",
+                        "$defs": {"item": {"$dynamicAnchor": "item", "type": of_strings}},
+                    },
+                    "numbers": {
+                        "$id": "numbers",
+                        "$ref": "list",
+                        "$defs": {"item": {"$dynamicAnchor": "item", "type": of_numbers}},
+                    },
+                    "list": {
+                        "$id": "list",
+                        "items": {"$dynamicRef": "#item"},
+                        "$defs": {"item": {"$dynamicAnchor": "item"}},
+                    },
+                },
+            })
+        };
+        let every = |classes: &Classed, location: &str| -> Vec<u32> {
+            let there = classes.iter().filter(|(place, _)| place == location);
+            there.map(|(_, class)| *class).collect()
+        };
+        let (of_a, of_b) = classed(&lists("string", "number"), &lists("string", "string"));
+        let list = "#/$defs/list";
+        let (in_a, in_b) = (every(&of_a, list), every(&of_b, list));
+        assert_eq!((in_a.len(), in_b.len()), (2, 2));
+        assert_ne!(in_a[0], in_a[1]);
+        // Where both ways say the same of the items, the list is of one class, and it is
+        // the class of the list of strings in the other schema.
+        assert_eq!(in_b[0], in_b[1]);
+        assert_eq!(in_a[0], in_b[0]);
+        let (strings, numbers) = ("#/$defs/strings", "#/$defs/numbers");
+        assert_ne!(at(&of_a, strings), at(&of_a, numbers));
+        assert_eq!(at(&of_b, strings), at(&of_b, numbers));
+        assert_eq!(at(&of_a, strings), at(&of_b, strings));
+        // The list by itself, with nothing that led to it, takes any item.
+        let alone = json!({"$ref": "#/$defs/list", "$defs": lists("null", "null")["$defs"]});
+        let (of_a, _) = classed(&alone, &json!({"items": {}}));
+        assert_eq!(every(&of_a, "#/$defs/list").len(), 1);
     }
 
     #[test]
@@ -467,22 +539,29 @@ mod tests {
             let truth = json!(true);
             let graph = parse(schema, &truth).unwrap().link().unwrap();
             let mut budget = Budget::new(u64::MAX);
-            classes(&graph, &mut budget).unwrap();
-            (budget.spent(), graph.len() as u64)
+            let (scopes, _) = reached(&graph, &mut budget).unwrap();
+            (budget.spent(), scopes.len() as u64)
         };
         let plain = json!({"properties": {"a": {"items": {"not": {}}}}});
         assert_eq!(rounds(&plain).0, 0);
 
         // Three of the four schemas on the cycle say the same by themselves. Each round tells
         // one more of them apart, by what it leads to, and a round that tells nothing apart
-        // ends the work. Every round but the first costs a step for each node.
+        // ends the work. Every round but the first costs a step for each schema that is
+        // classed: the four on the cycle and `true`.
         let cycle = json!({"not": {"not": {"not": {"$ref": "#"}}}});
         assert_eq!(rounds(&cycle), (3 * 5, 5));
+        // Schemas that nothing leads to are not classed. Here the root and `true` are, and
+        // the four on the cycle are not.
+        let unused = json!({
+            "$defs": {"cycle": {"not": {"not": {"not": {"$ref": "#/$defs/cycle"}}}}},
+        });
+        assert_eq!(rounds(&unused), (0, 2));
 
         let truth = json!(true);
         let graph = parse(&cycle, &truth).unwrap().link().unwrap();
-        assert_eq!(classes(&graph, &mut Budget::new(14)), Err(Exhausted));
-        assert!(classes(&graph, &mut Budget::new(15)).is_ok());
+        assert_eq!(reached(&graph, &mut Budget::new(14)).err(), Some(Exhausted));
+        assert!(reached(&graph, &mut Budget::new(15)).is_ok());
     }
 
     #[test]
@@ -497,9 +576,9 @@ mod tests {
         let (a, b, c) = (deep(json!({})), deep(json!({})), deep(json!(false)));
         let roots = |a: &Value, b: &Value| {
             let graph = parse(a, b).unwrap().link().unwrap();
-            let mut budget = Budget::new(0);
-            let classes = classes(&graph, &mut budget).unwrap();
-            (classes[graph.a.index()], classes[graph.b.index()])
+            let (scopes, classes) = reached(&graph, &mut Budget::new(0)).unwrap();
+            let of = |root| classes[scopes.from(root, ScopeId::NOTHING)];
+            (of(graph.a), of(graph.b))
         };
         let (of_a, of_b) = roots(&a, &b);
         assert_eq!(of_a, of_b);

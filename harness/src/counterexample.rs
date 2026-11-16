@@ -90,6 +90,137 @@ mod tests {
     }
 
     #[test]
+    fn the_validator_follows_the_dynamic_scope_as_the_library_does() {
+        // A list whose items are what the schema that led to it says they are, in a
+        // document that says what `root` says and has these definitions besides.
+        let lists = |root: Value, more: Value| {
+            let mut document = json!({
+                "$id": "https://example.com/root",
+                "$defs": {
+                    "strings": {
+                        "$id": "strings",
+                        "$ref": "list",
+                        "$defs": {"item": {"$dynamicAnchor": "item", "type": "string"}},
+                    },
+                    "list": {
+                        "$id": "list",
+                        "type": "array",
+                        "items": {"$dynamicRef": "#item"},
+                        "$defs": {"item": {"$dynamicAnchor": "item"}},
+                    },
+                },
+            });
+            for (keyword, value) in root.as_object().unwrap() {
+                document[keyword] = value.clone();
+            }
+            for (name, schema) in more.as_object().unwrap() {
+                document["$defs"][name] = schema.clone();
+            }
+            document
+        };
+        let (any, strings, nulls) = (
+            json!({"type": "array"}),
+            json!({"type": "array", "items": {"type": "string"}}),
+            json!({"type": "array", "items": {"type": "null"}}),
+        );
+        let of_nulls = json!({"$dynamicAnchor": "item", "type": "null"});
+        // Each schema with what it says, written without a reference.
+        let pairs = [
+            // The anchor of the outermost resource on the way that has one is meant.
+            (lists(json!({"$ref": "strings"}), json!({})), &strings),
+            (lists(json!({"$ref": "list"}), json!({})), &any),
+            (
+                lists(json!({"$ref": "strings"}), json!({"item": of_nulls})),
+                &nulls,
+            ),
+            // A resource that was left is on the way no more. The list is reached twice:
+            // by way of `strings`, and after that by itself, where it takes any item.
+            (
+                lists(
+                    json!({"not": {"not": {"$ref": "strings"}}, "$ref": "list"}),
+                    json!({}),
+                ),
+                &strings,
+            ),
+            (
+                lists(
+                    json!({"anyOf": [{"$ref": "strings"}, {"$ref": "list"}]}),
+                    json!({}),
+                ),
+                &any,
+            ),
+            // The first target is in a resource that is not on the way.
+            (
+                lists(
+                    json!({"type": "array", "items": {"$dynamicRef": "strings#item"}}),
+                    json!({}),
+                ),
+                &strings,
+            ),
+            // A `$dynamicRef` to an `$anchor` is a `$ref`.
+            (
+                lists(
+                    json!({"$ref": "inner"}),
+                    json!({
+                        "item": of_nulls,
+                        "inner": {
+                            "$id": "inner",
+                            "type": "array",
+                            "items": {"$dynamicRef": "#item"},
+                            "$defs": {"item": {"$anchor": "item", "type": "string"}},
+                        },
+                    }),
+                ),
+                &strings,
+            ),
+        ];
+        let instances = [
+            json!([]),
+            json!(["a"]),
+            json!([null]),
+            json!(["a", null]),
+            json!(0),
+        ];
+        let same = |one: &Value, other: &Value| {
+            let yes =
+                |wide, narrow| subsumes::subsumes(wide, narrow).unwrap() == subsumes::Verdict::Yes;
+            yes(one, other) && yes(other, one)
+        };
+        for (dynamic, plain) in &pairs {
+            assert!(same(dynamic, plain), "{dynamic} and {plain}");
+            let (of_dynamic, of_plain) = (validator(dynamic).unwrap(), validator(plain).unwrap());
+            for instance in &instances {
+                assert_eq!(
+                    of_dynamic.is_valid(instance),
+                    of_plain.is_valid(instance),
+                    "{instance} under {dynamic}"
+                );
+            }
+        }
+
+        // The two differ on a `$ref` that names a dynamic anchor where another one of the
+        // name is further out on the way. To the draft a `$ref` leads where it says, and
+        // the library follows the draft. The validator looks for the anchor on the way, as
+        // for a `$dynamicRef`. No schema of the corpus has such a `$ref`.
+        let plain_reference = lists(
+            json!({"$ref": "inner"}),
+            json!({
+                "item": of_nulls,
+                "inner": {
+                    "$id": "inner",
+                    "type": "array",
+                    "items": {"$ref": "#item"},
+                    "$defs": {"item": {"$dynamicAnchor": "item", "type": "string"}},
+                },
+            }),
+        );
+        assert!(same(&plain_reference, &strings));
+        let of_validator = validator(&plain_reference).unwrap();
+        assert!(!of_validator.is_valid(&json!(["a"])));
+        assert!(of_validator.is_valid(&json!([null])));
+    }
+
+    #[test]
     fn a_counterexample_is_valid_under_the_narrow_schema_only() {
         let (wide, narrow) = (
             json!({"type": "string"}),

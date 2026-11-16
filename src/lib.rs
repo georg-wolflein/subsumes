@@ -21,12 +21,11 @@
 //! specification describes: each file goes under `$defs` with its URI as its `$id`.
 //!
 //! The engine is being built keyword by keyword. So far it models the types, `null`, the
-//! booleans, numbers, strings, objects, `allOf`, `anyOf`, `oneOf`, `not`, `if`/`then`/`else`
-//! and `$ref`. A check whose answer depends on another keyword, such as one about arrays,
-//! returns [`Verdict::Unknown`] and names the keyword.
+//! booleans, numbers, strings, objects, arrays, `allOf`, `anyOf`, `oneOf`, `not`,
+//! `if`/`then`/`else`, `$ref` and `$dynamicRef`. A check whose answer depends on another
+//! keyword, such as `uniqueItems`, returns [`Verdict::Unknown`] and names the keyword.
 //! Two schemas that share such a keyword with the same value can still be decided, because
-//! what both say cancels. A schema that uses a `$dynamicRef` is not decided yet, whatever
-//! else it says.
+//! what both say cancels.
 //!
 //! Numbers are compared exactly: a number stands for the decimal that it is written as, so
 //! `0.0075` is a multiple of `0.0001`, which the two floats are not.

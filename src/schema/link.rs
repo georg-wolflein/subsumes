@@ -35,6 +35,7 @@ impl<'a> Unlinked<'a> {
                     reference: reference.reference.to_owned(),
                 });
             };
+            let anchor = builder.dynamic_anchor(reference, target);
             let node = &mut builder.nodes[reference.node.index()];
             if let Schema::Object(keywords) = &mut node.schema {
                 match reference.keyword {
@@ -43,6 +44,7 @@ impl<'a> Unlinked<'a> {
                         keywords.dynamic_reference = Some(DynamicReference {
                             reference: reference.reference,
                             target,
+                            anchor,
                         });
                     }
                 }
@@ -83,6 +85,18 @@ impl<'a> Builder<'a> {
         } else {
             Ok(self.anchors.get(&(resource, &*fragment)).copied())
         }
+    }
+
+    /// The name in the fragment of a reference, if it is the `$dynamicAnchor` of the target.
+    /// A fragment that is a JSON Pointer names no anchor, and neither does one that is the
+    /// `$anchor` of a target which has a `$dynamicAnchor` of another name besides.
+    fn dynamic_anchor(&self, reference: Reference<'a>, target: NodeId) -> Option<&'a str> {
+        let (_, fragment) = reference.reference.split_once('#')?;
+        let fragment = percent_decoded(fragment)?;
+        let Schema::Object(keywords) = &self.nodes[target.index()].schema else {
+            return None;
+        };
+        keywords.dynamic_anchor.filter(|name| *name == fragment)
     }
 
     /// The node that begins the resource which a URI reference names, where the reference
@@ -503,11 +517,65 @@ mod tests {
                 Some(DynamicReference {
                     reference: "#node",
                     target: graph.a,
+                    anchor: Some("node"),
                 })
             );
             assert_eq!(items.reference, None);
         })
         .unwrap();
+    }
+
+    #[test]
+    fn a_dynamic_reference_looks_for_an_anchor_only_if_its_first_target_has_it() {
+        // What each reference under `prefixItems` looks for in the dynamic scope.
+        let looked_for = |schema: Value| -> Vec<Option<String>> {
+            let mut found = Vec::new();
+            load(&schema, &json!(true), |graph| {
+                for item in &object(graph, graph.a).prefix_items {
+                    let dynamic = object(graph, *item).dynamic_reference.unwrap();
+                    found.push(dynamic.anchor.map(str::to_owned));
+                }
+            })
+            .unwrap();
+            found
+        };
+        let schema = json!({
+            "$id": "https://example.com/root",
+            "prefixItems": [
+                {"$dynamicRef": "#dynamic"},
+                // An escape in the fragment is read before the name is looked up.
+                {"$dynamicRef": "#dyn%61mic"},
+                {"$dynamicRef": "other#dynamic"},
+                // The name of an `$anchor`, a JSON Pointer to a schema that has a dynamic
+                // anchor, and no fragment at all.
+                {"$dynamicRef": "#plain"},
+                {"$dynamicRef": "#/$defs/dynamic"},
+                {"$dynamicRef": "other"},
+                // The `$anchor` of a schema that has a `$dynamicAnchor` of another name.
+                {"$dynamicRef": "#one"},
+                {"$dynamicRef": "#two"},
+            ],
+            "$defs": {
+                "dynamic": {"$dynamicAnchor": "dynamic"},
+                "plain": {"$anchor": "plain"},
+                "both": {"$anchor": "one", "$dynamicAnchor": "two"},
+                "other": {"$id": "other", "$dynamicAnchor": "dynamic"},
+            },
+        });
+        let named = |name: &str| Some(name.to_owned());
+        assert_eq!(
+            looked_for(schema),
+            [
+                named("dynamic"),
+                named("dynamic"),
+                named("dynamic"),
+                None,
+                None,
+                None,
+                None,
+                named("two"),
+            ]
+        );
     }
 
     /// Both resources have a dynamic anchor of the same name, and the reference names one.

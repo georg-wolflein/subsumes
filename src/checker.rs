@@ -60,18 +60,6 @@ impl Checker {
     /// When `a` or `b` cannot be checked at all; see [`Error`].
     pub fn check(&self, a: &Value, b: &Value) -> Result<Check, Error> {
         let graph = schema::parse(a, b)?.link()?;
-        // What a `$dynamicRef` accepts depends on the schemas that led to it, which the terms
-        // do not say yet.
-        if let Some(node) = lower::dynamic_reference(&graph) {
-            let reason = Reason::Unsupported {
-                schema: graph.node(node).side,
-                location: graph.keyword_location(node, "$dynamicRef"),
-            };
-            return Ok(Check {
-                verdict: Verdict::Unknown { reason },
-                steps: 0,
-            });
-        }
         let mut context = Context::new(self.budget);
         let outcome = lower::lower(&graph, &mut context)
             .and_then(|(a, b)| normalize::decide(&mut context, a, b));
@@ -172,41 +160,6 @@ mod tests {
                 },
             }
         );
-    }
-
-    #[test]
-    fn a_check_that_reaches_a_dynamic_reference_is_unknown_and_names_it() {
-        // Through `a` the dynamic reference leads to a schema that accepts everything, and
-        // through `d` alone to one that accepts nothing. So B accepts everything, and terms
-        // that give the reference one meaning would make B a schema and its own negation.
-        let b = json!({
-            "$id": "https://example.com/root",
-            "$ref": "a",
-            "not": {"$ref": "d"},
-            "$defs": {
-                "d": {
-                    "$id": "d",
-                    "$dynamicRef": "#x",
-                    "$defs": {"x": {"$dynamicAnchor": "x", "not": {}}},
-                },
-                "a": {
-                    "$id": "a",
-                    "$ref": "d",
-                    "$defs": {"x": {"$dynamicAnchor": "x"}},
-                },
-            },
-        });
-        let check = Checker::new().check(&json!(false), &b).unwrap();
-        assert_eq!(
-            check.verdict,
-            Verdict::Unknown {
-                reason: Reason::Unsupported {
-                    schema: Side::B,
-                    location: "#/$defs/d/$dynamicRef".to_owned(),
-                },
-            }
-        );
-        assert_eq!(check.steps, 0);
     }
 
     #[test]

@@ -89,6 +89,15 @@
 //! A definition may also hold itself in a property. What it accepts of a value then depends
 //! on what the definitions accept of the values inside, which are smaller. So the evaluator
 //! reads the definitions for the values inside first, and for each value once.
+//!
+//! # Dynamic references
+//!
+//! The engine works out what a `$dynamicRef` leads to before it looks at an instance, by
+//! following every way through the schemas. The evaluator does what the draft says, at the
+//! moment it comes to the reference: it keeps the resources that it has entered and not
+//! left, and takes the outermost of them that has a dynamic anchor of the name. One run
+//! makes documents of four resources that refer to each other, each with anchors of two
+//! names or without them, and none of them refers to itself.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -149,10 +158,62 @@ type Both<'d> = Rc<(Definitions<'d>, Definitions<'d>)>;
 /// has no answer.
 type Answered = (String, Vec<Option<bool>>);
 
+/// A resource of a document: a schema with an `$id`, or the document itself.
+struct Resource<'d> {
+    /// What its `$id` says, or nothing.
+    id: &'d str,
+    root: &'d Value,
+    /// The anchors in it and in no resource inside it: the name, the schema that has it,
+    /// and whether it is a `$dynamicAnchor`.
+    anchors: Vec<(&'d str, &'d Value, bool)>,
+}
+
+/// The resources of a document, the document itself first.
+fn resources(document: &Value) -> Vec<Resource<'_>> {
+    fn id(schema: &Value) -> Option<&str> {
+        schema.get("$id").and_then(Value::as_str)
+    }
+    let mut resources = vec![Resource {
+        id: id(document).unwrap_or_default(),
+        root: document,
+        anchors: Vec::new(),
+    }];
+    let mut pending = vec![(document, 0)];
+    while let Some((value, mut resource)) = pending.pop() {
+        let inside: Vec<&Value> = match value {
+            Value::Object(members) => members.values().collect(),
+            Value::Array(items) => items.iter().collect(),
+            _ => continue,
+        };
+        if let Some(id) = id(value).filter(|_| !std::ptr::eq(value, document)) {
+            resource = resources.len();
+            resources.push(Resource {
+                id,
+                root: value,
+                anchors: Vec::new(),
+            });
+        }
+        for (keyword, dynamic) in [("$anchor", false), ("$dynamicAnchor", true)] {
+            if let Some(name) = value.get(keyword).and_then(Value::as_str) {
+                resources[resource].anchors.push((name, value, dynamic));
+            }
+        }
+        pending.extend(inside.into_iter().map(|value| (value, resource)));
+    }
+    resources
+}
+
 /// A schema with its definitions, by the fragment that a reference to each holds.
+///
+/// A document with an `$id` is one of several resources instead. A reference in it names a
+/// resource and a place in that, and no schema of it refers to itself.
 struct Document<'d> {
     schema: &'d Value,
     definitions: Vec<(&'d str, &'d Value)>,
+    /// Empty for a document without an `$id`.
+    resources: Vec<Resource<'d>>,
+    /// The resources that the evaluator has entered and not left, the outermost first.
+    scope: RefCell<Vec<usize>>,
     /// Whether no definition refers to one. Then a reference is read by reading the
     /// definition where the reference stands, and nothing is read until it stands still.
     without_cycles: bool,
@@ -198,6 +259,17 @@ fn is(value: &Value, constant: &Value) -> bool {
 impl<'d> Document<'d> {
     /// `fragments` holds the fragment of every definition that a schema here may have.
     fn new(schema: &'d Value, fragments: &'d BTreeMap<String, String>) -> Self {
+        if schema.get("$id").is_some() {
+            return Self {
+                schema,
+                definitions: Vec::new(),
+                resources: resources(schema),
+                scope: RefCell::default(),
+                without_cycles: true,
+                leaves_of: RefCell::default(),
+                known: RefCell::default(),
+            };
+        }
         let definitions = schema.get("$defs").and_then(Value::as_object);
         let definitions = definitions.into_iter().flatten();
         let definitions = definitions.map(|(name, schema)| (fragments[name].as_str(), schema));
@@ -207,9 +279,54 @@ impl<'d> Document<'d> {
             schema,
             without_cycles: !definitions.iter().any(refers),
             definitions,
+            resources: Vec::new(),
+            scope: RefCell::default(),
             leaves_of: RefCell::default(),
             known: RefCell::default(),
         }
+    }
+
+    /// The schema that a reference of a document of several resources leads to, and the
+    /// resource that it is in. The reference stands in the resource that was entered last.
+    ///
+    /// A `$dynamicRef` whose fragment names a dynamic anchor of the resource that it names
+    /// leads to the anchor of that name in the outermost resource that has one, of those
+    /// entered and not left. Every other reference leads to where it says.
+    fn target(&self, reference: &str, dynamic: bool) -> (usize, &'d Value) {
+        let scope = self.scope.borrow();
+        let (id, fragment) = reference.split_once('#').unwrap_or((reference, ""));
+        let named = || self.resources.iter().position(|resource| resource.id == id);
+        let resource = if id.is_empty() {
+            *scope.last().expect("the document is entered")
+        } else {
+            named().expect("the reference names a resource")
+        };
+        let found = &self.resources[resource];
+        if fragment.is_empty() {
+            return (resource, found.root);
+        }
+        if fragment.starts_with('/') {
+            let schema = found.root.pointer(fragment);
+            return (resource, schema.expect("the pointer leads to a schema"));
+        }
+        // The schema with the anchor of the name in a resource, and whether the anchor is
+        // a dynamic one.
+        let anchor = |resource: usize| -> Option<(&'d Value, bool)> {
+            let mut anchors = self.resources[resource].anchors.iter();
+            let named = anchors.find(|(name, _, _)| *name == fragment)?;
+            Some((named.1, named.2))
+        };
+        let (first, is_dynamic) = anchor(resource).expect("the resource has the anchor");
+        if !(dynamic && is_dynamic) {
+            return (resource, first);
+        }
+        let mut entered = scope.iter().copied().chain([resource]);
+        entered
+            .find_map(|outer| match anchor(outer) {
+                Some((schema, true)) => Some((outer, schema)),
+                _ => None,
+            })
+            .expect("the resource that the reference names has the anchor")
     }
 
     fn accepting_nothing(&self) -> Definitions<'d> {
@@ -237,6 +354,10 @@ impl<'d> Document<'d> {
                 .as_object()
                 .expect("a schema is an object or a boolean"),
         };
+        // A schema that begins a resource enters it, until everything in it is looked at.
+        let mut resources = self.resources.iter();
+        let begins = resources.position(|resource| std::ptr::eq(resource.root, schema));
+        self.scope.borrow_mut().extend(begins);
         let accepts =
             |schema: &Value| self.accepts(value, schema, under_negation, read, which, leaves);
         // The same schema where its negation is what counts.
@@ -289,7 +410,17 @@ impl<'d> Document<'d> {
         let mut accepted = true;
         for (keyword, held) in keywords {
             accepted &= match keyword.as_str() {
-                "$defs" | "then" | "else" => true,
+                "$defs" | "then" | "else" | "$id" | "$anchor" | "$dynamicAnchor" => true,
+                // The resource of the target is entered for as long as the target is
+                // looked at.
+                "$ref" | "$dynamicRef" if !self.resources.is_empty() => {
+                    let dynamic = keyword == "$dynamicRef";
+                    let (resource, target) = self.target(held.as_str().unwrap(), dynamic);
+                    self.scope.borrow_mut().push(resource);
+                    let accepted = accepts(target);
+                    self.scope.borrow_mut().pop();
+                    accepted
+                }
                 "$ref" => {
                     let pointer = held.as_str().unwrap().trim_start_matches('#');
                     let definitions = if under_negation {
@@ -424,6 +555,9 @@ impl<'d> Document<'d> {
                 }
                 other => panic!("no schema here has the keyword {other}"),
             };
+        }
+        if begins.is_some() {
+            self.scope.borrow_mut().pop();
         }
         accepted
     }
@@ -973,6 +1107,107 @@ fn document(mut schema: Value, definitions: &Value) -> Value {
     schema
 }
 
+/// The resources of a document that has several: the document and three inside it.
+const RESOURCES: [&str; 4] = ["https://example.com/root", "r1", "r2", "r3"];
+/// The names that an anchor may have.
+const ANCHORS: [&str; 2] = ["x", "y"];
+
+/// For each resource and each name, whether the resource has an anchor of the name, and
+/// whether that is a dynamic one.
+type Anchored = [[Option<bool>; 2]; 4];
+
+/// The references that a schema in a resource may hold. Another resource is referred to
+/// only if it comes later, and a schema with an anchor holds no reference, so that no
+/// schema refers to itself. `$dynamicRef` is there in every way that it may be written:
+/// to a dynamic anchor here or elsewhere, which is looked for on the way, and to an
+/// `$anchor`, by a JSON Pointer and without a fragment, which is a `$ref`.
+fn references(of: usize, anchored: &Anchored) -> Vec<Value> {
+    let mut references = vec![json!({"$ref": "#/$defs/d"})];
+    for (resource, anchors) in anchored.iter().enumerate() {
+        let id = if resource == of {
+            ""
+        } else {
+            RESOURCES[resource]
+        };
+        if resource > of {
+            // More often than anything else, so that a way leads through several. One that
+            // leads to the definition `in` enters the resource in its middle.
+            references.extend(std::iter::repeat_n(json!({"$ref": id}), 3));
+            references.push(json!({"$dynamicRef": id}));
+            let inside = json!({"$ref": format!("{id}#/$defs/in")});
+            references.extend(std::iter::repeat_n(inside, 2));
+        }
+        // The root is named by no reference: its `$id` is no name that stands alone.
+        if resource == 0 && of != 0 {
+            continue;
+        }
+        for (name, anchor) in ANCHORS.iter().zip(anchors) {
+            if anchor.is_none() {
+                continue;
+            }
+            let dynamic = json!({"$dynamicRef": format!("{id}#{name}")});
+            references.extend(std::iter::repeat_n(dynamic, 3));
+            references.push(json!({"$ref": format!("{id}#{name}")}));
+            references.push(json!({"$dynamicRef": format!("{id}#/$defs/{name}")}));
+        }
+    }
+    references
+}
+
+/// A schema whose references are some of these.
+fn referring(random: &mut Random, shape: Shape, references: &[Value]) -> Value {
+    let mut schema = schema(random, 2, shape);
+    let mut pending = vec![&mut schema];
+    while let Some(value) = pending.pop() {
+        if value.get("$ref").is_some() {
+            *value = references[random.below(references.len())].clone();
+            continue;
+        }
+        match value {
+            Value::Object(members) => pending.extend(members.values_mut()),
+            Value::Array(items) => pending.extend(items.iter_mut()),
+            _ => {}
+        }
+    }
+    schema
+}
+
+/// The definitions of a resource: `d`, and a schema for each anchor that it has. None of
+/// them holds a reference.
+fn anchors(random: &mut Random, anchored: [Option<bool>; 2]) -> Value {
+    let mut of_resource = definitions(random, WITHOUT_CYCLES);
+    for (name, anchor) in ANCHORS.iter().zip(anchored) {
+        let Some(dynamic) = anchor else { continue };
+        let mut schema = match definitions(random, WITHOUT_CYCLES)["d"].take() {
+            Value::Bool(true) => json!({}),
+            Value::Bool(false) => json!({"not": {}}),
+            schema => schema,
+        };
+        let keyword = if dynamic { "$dynamicAnchor" } else { "$anchor" };
+        schema[keyword] = json!(name);
+        of_resource[name] = schema;
+    }
+    of_resource
+}
+
+/// A document of four resources. The first is the document itself, which says what `root`
+/// says, and the others are among its definitions. Each of those has a definition `in`
+/// that holds references as the resource itself does.
+fn of_resources(random: &mut Random, shape: Shape, anchored: &Anchored, root: Value) -> Value {
+    let mut document = root;
+    document["$id"] = json!(RESOURCES[0]);
+    document["$defs"] = anchors(random, anchored[0]);
+    for resource in 1..RESOURCES.len() {
+        let references = references(resource, anchored);
+        let mut schema = json!({"allOf": [referring(random, shape, &references)]});
+        schema["$id"] = json!(RESOURCES[resource]);
+        schema["$defs"] = anchors(random, anchored[resource]);
+        schema["$defs"]["in"] = referring(random, shape, &references);
+        document["$defs"][RESOURCES[resource]] = schema;
+    }
+    document
+}
+
 /// What the engine made of a pair that the evaluator agrees with.
 #[derive(Default)]
 struct Tally {
@@ -1439,5 +1674,73 @@ fn the_engine_agrees_on_schemas_that_hold_themselves_in_a_property() {
     assert!(
         yes > 150 && no > 200 && objects > 100,
         "{yes} {no} {objects}"
+    );
+}
+
+#[test]
+fn the_engine_agrees_on_dynamic_references() {
+    let random = &mut Random(7);
+    let instances = mostly_plain();
+    let mut tally = Tally::default();
+    for pair in 0..1_500 {
+        // The shape is there for its references, each of which becomes one of those that
+        // the resource may hold.
+        let shape = Shape {
+            definitions: &["e", "f"],
+            never_negated: false,
+            of_objects: false,
+            of_arrays: false,
+        };
+        let anchor = |random: &mut Random| match random.below(10) {
+            0 => None,
+            1 | 2 => Some(false),
+            _ => Some(true),
+        };
+        let anchored: Anchored = std::array::from_fn(|_| [anchor(random), anchor(random)]);
+        let at_the_root = references(0, &anchored);
+        let (of_a, of_b) = (
+            referring(random, shape, &at_the_root),
+            referring(random, shape, &at_the_root),
+        );
+        let a = of_resources(random, shape, &anchored, json!({"allOf": [of_a.clone()]}));
+        // B is A and more, A or more, A with other schemas at the anchors of one of its
+        // resources, or a document of its own.
+        let b = match pair % 4 {
+            0 | 1 => {
+                let mut b = a.clone();
+                let both = json!([of_a, of_b]);
+                b.as_object_mut().unwrap().remove("allOf");
+                b[if pair % 4 == 0 { "allOf" } else { "anyOf" }] = both;
+                b
+            }
+            2 => {
+                let mut b = a.clone();
+                let resource = random.below(RESOURCES.len());
+                let other = anchors(random, anchored[resource]);
+                let definitions = if resource == 0 {
+                    &mut b["$defs"]
+                } else {
+                    &mut b["$defs"][RESOURCES[resource]]["$defs"]
+                };
+                for (name, schema) in other.as_object().unwrap() {
+                    definitions[name] = schema.clone();
+                }
+                b
+            }
+            _ => of_resources(random, shape, &anchored, json!({"allOf": [of_b]})),
+        };
+        tally.compare(&a, &b, &instances, Unknown::Exact);
+    }
+    println!("{tally}");
+    let Tally {
+        yes,
+        no,
+        numbers,
+        strings,
+        ..
+    } = tally;
+    assert!(
+        yes > 300 && no > 300 && numbers > 100 && strings > 100,
+        "{yes} {no} {numbers} {strings}"
     );
 }

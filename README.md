@@ -20,9 +20,9 @@ Each check returns one of three verdicts:
 
 ## Status
 
-The engine is being built keyword by keyword. So far it models the types, `null`, the booleans, numbers, strings, objects, arrays, `allOf`, `anyOf`, `oneOf`, `not`, `if`/`then`/`else` and `$ref`. For numbers that is `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, `integer`, and a number in `const` or `enum`. For strings it is `minLength`, `maxLength`, `pattern`, `format`, and a string in `const` or `enum`. For objects it is `properties`, `patternProperties`, `additionalProperties`, `propertyNames`, `required`, `dependentRequired`, `dependentSchemas`, `minProperties` and `maxProperties`. For arrays it is `prefixItems`, `items`, `contains`, `minItems` and `maxItems`. A `const` or an `enum` may hold any value. A check whose answer depends on any other keyword returns `Unknown` and names the keyword: `uniqueItems`, `maxContains`, a `minContains` of two or more, `unevaluatedProperties` and `unevaluatedItems`. So does every check of a schema that uses a `$dynamicRef`, until the engine models it.
+The engine is being built keyword by keyword. So far it models the types, `null`, the booleans, numbers, strings, objects, arrays, `allOf`, `anyOf`, `oneOf`, `not`, `if`/`then`/`else`, `$ref` and `$dynamicRef`. For numbers that is `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, `integer`, and a number in `const` or `enum`. For strings it is `minLength`, `maxLength`, `pattern`, `format`, and a string in `const` or `enum`. For objects it is `properties`, `patternProperties`, `additionalProperties`, `propertyNames`, `required`, `dependentRequired`, `dependentSchemas`, `minProperties` and `maxProperties`. For arrays it is `prefixItems`, `items`, `contains`, `minItems` and `maxItems`. A `const` or an `enum` may hold any value. A check whose answer depends on any other keyword returns `Unknown` and names the keyword: `uniqueItems`, `maxContains`, a `minContains` of two or more, `unevaluatedProperties` and `unevaluatedItems`.
 
-Two schemas that share such a keyword with the same value can still be decided, because what both say cancels. The engine decides 95 in 100 of the checks of the benchmark corpus.
+Two schemas that share such a keyword with the same value can still be decided, because what both say cancels. The engine decides 96 in 100 of the checks of the benchmark corpus.
 
 ## Goals
 
@@ -84,6 +84,8 @@ A `Yes` holds for every number, however many digits it has. The counterexample o
 A schema has to stand on its own. A `$ref` resolves inside the schema or to a meta-schema of draft 2020-12; nothing is fetched, and a reference that resolves to nothing is an error.
 
 A schema that is spread over several files is bundled into one first, as [the specification describes](https://json-schema.org/draft/2020-12/json-schema-core#section-9.3): each file goes under `$defs` with its URI as its `$id`, and no reference has to change.
+
+A `$dynamicRef` leads to the dynamic anchor of the outermost resource on the way to it that has one of its name, as the draft says. Which resource that is depends on the schemas alone, so the library works it out for every way before it compares anything. The scope begins at the schema that is checked: `subsumes(a, b)` reads each of the two as a root. A `$ref` leads where it says, also when it names a dynamic anchor. Some validators look for the anchor on the way there too, which the draft does not say.
 
 ## Unsupported constructs
 

@@ -2908,6 +2908,7 @@ mod tests {
             // A resource of its own, so that `#` is the schema wherever it stands.
             json!({"$id": "https://example.com/tree", "anyOf": [{"type": "null"}, {"items": {"$ref": "#"}}]}),
             json!({"$id": "https://example.com/endless", "$ref": "#"}),
+            json!({"$dynamicAnchor": "x", "items": {"$dynamicRef": "#x"}, "minItems": 1}),
         ];
         let other = json!({"type": "array", "maxItems": 2});
         for schema in &schemas {
@@ -2923,15 +2924,189 @@ mod tests {
         }
 
         // A count that was too large to keep is like no other, so a schema with one is not
-        // known to subsume even itself. A schema that leads to a `$dynamicRef` is not looked
-        // at yet at all.
+        // known to subsume even itself.
         let huge = json!({"type": "string", "maxLength": 1e30});
         assert_eq!(depends_on(&huge, &huge.clone()).1, "#/maxLength");
-        let dynamic = json!({"$dynamicAnchor": "x", "items": {"$dynamicRef": "#x"}});
-        assert_eq!(
-            depends_on(&dynamic, &dynamic.clone()),
-            (Side::A, "#/items/$dynamicRef".to_owned())
+    }
+
+    #[test]
+    fn a_dynamic_reference_leads_to_one_schema_by_one_way_and_to_another_by_the_next() {
+        // Through `a` the dynamic reference leads to a schema that accepts everything, and
+        // through `d` alone to one that accepts nothing. So the schema accepts everything.
+        // With one meaning for the reference it would be a schema and its own negation.
+        let both_ways = json!({
+            "$id": "https://example.com/root",
+            "$ref": "a",
+            "not": {"$ref": "d"},
+            "$defs": {
+                "d": {
+                    "$id": "d",
+                    "$dynamicRef": "#x",
+                    "$defs": {"x": {"$dynamicAnchor": "x", "not": {}}},
+                },
+                "a": {
+                    "$id": "a",
+                    "$ref": "d",
+                    "$defs": {"x": {"$dynamicAnchor": "x"}},
+                },
+            },
+        });
+        yes(&both_ways, &json!(true));
+        assert_eq!(counterexample(&json!(false), &both_ways), json!(null));
+
+        // A list whose items are what the schema that led to it says they are.
+        let list = |of: Value| {
+            json!({
+                "$id": "https://example.com/of",
+                "$ref": "list",
+                "$defs": {
+                    "item": of,
+                    "list": {
+                        "$id": "list",
+                        "type": "array",
+                        "items": {"$dynamicRef": "#item"},
+                        "$defs": {"item": {"$dynamicAnchor": "item"}},
+                    },
+                },
+            })
+        };
+        let integers = list(json!({"$dynamicAnchor": "item", "type": "integer"}));
+        let numbers = list(json!({"$dynamicAnchor": "item", "type": "number"}));
+        yes(&numbers, &integers);
+        assert_eq!(counterexample(&integers, &numbers), json!([0.1]));
+        // Without an anchor of that name on the way, the anchor of the list itself is
+        // meant, which takes any item. So does a `$ref`, whatever is on the way.
+        let any = list(json!({"type": "integer"}));
+        yes(&any, &json!({"type": "array"}));
+        let mut fixed = integers.clone();
+        fixed["$defs"]["list"]["items"] = json!({"$ref": "#item"});
+        yes(&fixed, &json!({"type": "array"}));
+        assert_eq!(counterexample(&integers, &fixed), json!([null]));
+
+        // A reference that leads into the middle of a resource enters the resource: its
+        // anchor is further out than that of the list.
+        let by_the_middle = json!({
+            "$id": "https://example.com/root",
+            "$ref": "integers#/$defs/inner",
+            "$defs": {
+                "integers": {
+                    "$id": "integers",
+                    "$defs": {
+                        "inner": {"$ref": "list"},
+                        "item": {"$dynamicAnchor": "item", "type": "integer"},
+                    },
+                },
+                "list": integers["$defs"]["list"],
+            },
+        });
+        yes(&by_the_middle, &integers);
+        yes(&integers, &by_the_middle);
+    }
+
+    #[test]
+    fn an_anchor_where_the_draft_puts_no_schema_is_bound_to_nothing() {
+        // The draft puts no schema under `x-shared`, so it looks for no anchor there, and a
+        // reference that leads there by a pointer does not change that. The items of the
+        // list are what its own anchor says.
+        let list = |shared: &str| {
+            let mut document = json!({
+                "$id": "https://example.com/root",
+                "allOf": [{"$ref": format!("#/{shared}/item")}, {"$ref": "list"}],
+                "$defs": {
+                    "list": {
+                        "$id": "list",
+                        "items": {"$dynamicRef": "#item"},
+                        "$defs": {"item": {"$dynamicAnchor": "item", "type": "string"}},
+                    },
+                },
+            });
+            document[shared]["item"] = json!({"$dynamicAnchor": "item", "type": ["null", "array"]});
+            document
+        };
+        let of = |items: Value| json!({"type": ["null", "array"], "items": items});
+        let (strings, lists) = (
+            of(json!({"type": "string"})),
+            of(json!({"type": ["null", "array"]})),
         );
+        yes(&list("x-shared"), &strings);
+        yes(&strings, &list("x-shared"));
+        // Where the draft puts a schema, the anchor is one, and it is further out.
+        yes(&list("$defs"), &lists);
+        yes(&lists, &list("$defs"));
+    }
+
+    #[test]
+    fn a_leaf_that_holds_a_schema_is_a_leaf_for_each_thing_that_the_schema_says() {
+        // A `contains` that counts is a leaf that holds a schema. By way of `strings` that
+        // schema takes what `item` says, and by itself it takes anything. The document asks
+        // for the first and not for the second.
+        let lists = |count: Value, item: Value| {
+            json!({
+                "$id": "https://example.com/root",
+                "$ref": "strings",
+                "not": {"$ref": "list"},
+                "$defs": {
+                    "strings": {"$id": "strings", "$ref": "list", "$defs": {"item": item}},
+                    "list": {
+                        "$id": "list",
+                        "contains": {"$dynamicRef": "#item"},
+                        "minContains": count,
+                        "$defs": {"item": {"$dynamicAnchor": "item"}},
+                    },
+                },
+            })
+        };
+        // A count that is kept, and one that is too large to keep.
+        for (count, keyword) in [(json!(2), "minContains"), (json!(1e30), "contains")] {
+            // Where the two say the same, they are one leaf, and a leaf with its negation is
+            // nothing.
+            let same = lists(count.clone(), json!({"$dynamicAnchor": "item"}));
+            yes(&json!(false), &same);
+            // Where they differ, they are two, and nothing follows from one about the other.
+            let strings = json!({"$dynamicAnchor": "item", "type": "string"});
+            assert_eq!(
+                depends_on(&json!(false), &lists(count, strings)),
+                (Side::B, format!("#/$defs/list/{keyword}"))
+            );
+        }
+    }
+
+    #[test]
+    fn a_tree_that_is_extended_is_extended_at_every_node() {
+        // The children of a node are whatever the outermost schema with the anchor says a
+        // node is. So a tree that asks for a name asks for it at every node.
+        let tree = |children: Value| {
+            json!({
+                "$id": "tree",
+                "$dynamicAnchor": "node",
+                "type": "object",
+                "properties": {"children": {"type": "array", "items": children}},
+            })
+        };
+        let named = |tree: Value| {
+            json!({
+                "$id": "https://example.com/named",
+                "$dynamicAnchor": "node",
+                "$ref": "tree",
+                "required": ["name"],
+                "$defs": {"tree": tree},
+            })
+        };
+        let plain = |tree: Value| json!({"$id": "https://example.com/plain", "$ref": "tree", "$defs": {"tree": tree}});
+        let dynamic = || tree(json!({"$dynamicRef": "#node"}));
+        let everywhere = named(dynamic());
+        // With a `$ref` the children are nodes of the tree as it was, without a name.
+        let at_the_root = named(tree(json!({"$ref": "#"})));
+        yes(&at_the_root, &everywhere);
+        assert_eq!(
+            counterexample(&everywhere, &at_the_root),
+            json!({"children": [{}], "name": null})
+        );
+        yes(&plain(dynamic()), &everywhere);
+        assert_eq!(counterexample(&everywhere, &plain(dynamic())), json!({}));
+        // By itself the tree is the same with either reference.
+        yes(&plain(dynamic()), &plain(tree(json!({"$ref": "#"}))));
+        yes(&plain(tree(json!({"$ref": "#"}))), &plain(dynamic()));
     }
 
     #[test]
