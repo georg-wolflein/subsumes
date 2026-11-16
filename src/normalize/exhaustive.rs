@@ -541,13 +541,24 @@ impl<'d> Document<'d> {
                 }
                 // The properties that nothing in the schema has evaluated.
                 "unevaluatedProperties" => {
-                    let evaluated = self.evaluated(value, schema, true, read, which, leaves);
+                    let evaluated = self.evaluated(value, schema, false, true, read, which, leaves);
                     let there = members.into_iter().flatten();
                     let others = there.filter(|(name, _)| {
                         let names = evaluated.as_ref();
                         names.is_some_and(|names| !names.contains(name.as_str()))
                     });
                     all(&mut others.map(|(_, inner)| inside(inner, held)))
+                }
+                // The items that nothing in the schema has evaluated.
+                "unevaluatedItems" => {
+                    let evaluated = self.evaluated(value, schema, true, true, read, which, leaves);
+                    let there = items.into_iter().flatten().enumerate();
+                    let others = there.filter(|(position, _)| {
+                        let positions = evaluated.as_ref();
+                        positions
+                            .is_some_and(|positions| !positions.contains(&position.to_string()))
+                    });
+                    all(&mut others.map(|(_, item)| inside(item, held)))
                 }
                 "dependentRequired" => {
                     let dependencies = held.as_object().unwrap().iter();
@@ -572,39 +583,67 @@ impl<'d> Document<'d> {
         accepted
     }
 
-    /// The names of the properties of a value that a schema evaluates, if it accepts the
-    /// value, or `None` if it evaluates all of them. It evaluates what `properties` names,
-    /// what `patternProperties` matches, and everything with an `additionalProperties` or
-    /// an `unevaluatedProperties`; and what the schemas in place evaluate, of those that
-    /// are asked of the value and accept it. `outermost` is the schema whose
-    /// `unevaluatedProperties` is being asked, which does not count for itself.
+    /// What a schema evaluates of a value, if it accepts the value: the names of
+    /// properties, or with `of_items` the positions of items, as text. `None` is all of
+    /// them.
+    ///
+    /// Of properties it evaluates what `properties` names, what `patternProperties`
+    /// matches, and everything with an `additionalProperties` or an
+    /// `unevaluatedProperties`. Of items it evaluates those that `prefixItems` names, each
+    /// one that the schema of `contains` accepts, and everything with an `items` or an
+    /// `unevaluatedItems`. And it evaluates what the schemas in place do, of those that are
+    /// asked of the value and accept it. `outermost` is the schema whose `unevaluated`
+    /// keyword is being asked, which does not count for itself.
     ///
     /// This is for documents of one resource in which no definition refers to one.
+    #[allow(clippy::too_many_arguments)]
     fn evaluated(
         &self,
         value: &Value,
         schema: &Value,
+        of_items: bool,
         outermost: bool,
         read: &Readings,
         which: Which,
         leaves: &Leaves,
     ) -> Option<BTreeSet<String>> {
         assert!(self.without_cycles && self.resources.is_empty());
-        let (Some(keywords), Some(members)) = (schema.as_object(), value.as_object()) else {
+        let Some(keywords) = schema.as_object() else {
             return Some(BTreeSet::new());
         };
-        let accepts = |schema: &Value| self.accepts(value, schema, false, read, which, leaves);
-        let below = |schema: &Value| self.evaluated(value, schema, false, read, which, leaves);
-        let mut all = keywords.contains_key("additionalProperties")
-            || (!outermost && keywords.contains_key("unevaluatedProperties"));
-        let mut names = BTreeSet::new();
-        let listed = keywords.get("properties").and_then(Value::as_object);
-        let patterns = keywords.get("patternProperties").and_then(Value::as_object);
-        for name in members.keys() {
-            let is_listed = listed.is_some_and(|listed| listed.contains_key(name));
-            let mut patterns = patterns.into_iter().flatten();
-            if is_listed || patterns.any(|(pattern, _)| matches(pattern, name)) {
-                names.insert(name.clone());
+        let accepts =
+            |value: &Value, schema: &Value| self.accepts(value, schema, false, read, which, leaves);
+        let below =
+            |schema: &Value| self.evaluated(value, schema, of_items, false, read, which, leaves);
+        let has = |keyword: &str| keywords.contains_key(keyword);
+        let mut evaluated = BTreeSet::new();
+        let mut all;
+        if of_items {
+            let Some(items) = value.as_array() else {
+                return Some(BTreeSet::new());
+            };
+            all = has("items") || (!outermost && has("unevaluatedItems"));
+            let first = keywords.get("prefixItems").and_then(Value::as_array);
+            let first = first.map_or(0, Vec::len).min(items.len());
+            evaluated.extend((0..first).map(|position| position.to_string()));
+            if let Some(contained) = keywords.get("contains") {
+                let there = items.iter().enumerate();
+                let accepted = there.filter(|(_, item)| accepts(item, contained));
+                evaluated.extend(accepted.map(|(position, _)| position.to_string()));
+            }
+        } else {
+            let Some(members) = value.as_object() else {
+                return Some(BTreeSet::new());
+            };
+            all = has("additionalProperties") || (!outermost && has("unevaluatedProperties"));
+            let listed = keywords.get("properties").and_then(Value::as_object);
+            let patterns = keywords.get("patternProperties").and_then(Value::as_object);
+            for name in members.keys() {
+                let is_listed = listed.is_some_and(|listed| listed.contains_key(name));
+                let mut patterns = patterns.into_iter().flatten();
+                if is_listed || patterns.any(|(pattern, _)| matches(pattern, name)) {
+                    evaluated.insert(name.clone());
+                }
             }
         }
         let mut applied: Vec<&Value> = Vec::new();
@@ -612,10 +651,10 @@ impl<'d> Document<'d> {
         applied.extend(listed("allOf").into_iter().flatten());
         for keyword in ["anyOf", "oneOf"] {
             let branches = listed(keyword).into_iter().flatten();
-            applied.extend(branches.filter(|branch| accepts(branch)));
+            applied.extend(branches.filter(|branch| accepts(value, branch)));
         }
         if let Some(condition) = keywords.get("if") {
-            if accepts(condition) {
+            if accepts(value, condition) {
                 applied.push(condition);
                 applied.extend(keywords.get("then"));
             } else {
@@ -624,9 +663,10 @@ impl<'d> Document<'d> {
         }
         let dependent = keywords.get("dependentSchemas").and_then(Value::as_object);
         let dependent = dependent.into_iter().flatten();
+        let present = |name: &String| value.get(name).is_some() && value.is_object();
         applied.extend(
             dependent
-                .filter(|(name, _)| members.contains_key(*name))
+                .filter(|(name, _)| present(name))
                 .map(|(_, schema)| schema),
         );
         if let Some(reference) = keywords.get("$ref") {
@@ -636,11 +676,11 @@ impl<'d> Document<'d> {
         }
         for schema in applied {
             match below(schema) {
-                Some(more) => names.extend(more),
+                Some(more) => evaluated.extend(more),
                 None => all = true,
             }
         }
-        (!all).then_some(names)
+        (!all).then_some(evaluated)
     }
 
     /// What the definitions accept of a value when they are read until nothing changes,
@@ -891,7 +931,8 @@ struct Shape {
     /// Whether most of it is about arrays and about their items, with objects among them.
     of_arrays: bool,
     /// Whether some schemas have an `unevaluatedProperties`, beside what evaluates
-    /// properties in place and in the schemas that do.
+    /// properties in place and in the schemas that do. Among arrays it is an
+    /// `unevaluatedItems`.
     unevaluated: bool,
 }
 
@@ -1055,7 +1096,12 @@ fn plain(random: &mut Random, shape: Shape) -> Value {
         return schema;
     }
     if shape.of_arrays && random.chance(75) {
-        return about_arrays(random, 1, shape, true);
+        let mut schema = about_arrays(random, 1, shape, true);
+        // In a branch, where it evaluates every item for the schema around it.
+        if shape.unevaluated && random.chance(15) {
+            schema["unevaluatedItems"] = unevaluated(random, shape);
+        }
+        return schema;
     }
     let plain = [
         json!(true),
@@ -1169,17 +1215,24 @@ fn schema(random: &mut Random, depth: usize, shape: Shape) -> Value {
         let (keyword, value) = beside[random.below(beside.len())].clone();
         schema[keyword] = value;
     }
-    // Next to the connective, whose branches evaluate properties or do not.
+    // Next to the connective, whose branches evaluate properties or items, or do not.
     if shape.unevaluated && random.chance(50) {
-        if random.chance(30) {
-            schema["properties"] = json!({"b": for_a_value(random, 0, shape)});
+        if shape.of_arrays {
+            if random.chance(30) {
+                schema["prefixItems"] = json!([for_a_value(random, 0, shape)]);
+            }
+            schema["unevaluatedItems"] = unevaluated(random, shape);
+        } else {
+            if random.chance(30) {
+                schema["properties"] = json!({"b": for_a_value(random, 0, shape)});
+            }
+            schema["unevaluatedProperties"] = unevaluated(random, shape);
         }
-        schema["unevaluatedProperties"] = unevaluated(random, shape);
     }
     schema
 }
 
-/// A schema for the properties that nothing evaluates: often none at all.
+/// A schema for the properties or the items that nothing evaluates: often none at all.
 fn unevaluated(random: &mut Random, shape: Shape) -> Value {
     match random.below(4) {
         0 | 1 => json!(false),
@@ -1889,4 +1942,35 @@ fn the_engine_agrees_on_unevaluated_properties() {
         yes > 300 && no > 500 && objects > 300,
         "{yes} {no} {objects}"
     );
+}
+
+#[test]
+fn the_engine_agrees_on_unevaluated_items() {
+    let random = &mut Random(9);
+    let shape = Shape {
+        definitions: &[],
+        never_negated: false,
+        of_objects: false,
+        of_arrays: true,
+        unevaluated: true,
+    };
+    let instances = mostly_arrays();
+    let mut tally = Tally::default();
+    for pair in 0..800 {
+        let (a, b) = (schema(random, 2, shape), schema(random, 2, shape));
+        let (of_a, of_b) = (definitions(random, shape), definitions(random, shape));
+        let b = match pair % 4 {
+            0 => document(json!({"allOf": [a, b]}), &of_a),
+            1 => document(json!({"anyOf": [a, b]}), &of_a),
+            _ => document(b, &of_b),
+        };
+        let a = document(a, &of_a);
+        // The arrays that are listed are not one of every kind.
+        tally.compare(&a, &b, &instances, Unknown::Found);
+    }
+    println!("{tally}");
+    let Tally {
+        yes, no, arrays, ..
+    } = tally;
+    assert!(yes > 200 && no > 250 && arrays > 100, "{yes} {no} {arrays}");
 }

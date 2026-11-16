@@ -3187,6 +3187,92 @@ mod tests {
     }
 
     #[test]
+    fn unevaluated_items_are_those_that_no_schema_in_place_evaluates() {
+        let same = |one: &Value, other: &Value| {
+            yes(one, other);
+            yes(other, one);
+        };
+        let closed = |mut schema: Value| {
+            schema["unevaluatedItems"] = json!(false);
+            schema
+        };
+        let (text, number) = (json!({"type": "string"}), json!({"type": "number"}));
+        let first = |items: Value| json!({"prefixItems": items, "items": false});
+
+        // Next to nothing in place it is `items`.
+        same(
+            &closed(json!({"prefixItems": [text]})),
+            &first(json!([text])),
+        );
+        // The first items that a schema of `allOf` names are evaluated too.
+        let longer = json!({"allOf": [{"prefixItems": [{}, number]}], "prefixItems": [text]});
+        same(&closed(longer), &first(json!([text, number])));
+        // An item that the schema of `contains` accepts is evaluated, so every item is one.
+        let nulls = json!({"items": {"type": "null"}, "minItems": 1});
+        same(&closed(json!({"contains": {"type": "null"}})), &nulls);
+
+        // A branch of `anyOf` evaluates where the instance satisfies it: a second item
+        // that is no number makes its branch fail, and nothing evaluates it then.
+        let either = closed(json!({
+            "anyOf": [{"prefixItems": [text]}, {"prefixItems": [{}, number]}],
+        }));
+        yes(&json!({"maxItems": 2}), &either);
+        assert_eq!(
+            counterexample(&either, &json!({"prefixItems": [text], "maxItems": 2})),
+            json!(["", null])
+        );
+        same(
+            &either,
+            &json!({"anyOf": [first(json!([{}, number])), {"maxItems": 1, "prefixItems": [text]}]}),
+        );
+
+        // Where the condition is met, it evaluates with `then`.
+        let conditional = closed(json!({
+            "if": {"prefixItems": [{"const": 1}], "minItems": 1},
+            "then": {"prefixItems": [{}, text]},
+            "else": {"prefixItems": [number]},
+        }));
+        let mut met = first(json!([{"const": 1}, text]));
+        met["minItems"] = json!(1);
+        let unmet =
+            json!({"prefixItems": [{"type": "number", "not": {"const": 1}}], "maxItems": 1});
+        same(&conditional, &json!({"anyOf": [met, unmet]}));
+
+        // A schema of `dependentSchemas` is asked of no array, so it evaluates no item.
+        let dependent = closed(json!({"dependentSchemas": {"a": {"items": {}}}}));
+        same(&dependent, &json!({"maxItems": 0}));
+        // A schema in place with an `unevaluatedItems` of its own evaluates every item.
+        let inner = closed(json!({
+            "allOf": [{"prefixItems": [text], "unevaluatedItems": {"type": "null"}}],
+        }));
+        same(
+            &inner,
+            &json!({"prefixItems": [text], "items": {"type": "null"}}),
+        );
+
+        // The schema of a `contains` is what it is by the way that led to it: with the
+        // anchor of the root on the way its items are strings, and without it nulls.
+        let contained = |anchor: &str| {
+            json!({
+                "$id": "https://example.com/root",
+                "$ref": "list",
+                "$defs": {
+                    "item": {anchor: "item", "type": "string"},
+                    "list": {
+                        "$id": "list",
+                        "contains": {"$dynamicRef": "#item"},
+                        "unevaluatedItems": false,
+                        "$defs": {"item": {"$dynamicAnchor": "item", "type": "null"}},
+                    },
+                },
+            })
+        };
+        let of = |kind: &str| json!({"items": {"type": kind}, "minItems": 1});
+        same(&contained("$dynamicAnchor"), &of("string"));
+        same(&contained("$anchor"), &of("null"));
+    }
+
+    #[test]
     fn a_tree_that_is_extended_is_extended_at_every_node() {
         // The children of a node are whatever the outermost schema with the anchor says a
         // node is. So a tree that asks for a name asks for it at every node.
