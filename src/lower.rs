@@ -1761,6 +1761,13 @@ mod tests {
         // So thirty such definitions, which are 2^32 looks, end at the budget. More of them
         // are deeper in place than is followed.
         assert_eq!(steps(&doubled(30), 100_000), (false, 100_000));
+        // The walk for `unevaluatedItems` is the same one.
+        let mut items = doubled(3);
+        items["$defs"]["d0"] = json!({"prefixItems": [{}]});
+        let keywords = items.as_object_mut().unwrap();
+        let schema = keywords.remove("unevaluatedProperties").unwrap();
+        keywords.insert("unevaluatedItems".to_owned(), schema);
+        assert_eq!(steps(&items, u64::MAX), (true, 30));
     }
 
     #[test]
