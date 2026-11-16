@@ -452,81 +452,43 @@ impl Search<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use serde_json::json;
 
     use super::*;
-    use crate::canonical::object::Partitions;
-    use crate::language::Languages;
-    use crate::schema::NodeId;
-    use crate::term::{InstanceType, TypeSet, VarId};
+    use crate::canonical::made_up::{Engine, given, none};
+    use crate::term::VarId;
 
     /// What is asked of the arrays of a branch, with an engine that is made up.
-    ///
-    /// A variable is named by a number, and `-2` is the second one negated. To the engine
-    /// here, no value satisfies variable 0, and none satisfies 3 and 4 together. Whether
-    /// one satisfies variable 1 it does not know. Any other value is the names of what it
-    /// satisfies.
     struct Asked {
-        terms: Terms,
-        languages: Languages,
-        partitions: Partitions,
-        variables: Vec<VarId>,
+        engine: Engine,
         arrays: Arrays,
-        found: HashMap<CRefId, Found>,
-        /// The c-references that the engine was told to find out about.
-        decided: Vec<CRefId>,
     }
 
     impl Asked {
         fn new() -> Self {
-            let mut terms = Terms::default();
-            let string = TypeSet::of(InstanceType::String);
-            let variables = (0..6).map(|index| {
-                let variable = terms.new_variable(NodeId::new(0));
-                let body = terms.unknown(string, format!("{index}"), NodeId::new(0), "x");
-                terms.variable_mut(variable).body = body;
-                variable
-            });
             Self {
-                variables: variables.collect(),
-                terms,
-                languages: Languages::default(),
-                partitions: Partitions::default(),
+                engine: Engine::new(),
                 arrays: Arrays::default(),
-                found: HashMap::new(),
-                decided: Vec::new(),
             }
-        }
-
-        fn of(&mut self, variables: &[i32]) -> CRefId {
-            let mut all = Terms::ANYTHING;
-            for variable in variables {
-                let named = self.variables[variable.unsigned_abs() as usize];
-                let one = self.terms.literal(named, *variable < 0);
-                all = self.terms.both(all, one);
-            }
-            all
         }
 
         /// The item at a position satisfies these.
         fn at(mut self, position: u64, variables: &[i32]) -> Self {
-            let of = self.of(variables);
-            self.arrays.at(position, of, &mut self.terms);
+            let of = self.engine.of(variables);
+            self.arrays.at(position, of, &mut self.engine.terms);
             self
         }
 
         /// Every item from a position on satisfies these.
         fn from(mut self, from: u64, variables: &[i32]) -> Self {
-            let of = self.of(variables);
-            self.arrays.from(from, of, &mut self.terms);
+            let of = self.engine.of(variables);
+            self.arrays.from(from, of, &mut self.engine.terms);
             self
         }
 
         /// Some item at a position or after it satisfies these.
         fn some(mut self, from: u64, variables: &[i32]) -> Self {
-            let of = self.of(variables);
+            let of = self.engine.of(variables);
             self.arrays.some(from, of);
             self
         }
@@ -539,71 +501,23 @@ mod tests {
         /// A term as it stands, or with a variable below zero the term negated. The
         /// variable of a term that has none is 2 or -2.
         fn term(mut self, variable: i32, term: impl Fn(VarId) -> Term) -> Self {
-            let term = term(self.variables[variable.unsigned_abs() as usize]);
-            self.arrays.take(&term, variable < 0, &mut self.terms);
+            let term = term(self.engine.variable(variable));
+            self.arrays
+                .take(&term, variable < 0, &mut self.engine.terms);
             self
         }
 
-        /// What the engine that is made up finds of a c-reference.
-        fn decide(&self, of: CRefId) -> Found {
-            let literals = self.terms.literals(of);
-            let holds = |index: usize| literals.contains(&(self.variables[index], false));
-            if holds(0) || (holds(3) && holds(4)) {
-                return Found::Nothing;
-            }
-            if holds(1) {
-                return Found::Unknown(Cause::Number);
-            }
-            let named = literals.iter().map(|(variable, negated)| {
-                let sign = if *negated { "-" } else { "" };
-                format!("{sign}{}", variable.index())
-            });
-            let value = json!(named.collect::<Vec<_>>().join(" "));
-            Found::Instance(Witness::plain(value))
-        }
-
-        /// What is left, with the engine deciding what it is asked for until nothing is
-        /// asked any more.
+        /// What is left, with the engine deciding what it is asked for.
         fn left(&mut self, budget: &mut Budget) -> Result<Left, Exhausted> {
-            loop {
-                let found = &self.found;
-                let mut ask = |of: CRefId| match of {
-                    Terms::NOTHING => Some(Found::Nothing),
-                    Terms::ANYTHING => Some(Found::Instance(Witness::plain(Value::Null))),
-                    _ => found.get(&of).cloned(),
-                };
-                let mut solver = Solver {
-                    terms: &mut self.terms,
-                    languages: &mut self.languages,
-                    budget,
-                    partitions: &mut self.partitions,
-                };
-                let left = self.arrays.left(&mut solver, &mut ask, true)?;
-                let Left::Needs(wanted) = left else {
-                    return Ok(left);
-                };
-                assert!(!wanted.is_empty());
-                for of in wanted {
-                    assert!(!self.found.contains_key(&of));
-                    self.found.insert(of, self.decide(of));
-                    self.decided.push(of);
-                }
-            }
+            let arrays = &self.arrays;
+            self.engine
+                .left(budget, |with, ask| arrays.left(with, ask, true))
         }
 
         /// The array that is given, or why none is.
         fn given(mut self) -> Result<Value, String> {
-            match self.left(&mut Budget::new(u64::MAX)).unwrap() {
-                Left::Value(Some(array)) => Ok(array.value.clone()),
-                Left::Nothing => Err("nothing".to_owned()),
-                Left::Unknown(cause) => Err(format!("{cause:?}")),
-                other => panic!("{other:?} is no answer"),
-            }
+            given(self.left(&mut Budget::new(u64::MAX)).unwrap())
         }
-    }
-
-    fn none() -> Result<Value, String> {
-        Err("nothing".to_owned())
     }
 
     #[test]
@@ -774,12 +688,67 @@ mod tests {
     }
 
     #[test]
+    fn an_item_that_is_moved_leaves_the_slot_that_it_shared_as_it_was() {
+        // At most two items. One that there has to be is at position 1, and three more are
+        // anywhere. The last of them cannot share with the one before it, so that one is
+        // moved from position 0 to position 1, and position 0 is asked again only what it
+        // was asked before that one came.
+        let asked = Asked::new()
+            .count(0, Some(2))
+            .some(0, &[4])
+            .some(0, &[3])
+            .some(0, &[2])
+            .some(1, &[3]);
+        assert_eq!(asked.given(), Ok(json!(["2 4", "3"])));
+    }
+
+    #[test]
+    fn a_place_costs_a_step_and_one_that_may_only_do_is_tried_once() {
+        // The item may be at position 0 or after it, and at neither does the engine know
+        // whether there is a value. Once the array with the item at position 0 stands only
+        // as far as the engine knows, the other place is not filled again: only an array
+        // with every value would say more.
+        let mut asked = Asked::new().at(0, &[2]).some(0, &[1]);
+        let mut budget = Budget::new(u64::MAX);
+        let left = asked.left(&mut budget).unwrap();
+        assert!(matches!(left, Left::Unknown(Cause::Number)), "{left:?}");
+        // The engine is asked twice, so the search runs three times. Each time costs a
+        // step for the head and one for each place that is tried, besides the steps for
+        // the positions that are looked at and filled: 3, 6 and 4.
+        assert_eq!((asked.engine.waited, budget.spent()), (2, 13));
+    }
+
+    #[test]
+    fn an_array_that_ends_before_it_has_items_enough_ends_the_search() {
+        // Two items at least, and no value can be at position 1. However the item that
+        // there has to be is placed, the array ends there, so its other places are not
+        // tried. The engine is asked once: the search costs 5 steps before and 4 after.
+        let mut asked = Asked::new().count(2, None).at(1, &[0]).some(0, &[2]);
+        let mut budget = Budget::new(u64::MAX);
+        assert!(matches!(asked.left(&mut budget), Ok(Left::Nothing)));
+        assert_eq!((asked.engine.waited, budget.spent()), (1, 9));
+    }
+
+    #[test]
+    fn no_item_is_tried_at_the_position_where_the_array_ends() {
+        // No value can be at position 1, and the two items that there have to be cannot
+        // share position 0. Once the search knows where the array ends, it does not ask
+        // the engine about the first of them at that position.
+        let mut asked = Asked::new().at(1, &[0]).some(0, &[3]).some(0, &[4]);
+        let left = asked.left(&mut Budget::new(u64::MAX));
+        assert!(matches!(left, Ok(Left::Nothing)));
+        let (second, first) = (asked.engine.of(&[0, 3]), asked.engine.of(&[0, 4]));
+        assert!(asked.engine.decided.contains(&second));
+        assert!(!asked.engine.decided.contains(&first));
+    }
+
+    #[test]
     fn the_engine_is_asked_only_about_the_items_that_the_array_has() {
         // The empty array is given without a question.
         let mut asked = Asked::new().at(0, &[2]).at(1, &[4]).from(2, &[5]);
         let left = asked.left(&mut Budget::new(u64::MAX));
         assert!(matches!(left, Ok(Left::Value(Some(_)))));
-        assert_eq!(asked.decided, []);
+        assert_eq!(asked.engine.decided, []);
         // One item: about the first position, and about no other.
         let mut asked = Asked::new().at(0, &[2]).at(1, &[4]).from(2, &[5]);
         asked = asked.count(1, None);
@@ -789,14 +758,14 @@ mod tests {
         };
         assert_eq!(array.value, json!(["2"]));
         assert_eq!((array.size, array.depth), (2, 1));
-        let first = asked.of(&[2]);
-        assert_eq!(asked.decided, [first]);
+        let first = asked.engine.of(&[2]);
+        assert_eq!(asked.engine.decided, [first]);
         // Nor is it asked about an item at a position after the end of the array.
         let mut asked = Asked::new().at(1, &[0]).some(1, &[2]);
         let left = asked.left(&mut Budget::new(u64::MAX));
         assert!(matches!(left, Ok(Left::Nothing)));
-        let (end, at_the_end) = (asked.of(&[0]), asked.of(&[0, 2]));
-        assert_eq!(asked.decided, [at_the_end, end]);
+        let (end, at_the_end) = (asked.engine.of(&[0]), asked.engine.of(&[0, 2]));
+        assert_eq!(asked.engine.decided, [at_the_end, end]);
         // A thousand items after the head are one question, and a step for each to copy.
         let mut asked = Asked::new().from(0, &[5]).count(1000, None);
         let mut budget = Budget::new(u64::MAX);
@@ -805,7 +774,7 @@ mod tests {
             panic!("{left:?} is no array");
         };
         assert_eq!(array.value.as_array().unwrap().len(), 1000);
-        assert_eq!((array.size, asked.decided.len()), (1001, 1));
+        assert_eq!((array.size, asked.engine.decided.len()), (1001, 1));
         assert!(budget.spent() >= 1000, "{}", budget.spent());
         // Without steps enough to copy them, there is no answer.
         let mut asked = Asked::new().count(1000, None);
@@ -823,8 +792,8 @@ mod tests {
         };
         for (depth, given) in [(DEEPEST - 1, true), (DEEPEST, false)] {
             let mut asked = Asked::new().from(0, &[2]).count(1, None);
-            let of = asked.of(&[2]);
-            asked.found.insert(of, Found::Instance(deep(depth)));
+            let of = asked.engine.of(&[2]);
+            asked.engine.found.insert(of, Found::Instance(deep(depth)));
             match asked.left(&mut Budget::new(u64::MAX)).unwrap() {
                 Left::Value(Some(array)) => assert!(given && array.depth == depth + 1),
                 Left::Unknown(Cause::Depth) => assert!(!given),

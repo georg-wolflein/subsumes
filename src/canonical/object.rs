@@ -608,88 +608,55 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::schema::NodeId;
-    use crate::term::{InstanceType, TypeSet, VarId};
+    use crate::canonical::made_up::{Engine, given, none};
 
     /// What is asked of the objects of a branch, with an engine that is made up.
-    ///
-    /// A variable is named by a number, and `-2` is the second one negated. To the engine
-    /// here, no value satisfies variable 0, and none satisfies 3 and 4 together. Whether
-    /// one satisfies variable 1 it does not know. Any other value is the names of what it
-    /// satisfies.
     struct Asked {
-        terms: Terms,
-        languages: Languages,
-        partitions: Partitions,
-        variables: Vec<VarId>,
+        engine: Engine,
         objects: Objects,
-        found: HashMap<CRefId, Found>,
-        /// How many times the engine was told to find something out first.
-        waited: usize,
     }
 
     impl Asked {
         fn new() -> Self {
-            let mut terms = Terms::default();
-            let string = TypeSet::of(InstanceType::String);
-            let variables = (0..6).map(|index| {
-                let variable = terms.new_variable(NodeId::new(0));
-                let body = terms.unknown(string, format!("{index}"), NodeId::new(0), "x");
-                terms.variable_mut(variable).body = body;
-                variable
-            });
             Self {
-                variables: variables.collect(),
-                terms,
-                languages: Languages::default(),
-                partitions: Partitions::default(),
+                engine: Engine::new(),
                 objects: Objects::default(),
-                found: HashMap::new(),
-                waited: 0,
             }
         }
 
         /// The language of a pattern, or with `=` in front of a few words, or with `!`
         /// of every string but a few words.
         fn names(&mut self, names: &str) -> LanguageId {
+            let languages = &mut self.engine.languages;
             if let Some(words) = names.strip_prefix('=') {
-                return self.languages.words(words.split(','));
+                return languages.words(words.split(','));
             }
             if let Some(words) = names.strip_prefix('!') {
-                let words = self.languages.words(words.split(','));
-                return self.languages.outside([words]);
+                let words = languages.words(words.split(','));
+                return languages.outside([words]);
             }
-            self.languages.pattern(names).unwrap()
-        }
-
-        fn of(&mut self, variables: &[i32]) -> CRefId {
-            let mut all = Terms::ANYTHING;
-            for variable in variables {
-                let named = self.variables[variable.unsigned_abs() as usize];
-                let one = self.terms.literal(named, *variable < 0);
-                all = self.terms.both(all, one);
-            }
-            all
+            languages.pattern(names).unwrap()
         }
 
         /// Every property with such a name satisfies these.
         fn every(mut self, names: &str, variables: &[i32]) -> Self {
-            let (names, of) = (self.names(names), self.of(variables));
-            self.objects.every(names, of, &mut self.terms);
+            let (names, of) = (self.names(names), self.engine.of(variables));
+            self.objects.every(names, of, &mut self.engine.terms);
             self
         }
 
         /// No property has such a name.
         fn none(mut self, names: &str) -> Self {
             let names = self.names(names);
-            self.objects.every(names, Terms::NOTHING, &mut self.terms);
+            let terms = &mut self.engine.terms;
+            self.objects.every(names, Terms::NOTHING, terms);
             self
         }
 
         /// Some property with such a name satisfies these.
         fn some(mut self, names: &str, variables: &[i32]) -> Self {
-            let (names, of) = (self.names(names), self.of(variables));
-            self.objects.some(names, of, &mut self.terms);
+            let (names, of) = (self.names(names), self.engine.of(variables));
+            self.objects.some(names, of, &mut self.engine.terms);
             self
         }
 
@@ -698,66 +665,17 @@ mod tests {
             self
         }
 
-        /// What the engine that is made up finds of a c-reference.
-        fn decide(&self, of: CRefId) -> Found {
-            let literals = self.terms.literals(of);
-            let holds = |index: usize| literals.contains(&(self.variables[index], false));
-            if holds(0) || (holds(3) && holds(4)) {
-                return Found::Nothing;
-            }
-            if holds(1) {
-                return Found::Unknown(Cause::Number);
-            }
-            let named = literals.iter().map(|(variable, negated)| {
-                let sign = if *negated { "-" } else { "" };
-                format!("{sign}{}", variable.index())
-            });
-            let value = json!(named.collect::<Vec<_>>().join(" "));
-            Found::Instance(Witness::plain(value))
-        }
-
-        /// What is left, with the engine deciding what it is asked for until nothing is
-        /// asked any more.
+        /// What is left, with the engine deciding what it is asked for.
         fn left(&mut self, budget: &mut Budget) -> Result<Left, Exhausted> {
-            loop {
-                let found = &self.found;
-                let mut ask = |of: CRefId| match of {
-                    Terms::NOTHING => Some(Found::Nothing),
-                    Terms::ANYTHING => Some(Found::Instance(Witness::plain(Value::Null))),
-                    _ => found.get(&of).cloned(),
-                };
-                let mut solver = Solver {
-                    terms: &mut self.terms,
-                    languages: &mut self.languages,
-                    budget,
-                    partitions: &mut self.partitions,
-                };
-                let left = self.objects.left(&mut solver, &mut ask, true)?;
-                let Left::Needs(wanted) = left else {
-                    return Ok(left);
-                };
-                assert!(!wanted.is_empty());
-                self.waited += 1;
-                for of in wanted {
-                    assert!(!self.found.contains_key(&of));
-                    self.found.insert(of, self.decide(of));
-                }
-            }
+            let objects = &self.objects;
+            self.engine
+                .left(budget, |with, ask| objects.left(with, ask, true))
         }
 
         /// The object that is given, or why none is.
         fn given(mut self) -> Result<Value, String> {
-            match self.left(&mut Budget::new(u64::MAX)).unwrap() {
-                Left::Value(Some(object)) => Ok(object.value.clone()),
-                Left::Nothing => Err("nothing".to_owned()),
-                Left::Unknown(cause) => Err(format!("{cause:?}")),
-                other => panic!("{other:?} is no answer"),
-            }
+            given(self.left(&mut Budget::new(u64::MAX)).unwrap())
         }
-    }
-
-    fn none() -> Result<Value, String> {
-        Err("nothing".to_owned())
     }
 
     #[test]
@@ -905,12 +823,12 @@ mod tests {
         let mut budget = Budget::new(u64::MAX);
         assert!(matches!(asked.left(&mut budget), Ok(Left::Value(Some(_)))));
         // One c-reference for the four, asked for in one go.
-        assert_eq!((asked.waited, asked.found.len()), (1, 1));
+        assert_eq!((asked.engine.waited, asked.engine.found.len()), (1, 1));
         // The search costs steps, and the partition is made once.
         let spent = budget.spent();
         assert!(spent > 8, "{spent}");
         assert!(matches!(asked.left(&mut budget), Ok(Left::Value(Some(_)))));
-        assert_eq!(asked.partitions.of.len(), 1);
+        assert_eq!(asked.engine.partitions.of.len(), 1);
         assert_eq!(four().left(&mut Budget::new(spent)).map(|_| ()), Ok(()));
         assert_eq!(
             four().left(&mut Budget::new(spent - 1)).map(|_| ()),
