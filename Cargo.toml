@@ -2,6 +2,14 @@
 name = "subsumes"
 version = "0.1.0"
 edition = "2024"
+description = "JSON Schema inclusion: does one schema accept every instance that is valid under another?"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/georg-wolflein/subsumes"
+readme = "README.md"
+keywords = ["json-schema", "jsonschema", "subsumption", "inclusion", "compatibility"]
+categories = ["development-tools", "web-programming"]
+# What a published crate holds: the library, and not the notes and tools of the repository.
+include = ["/src", "/README.md", "/LICENSE-*"]
 
 [dependencies]
 fluent-uri = "0.4"
