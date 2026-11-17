@@ -22,7 +22,7 @@ use crate::rational::{Rational, common_multiple, is_multiple};
 use crate::term::Term;
 
 /// The numbers that a branch still accepts.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Numbers {
     /// The two ends of the interval. Without one, the interval has no end on that side.
     lower: Option<End>,
@@ -34,10 +34,26 @@ pub(crate) struct Numbers {
     /// The numbers that are not in the set, whatever else lets them be: "not this number"
     /// takes one number out and leaves the rest as it is.
     removed: BTreeSet<Rational>,
+    /// What undoes each change that a term made, the last change last.
+    log: Vec<Undo>,
+}
+
+/// What undoes a change to the numbers of a branch: what there was before it.
+#[derive(Debug, Clone, PartialEq)]
+enum Undo {
+    /// The interval had this end.
+    Lower(Option<End>),
+    Upper(Option<End>),
+    /// Every number was a multiple of this.
+    Multiple(Option<Rational>),
+    /// Multiples of this were not excluded.
+    Excluded(Rational),
+    /// This number was not removed.
+    Removed(Rational),
 }
 
 /// One end of an interval.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct End {
     at: Rational,
     /// Whether the end itself is outside the interval.
@@ -54,22 +70,50 @@ impl Numbers {
             (Term::Max(at), false) | (Term::ExMin(at), true) => self.at_most(at, false),
             (Term::ExMax(at), false) | (Term::Min(at), true) => self.at_most(at, true),
             (Term::Mof(step), false) => {
-                self.multiple = Some(match &self.multiple {
+                let multiple = match &self.multiple {
                     Some(multiple) => common_multiple(multiple, step),
                     None => step.clone(),
-                });
+                };
+                let was = self.multiple.replace(multiple);
+                self.log.push(Undo::Multiple(was));
             }
             (Term::Mof(step), true) => {
-                self.excluded.insert(step.clone());
+                if self.excluded.insert(step.clone()) {
+                    self.log.push(Undo::Excluded(step.clone()));
+                }
             }
             (Term::NumConst(number), false) => {
                 self.at_least(number, false);
                 self.at_most(number, false);
             }
             (Term::NumConst(number), true) => {
-                self.removed.insert(number.clone());
+                if self.removed.insert(number.clone()) {
+                    self.log.push(Undo::Removed(number.clone()));
+                }
             }
             (other, _) => unreachable!("{other:?} is not about numbers"),
+        }
+    }
+
+    /// Where the log of changes is now: a place to which [`Self::undo`] takes the set back.
+    pub fn mark(&self) -> usize {
+        self.log.len()
+    }
+
+    /// Undoes every change since a mark, the last one first.
+    pub fn undo(&mut self, mark: usize) {
+        for undo in self.log.drain(mark..).rev() {
+            match undo {
+                Undo::Lower(was) => self.lower = was,
+                Undo::Upper(was) => self.upper = was,
+                Undo::Multiple(was) => self.multiple = was,
+                Undo::Excluded(step) => {
+                    self.excluded.remove(&step);
+                }
+                Undo::Removed(number) => {
+                    self.removed.remove(&number);
+                }
+            }
         }
     }
 
@@ -84,7 +128,8 @@ impl Numbers {
             });
         if asks_more {
             let at = at.clone();
-            self.lower = Some(End { at, open });
+            let was = self.lower.replace(End { at, open });
+            self.log.push(Undo::Lower(was));
         }
     }
 
@@ -99,13 +144,9 @@ impl Numbers {
             });
         if asks_more {
             let at = at.clone();
-            self.upper = Some(End { at, open });
+            let was = self.upper.replace(End { at, open });
+            self.log.push(Undo::Upper(was));
         }
-    }
-
-    /// How much there is to copy when the branch splits.
-    pub fn weight(&self) -> u64 {
-        (self.excluded.len() + self.removed.len()) as u64
     }
 
     /// What every number of the set is a multiple of, if anything was asked.
@@ -283,8 +324,14 @@ pub(crate) mod testing {
     /// The set that is left when these terms are taken in: `>= 1`, `< 2.5`, `mof 0.5`,
     /// `not mof 2` for no multiple, `= 3` for one number and `!= 3` for any other.
     pub(crate) fn numbers(asked: &[&str]) -> Numbers {
-        let mut terms = Terms::default();
         let mut numbers = Numbers::default();
+        take(&mut numbers, asked);
+        numbers
+    }
+
+    /// Takes such terms into a set.
+    pub(crate) fn take(numbers: &mut Numbers, asked: &[&str]) {
+        let mut terms = Terms::default();
         for asked in asked {
             let (what, at) = asked.rsplit_once(' ').unwrap();
             let at = number(at);
@@ -301,7 +348,6 @@ pub(crate) mod testing {
             };
             numbers.take(terms.term(term), negated);
         }
-        numbers
     }
 
     fn quarters(decimal: &str) -> i64 {
@@ -389,7 +435,7 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
-    use super::testing::{Asked, QUARTERS, numbers};
+    use super::testing::{Asked, QUARTERS, numbers, take};
     use super::*;
     use crate::rational::testing::number;
     use crate::term::Terms;
@@ -541,6 +587,44 @@ mod tests {
             nearest(&[">= 1", "<= 3", "!= 1", "!= 2"], "0.5"),
             some("3/2")
         );
+    }
+
+    #[test]
+    fn what_was_asked_since_a_mark_is_undone() {
+        // Each kind of term more than once, so that some of them ask nothing new.
+        let all = [
+            ">= 1",
+            "> 1",
+            ">= 2",
+            "<= 2.5",
+            "< 2.5",
+            "<= 3",
+            "mof 0.5",
+            "mof 1.5",
+            "not mof 2",
+            "not mof 3",
+            "= 2",
+            "!= 3",
+            "!= 1",
+        ];
+        let random = &mut Random(4);
+        for _ in 0..500 {
+            let mut some = || -> Vec<&str> {
+                let count = random.below(5);
+                (0..count).map(|_| random.pick(&all)).collect()
+            };
+            let (first, second, third) = (some(), some(), some());
+            let mut numbers = numbers(&first);
+            let (mark, was) = (numbers.mark(), numbers.clone());
+            take(&mut numbers, &second);
+            // A mark after a mark, which is undone first.
+            let (inner, then) = (numbers.mark(), numbers.clone());
+            take(&mut numbers, &third);
+            numbers.undo(inner);
+            assert_eq!(numbers, then, "{first:?} {second:?} {third:?}");
+            numbers.undo(mark);
+            assert_eq!(numbers, was, "{first:?} {second:?} {third:?}");
+        }
     }
 
     #[test]

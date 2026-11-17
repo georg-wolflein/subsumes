@@ -19,17 +19,31 @@ use crate::language::{LanguageId, Languages, Lengths};
 use crate::term::Term;
 
 /// The strings that a branch still accepts.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Strings {
     /// The languages that a string is in, and those that it is not in.
     within: BTreeSet<LanguageId>,
     without: BTreeSet<LanguageId>,
-    /// What those of them leave that were put together so far, and those that were not:
-    /// each with whether it is asked against, and whether it is one string.
+    /// The same languages in the order in which they were asked: each with whether it is
+    /// asked against, and whether it is one string.
+    asked: Vec<(LanguageId, bool, Option<Rc<str>>)>,
+    /// What the first of them leave together, and how many those are. The others are put
+    /// together when the branch asks whether a string is left.
     left: LanguageId,
-    fresh: Vec<(LanguageId, bool, Option<Rc<str>>)>,
+    together: usize,
     lengths: Lengths,
     /// Whether what was asked leaves no string on the face of it.
+    none: bool,
+}
+
+/// The strings of a branch as they were at some time: what [`Strings::undo`] takes them
+/// back to. The languages only grow in number, so of them it is how many there were.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Mark {
+    asked: usize,
+    left: LanguageId,
+    together: usize,
+    lengths: Lengths,
     none: bool,
 }
 
@@ -38,8 +52,9 @@ impl Default for Strings {
         Self {
             within: BTreeSet::new(),
             without: BTreeSet::new(),
+            asked: Vec::new(),
             left: Languages::EVERYTHING,
-            fresh: Vec::new(),
+            together: 0,
             lengths: Lengths::ANY,
             none: false,
         }
@@ -82,18 +97,44 @@ impl Strings {
         if against.contains(&language) {
             self.none = true;
         } else if asked.insert(language) {
-            self.fresh
+            self.asked
                 .push((language, negated, one_string.map(Rc::from)));
         }
     }
 
-    fn at_most(&mut self, most: u64) {
-        self.lengths.max = Some(self.lengths.max.map_or(most, |max| max.min(most)));
+    pub fn mark(&self) -> Mark {
+        Mark {
+            asked: self.asked.len(),
+            left: self.left,
+            together: self.together,
+            lengths: self.lengths,
+            none: self.none,
+        }
     }
 
-    /// How much there is to copy when the branch splits.
-    pub fn weight(&self) -> u64 {
-        (self.within.len() + self.without.len()) as u64
+    /// Undoes everything that was asked since a mark.
+    pub fn undo(&mut self, mark: Mark) {
+        let Mark {
+            asked,
+            left,
+            together,
+            lengths,
+            none,
+        } = mark;
+        for (language, negated, _) in self.asked.drain(asked..) {
+            let asked = if negated {
+                &mut self.without
+            } else {
+                &mut self.within
+            };
+            asked.remove(&language);
+        }
+        (self.left, self.together) = (left, together);
+        (self.lengths, self.none) = (lengths, none);
+    }
+
+    fn at_most(&mut self, most: u64) {
+        self.lengths.max = Some(self.lengths.max.map_or(most, |max| max.min(most)));
     }
 
     /// The language that is left when everything that was asked is put together.
@@ -109,7 +150,8 @@ impl Strings {
         // in words, and a DFA would take them in one by one.
         let mut fresh = Languages::EVERYTHING;
         let mut taken_out: Vec<&str> = Vec::new();
-        for (language, negated, one_string) in &self.fresh {
+        let asked = &self.asked[self.together..];
+        for (language, negated, one_string) in asked {
             match one_string {
                 Some(word) if *negated => taken_out.push(word),
                 Some(_) => fresh = languages.intersection(fresh, *language, budget)?,
@@ -123,7 +165,7 @@ impl Strings {
             let others = languages.complement(these, budget)?;
             fresh = languages.intersection(fresh, others, budget)?;
         }
-        let patterns = self.fresh.iter().filter(|asked| asked.2.is_none());
+        let patterns = asked.iter().filter(|asked| asked.2.is_none());
         for (language, negated, _) in patterns {
             // Once no string is left, the rest is not worth a DFA.
             if fresh == Languages::NOTHING {
@@ -153,7 +195,7 @@ impl Strings {
             return Ok(true);
         }
         self.left = self.settled(languages, budget)?;
-        self.fresh.clear();
+        self.together = self.asked.len();
         languages.is_empty(self.left, self.lengths, budget)
     }
 
@@ -201,13 +243,20 @@ impl Strings {
 mod tests {
     use super::*;
     use crate::term::Terms;
+    use crate::testing::Random;
 
     /// The set that is left when these are asked: `in ^a` and `not in ^a` for a pattern,
     /// `= a` and `!= a` for one string, `>= 2` and `<= 2` for a length, and `not >= 2` and
     /// `not <= 2` for the two negated.
     fn strings(asked: &[&str], languages: &mut Languages) -> Strings {
-        let mut terms = Terms::default();
         let mut strings = Strings::default();
+        take(&mut strings, asked, languages);
+        strings
+    }
+
+    /// Takes such terms into a set.
+    fn take(strings: &mut Strings, asked: &[&str], languages: &mut Languages) {
+        let mut terms = Terms::default();
         for asked in asked {
             let (what, of) = asked.rsplit_once(' ').unwrap();
             let count = || of.parse().unwrap();
@@ -224,7 +273,6 @@ mod tests {
             };
             strings.take(terms.term(term), negated, languages);
         }
-        strings
     }
 
     /// The shortest string of the set.
@@ -298,6 +346,55 @@ mod tests {
         assert_eq!(given(&same), None);
         // What one string says is seen without a DFA too.
         assert_eq!(is_empty(&["= a", "<= 1"]), Ok(false));
+    }
+
+    #[test]
+    fn what_was_asked_since_a_mark_is_undone() {
+        // Each kind of term more than once, so that some of them ask nothing new.
+        let all = [
+            "in ^a",
+            "not in ^a",
+            "in b$",
+            "not in b$",
+            "= ab",
+            "!= ab",
+            "!= a",
+            ">= 1",
+            ">= 2",
+            "not >= 3",
+            "<= 4",
+            "<= 3",
+            "not <= 1",
+        ];
+        let (languages, random) = (&mut Languages::default(), &mut Random(5));
+        let budget = &mut Budget::new(u64::MAX);
+        for _ in 0..500 {
+            let mut some = || -> (Vec<&str>, bool) {
+                let count = random.below(5);
+                let asked = (0..count).map(|_| random.pick(&all)).collect();
+                (asked, random.chance(50))
+            };
+            let (first, second, third) = (some(), some(), some());
+            // After some of what is asked, the set is asked whether a string is left,
+            // which puts the languages together.
+            let mut ask = |strings: &mut Strings, (asked, is_empty): &(Vec<&str>, bool)| {
+                take(strings, asked, languages);
+                if *is_empty {
+                    strings.is_empty(languages, budget).unwrap();
+                }
+            };
+            let mut strings = Strings::default();
+            ask(&mut strings, &first);
+            let (mark, was) = (strings.mark(), strings.clone());
+            ask(&mut strings, &second);
+            // A mark after a mark, which is undone first.
+            let (inner, then) = (strings.mark(), strings.clone());
+            ask(&mut strings, &third);
+            strings.undo(inner);
+            assert_eq!(strings, then, "{first:?} {second:?} {third:?}");
+            strings.undo(mark);
+            assert_eq!(strings, was, "{first:?} {second:?} {third:?}");
+        }
     }
 
     #[test]

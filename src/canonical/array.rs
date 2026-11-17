@@ -44,7 +44,7 @@ use crate::normalize::{Cause, DEEPEST, Found, Witness};
 use crate::term::{CRefId, Term, Terms};
 
 /// The arrays that a branch still accepts.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Arrays {
     /// What the item at each of the first positions satisfies.
     head: Vec<CRefId>,
@@ -58,6 +58,31 @@ pub(crate) struct Arrays {
     max: Option<u64>,
     /// Whether what was asked leaves no array on the face of it.
     none: bool,
+    /// What undoes each change to the head and to the items that there have to be, the
+    /// last change last.
+    log: Vec<Undo>,
+}
+
+/// What undoes a change to the arrays of a branch.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Undo {
+    /// The item at this position of the head satisfied this.
+    Head(usize, CRefId),
+    /// This item did not have to be there.
+    Some(u64, CRefId),
+}
+
+/// The arrays of a branch as they were at some time: what [`Arrays::undo`] takes them back
+/// to. The head only grows longer, so of it this is its length, and what its items
+/// satisfied is in the log.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Mark {
+    log: usize,
+    head: usize,
+    tail: CRefId,
+    min: u64,
+    max: Option<u64>,
+    none: bool,
 }
 
 impl Default for Arrays {
@@ -69,6 +94,7 @@ impl Default for Arrays {
             min: 0,
             max: None,
             none: false,
+            log: Vec::new(),
         }
     }
 }
@@ -130,7 +156,17 @@ impl Arrays {
         if self.head.len() <= position {
             self.head.resize(position + 1, self.tail);
         }
-        self.head[position] = terms.both(self.head[position], of);
+        self.narrow(position, of, terms);
+    }
+
+    /// The item at a position of the head satisfies this besides.
+    fn narrow(&mut self, position: usize, of: CRefId, terms: &mut Terms) {
+        let was = self.head[position];
+        let both = terms.both(was, of);
+        if both != was {
+            self.head[position] = both;
+            self.log.push(Undo::Head(position, was));
+        }
     }
 
     /// Every item from a position on satisfies this.
@@ -139,8 +175,8 @@ impl Arrays {
         if self.head.len() < from {
             self.head.resize(from, self.tail);
         }
-        for item in &mut self.head[from..] {
-            *item = terms.both(*item, of);
+        for position in from..self.head.len() {
+            self.narrow(position, of, terms);
         }
         self.tail = terms.both(self.tail, of);
     }
@@ -152,17 +188,53 @@ impl Arrays {
             // Any value will do, so there only has to be an item.
             Terms::ANYTHING => self.min = self.min.max(from.saturating_add(1)),
             _ => {
-                self.some.insert((from, of));
+                if self.some.insert((from, of)) {
+                    self.log.push(Undo::Some(from, of));
+                }
             }
         }
+    }
+
+    pub fn mark(&self) -> Mark {
+        Mark {
+            log: self.log.len(),
+            head: self.head.len(),
+            tail: self.tail,
+            min: self.min,
+            max: self.max,
+            none: self.none,
+        }
+    }
+
+    /// Undoes everything that was asked since a mark, the last change first.
+    pub fn undo(&mut self, mark: Mark) {
+        let Mark {
+            log,
+            head,
+            tail,
+            min,
+            max,
+            none,
+        } = mark;
+        for undo in self.log.drain(log..).rev() {
+            match undo {
+                Undo::Head(position, was) => self.head[position] = was,
+                Undo::Some(from, of) => {
+                    self.some.remove(&(from, of));
+                }
+            }
+        }
+        // The positions that the head has since then go last: the log names them too.
+        self.head.truncate(head);
+        (self.tail, self.min, self.max, self.none) = (tail, min, max, none);
     }
 
     fn at_most(&mut self, most: u64) {
         self.max = Some(self.max.map_or(most, |max| max.min(most)));
     }
 
-    /// How much there is to copy when the branch splits, and to look at when a term about
-    /// every item from a position on is taken in.
+    /// How much there is to look at when a term about every item from a position on is
+    /// taken in.
     pub fn weight(&self) -> u64 {
         (self.head.len() + self.some.len()) as u64
     }
@@ -528,6 +600,30 @@ mod tests {
         assert_eq!(three.given(), Ok(json!([null, null, null])));
         assert_eq!(Asked::new().count(1, Some(1)).given(), Ok(json!([null])));
         assert_eq!(Asked::new().count(2, Some(1)).given(), none());
+    }
+
+    #[test]
+    fn what_was_asked_since_a_mark_is_undone() {
+        let asked = Asked::new().at(1, &[2]).from(1, &[5]).some(0, &[4]);
+        let asked = asked.count(1, Some(6));
+        let (mark, was) = (asked.arrays.mark(), asked.arrays.clone());
+        // Something of each kind: at a position that the head has and at one that it gets
+        // to, from a position on, an item that has to be there and one that was asked for
+        // before, and other bounds.
+        let asked = asked.at(1, &[3]).at(3, &[2]).from(0, &[2]);
+        let asked = asked.some(0, &[4]).some(2, &[5]).count(2, Some(4));
+        assert_ne!(asked.arrays, was);
+        // A mark after a mark, which is undone first. No value satisfies 2 and not 2,
+        // which leaves no array on the face of it.
+        let (inner, then) = (asked.arrays.mark(), asked.arrays.clone());
+        let asked = asked.from(2, &[4]).at(5, &[3]).some(1, &[2, -2]);
+        let mut asked = asked.some(7, &[]).term(2, |_| Term::MaxIts(3));
+        assert!(asked.arrays.none);
+        asked.arrays.undo(inner);
+        assert_eq!(asked.arrays, then);
+        asked.arrays.undo(mark);
+        assert_eq!(asked.arrays, was);
+        assert_eq!(asked.given(), Ok(json!(["4"])));
     }
 
     #[test]
