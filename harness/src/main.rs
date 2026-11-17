@@ -5,6 +5,7 @@ mod patterns;
 mod results;
 mod run;
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::{env, fs};
@@ -48,6 +49,11 @@ struct RunArguments {
     corpus: PathBuf,
     /// The results file to write.
     results: PathBuf,
+    /// How many cases are checked at once. With one, the cases are checked one after the
+    /// other, and the times of the checks can be held against those of another run. More is
+    /// faster, and the times are then no more than a hint.
+    #[arg(long, value_name = "COUNT", default_value_t = NonZeroUsize::MIN)]
+    jobs: NonZeroUsize,
 }
 
 #[derive(Args)]
@@ -96,7 +102,7 @@ fn main() -> ExitCode {
 }
 
 fn run(arguments: &RunArguments) -> Result<bool, String> {
-    let records = run::run(&arguments.corpus)?;
+    let records = run::run(&arguments.corpus, arguments.jobs)?;
     if let Some(folder) = arguments.results.parent() {
         fs::create_dir_all(folder)
             .map_err(|error| format!("cannot create {}: {error}", folder.display()))?;
