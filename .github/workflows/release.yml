@@ -1,0 +1,76 @@
+name: Release
+
+# release-please keeps one pull request open that raises the version by what the commits on
+# main since the last release call for; release-please-config.json says how. Merging that
+# pull request is the release: this workflow then tags the merged commit v<version> and
+# publishes the crate to crates.io from that commit.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# One run at a time. A run that waits is replaced by the run of a newer push, which then
+# does the work of both.
+concurrency: release
+
+jobs:
+  # Opens or updates the release pull request. On the push that merges it, creates the tag
+  # and a draft of the release instead. It acts as a GitHub App: a pull request opened with
+  # this workflow's own token would not start the checks that a merge requires.
+  release-please:
+    if: vars.PR_BOT_CLIENT_ID != ''
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: app
+        with:
+          client-id: ${{ vars.PR_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.PR_BOT_PRIVATE_KEY }}
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+        with:
+          token: ${{ steps.app.outputs.token }}
+
+  # The release stays a draft until crates.io has the crate, so that a release that can be
+  # seen is always one that can be installed. The checks ran on the release pull request
+  # before it was merged.
+  publish:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to publish the draft of the release
+      id-token: write # to show crates.io which workflow asks
+    env:
+      TAG: ${{ needs.release-please.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release-please.outputs.tag }} # not always the commit of this run
+      # No token is stored: crates.io trusts this workflow of this repository, and gives it
+      # a token that lasts as long as the job.
+      - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+        id: crates-io
+      - name: Publish the crate to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io.outputs.token }}
+        # A version cannot be published twice. One that is there already, from an earlier
+        # attempt, is left as it is.
+        run: |
+          version="${TAG#v}"
+          if curl --silent --fail --output /dev/null --user-agent "$GITHUB_REPOSITORY" \
+              "https://crates.io/api/v1/crates/subsumes/$version"; then
+            echo "subsumes $version is on crates.io already"
+          else
+            cargo publish --locked --package subsumes
+          fi
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$TAG" --draft=false
