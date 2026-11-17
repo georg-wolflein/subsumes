@@ -44,7 +44,7 @@ use crate::normalize::{Cause, DEEPEST, Found, Witness};
 use crate::term::{CRefId, Term, Terms};
 
 /// The objects that a branch still accepts.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Objects {
     /// What the value of every property with a name of a language satisfies.
     every: BTreeSet<(LanguageId, CRefId)>,
@@ -55,6 +55,25 @@ pub(crate) struct Objects {
     min: u64,
     max: Option<u64>,
     /// Whether what was asked leaves no object on the face of it.
+    none: bool,
+    /// What was put into the two sets, the last one last.
+    log: Vec<Added>,
+}
+
+/// What was asked of the properties of an object and had not been asked before.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Added {
+    Every(LanguageId, CRefId),
+    Some(LanguageId, CRefId),
+}
+
+/// The objects of a branch as they were at some time: what [`Objects::undo`] takes them
+/// back to. The two sets only grow, so of them it is how much had been put into them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Mark {
+    log: usize,
+    min: u64,
+    max: Option<u64>,
     none: bool,
 }
 
@@ -110,7 +129,9 @@ impl Objects {
         if there.any(|(_, other)| terms.both(of, *other) == Terms::NOTHING) {
             self.none = true;
         }
-        self.every.insert((names, of));
+        if self.every.insert((names, of)) {
+            self.log.push(Added::Every(names, of));
+        }
     }
 
     fn some(&mut self, names: LanguageId, of: CRefId, terms: &mut Terms) {
@@ -123,16 +144,39 @@ impl Objects {
         {
             self.none = true;
         }
-        self.some.insert((names, of));
+        if self.some.insert((names, of)) {
+            self.log.push(Added::Some(names, of));
+        }
+    }
+
+    pub fn mark(&self) -> Mark {
+        Mark {
+            log: self.log.len(),
+            min: self.min,
+            max: self.max,
+            none: self.none,
+        }
+    }
+
+    /// Undoes everything that was asked since a mark.
+    pub fn undo(&mut self, mark: Mark) {
+        let Mark {
+            log,
+            min,
+            max,
+            none,
+        } = mark;
+        for added in self.log.drain(log..) {
+            match added {
+                Added::Every(names, of) => self.every.remove(&(names, of)),
+                Added::Some(names, of) => self.some.remove(&(names, of)),
+            };
+        }
+        (self.min, self.max, self.none) = (min, max, none);
     }
 
     fn at_most(&mut self, most: u64) {
         self.max = Some(self.max.map_or(most, |max| max.min(most)));
-    }
-
-    /// How much there is to copy when the branch splits.
-    pub fn weight(&self) -> u64 {
-        (self.every.len() + self.some.len()) as u64
     }
 
     /// Whether an object is left, and with `give` such an object.
@@ -689,6 +733,27 @@ mod tests {
             Ok(json!({"a": null}))
         );
         assert_eq!(Asked::new().count(2, Some(1)).given(), none());
+    }
+
+    #[test]
+    fn what_was_asked_since_a_mark_is_undone() {
+        let asked = Asked::new().every("^a", &[2]).some("=a", &[4]);
+        let asked = asked.count(1, Some(5));
+        let (mark, was) = (asked.objects.mark(), asked.objects.clone());
+        // What was asked before once more, and something new of each kind.
+        let asked = asked.every("^a", &[2]).every("^b", &[3]);
+        let asked = asked.some("=a", &[4]).some("=b", &[5]).count(2, Some(4));
+        assert_ne!(asked.objects, was);
+        // A mark after a mark, which is undone first. No value satisfies 2 and not 2,
+        // which leaves no object on the face of it.
+        let (inner, then) = (asked.objects.mark(), asked.objects.clone());
+        let mut asked = asked.some("^a", &[-2]).none("^c").count(3, Some(3));
+        assert!(asked.objects.none);
+        asked.objects.undo(inner);
+        assert_eq!(asked.objects, then);
+        asked.objects.undo(mark);
+        assert_eq!(asked.objects, was);
+        assert_eq!(asked.given(), Ok(json!({"a": "2 4"})));
     }
 
     #[test]

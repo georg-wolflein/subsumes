@@ -16,6 +16,11 @@
 //! number among its instances, and when one does, that number is an instance. So it is with
 //! strings.
 //!
+//! The alternatives of a split are followed one after the other, each to its end. So the
+//! branches of a split are never there at one time, and they are one branch that is changed
+//! in place: a split marks how the branch is, and for each alternative the branch is taken
+//! back to the mark, which undoes what the alternative before made of it.
+//!
 //! # Values inside an instance
 //!
 //! What a branch says about objects is about the values of their properties, and what it
@@ -45,10 +50,10 @@ use std::rc::Rc;
 
 use serde_json::Value;
 
-use crate::canonical::array::Arrays;
+use crate::canonical::array::{self, Arrays};
 use crate::canonical::number::Numbers;
-use crate::canonical::object::{Objects, Partitions};
-use crate::canonical::string::Strings;
+use crate::canonical::object::{self, Objects, Partitions};
+use crate::canonical::string::{self, Strings};
 use crate::canonical::{Left, Solver};
 use crate::context::{Context, Exhausted};
 use crate::generate;
@@ -141,7 +146,7 @@ pub(crate) fn decide(context: &mut Context, a: VarId, b: VarId) -> Result<Outcom
 }
 
 /// A term that a branch has yet to take in, as it is or negated.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct Item {
     term: TermId,
     negated: bool,
@@ -171,7 +176,9 @@ struct Unfolding {
     within: Option<usize>,
 }
 
-#[derive(Debug, Clone)]
+/// A branch is changed in place. It says more with every term that it takes in, and what
+/// it says is taken back when the search returns to a split: see [`Branch::undo`].
+#[derive(Debug, Clone, PartialEq)]
 struct Branch {
     /// The types that an instance may still have.
     types: TypeSet,
@@ -208,8 +215,46 @@ struct Branch {
     /// to waits behind everything that was there before, so that a variable meets its own
     /// negation before either is opened.
     todo: VecDeque<Item>,
-    /// The disjunctions that were met and not split yet.
-    choices: VecDeque<Item>,
+    /// The disjunctions that were met, in the order in which they came up, and how many
+    /// of the first of them were split.
+    choices: Vec<Item>,
+    split: usize,
+    /// What was put into the sets of leaves and of variables, the last one last.
+    log: Vec<Added>,
+}
+
+/// What a branch put into one of its sets and had not been there before.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Added {
+    Holds(LeafId),
+    Fails(LeafId),
+    Taken(VarId, bool),
+    Met(usize, usize),
+}
+
+/// A branch as it was at some time: what [`Branch::undo`] takes it back to.
+///
+/// What a branch says in a few words is kept here as it was. Its sets only grow, so of
+/// them the mark keeps how much had been put into them, and each part of the branch keeps
+/// a mark of its own in the same way.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Mark {
+    types: TypeSet,
+    booleans: [bool; 2],
+    covered: TypeSet,
+    numbers_asked: bool,
+    strings_asked: bool,
+    objects_asked: bool,
+    objects_depend: Option<Cause>,
+    arrays_asked: bool,
+    arrays_depend: Option<Cause>,
+    choices: usize,
+    split: usize,
+    log: usize,
+    numbers: usize,
+    strings: string::Mark,
+    objects: object::Mark,
+    arrays: array::Mark,
 }
 
 impl Default for Branch {
@@ -233,7 +278,9 @@ impl Default for Branch {
             taken: BTreeMap::new(),
             met: BTreeSet::new(),
             todo: VecDeque::new(),
-            choices: VecDeque::new(),
+            choices: Vec::new(),
+            split: 0,
+            log: Vec::new(),
         }
     }
 }
@@ -245,15 +292,6 @@ const ARRAY: TypeSet = TypeSet::of(InstanceType::Array);
 const OBJECT: TypeSet = TypeSet::of(InstanceType::Object);
 
 impl Branch {
-    /// How much there is to copy when the branch splits.
-    fn weight(&self) -> u64 {
-        let leaves = self.holds.len() + self.fails.len();
-        let variables = self.taken.len() + self.met.len();
-        let copied = (leaves + variables + self.choices.len()) as u64;
-        let values = self.objects.weight() + self.arrays.weight();
-        copied + self.numbers.weight() + self.strings.weight() + values
-    }
-
     /// Keeps only instances of these types. Returns whether any are left.
     fn restrict(&mut self, types: TypeSet) -> bool {
         self.types = self.types.intersection(types);
@@ -275,13 +313,100 @@ impl Branch {
         let about = terms.leaf(leaf).domain;
         if negated {
             // A leaf fails only for an instance that it is about.
-            self.fails.insert(leaf);
+            if self.fails.insert(leaf) {
+                self.log.push(Added::Fails(leaf));
+            }
             self.restrict(about) && !self.holds.contains(&leaf)
         } else {
-            self.holds.insert(leaf);
-            self.covered = self.covered.union(about);
+            self.hold(leaf, about);
             !self.fails.contains(&leaf)
         }
+    }
+
+    /// Takes in a leaf that must hold and is about these types.
+    fn hold(&mut self, leaf: LeafId, about: TypeSet) {
+        if self.holds.insert(leaf) {
+            self.log.push(Added::Holds(leaf));
+        }
+        self.covered = self.covered.union(about);
+    }
+
+    /// The next disjunction that was met and not split yet, which is split now.
+    fn choice(&mut self) -> Option<Item> {
+        let choice = self.choices.get(self.split).copied()?;
+        self.split += 1;
+        Some(choice)
+    }
+
+    /// The branch as it is now. Nothing is still to be taken in then: a branch is marked
+    /// where it splits.
+    fn mark(&self) -> Mark {
+        debug_assert!(
+            self.todo.is_empty(),
+            "a branch that splits has taken in everything"
+        );
+        Mark {
+            types: self.types,
+            booleans: self.booleans,
+            covered: self.covered,
+            numbers_asked: self.numbers_asked,
+            strings_asked: self.strings_asked,
+            objects_asked: self.objects_asked,
+            objects_depend: self.objects_depend,
+            arrays_asked: self.arrays_asked,
+            arrays_depend: self.arrays_depend,
+            choices: self.choices.len(),
+            split: self.split,
+            log: self.log.len(),
+            numbers: self.numbers.mark(),
+            strings: self.strings.mark(),
+            objects: self.objects.mark(),
+            arrays: self.arrays.mark(),
+        }
+    }
+
+    /// Takes the branch back to a mark: undoes everything that it took in since then.
+    fn undo(&mut self, mark: Mark) {
+        let Mark {
+            types,
+            booleans,
+            covered,
+            numbers_asked,
+            strings_asked,
+            objects_asked,
+            objects_depend,
+            arrays_asked,
+            arrays_depend,
+            choices,
+            split,
+            log,
+            numbers,
+            strings,
+            objects,
+            arrays,
+        } = mark;
+        (self.types, self.booleans, self.covered) = (types, booleans, covered);
+        (self.numbers_asked, self.strings_asked) = (numbers_asked, strings_asked);
+        (self.objects_asked, self.objects_depend) = (objects_asked, objects_depend);
+        (self.arrays_asked, self.arrays_depend) = (arrays_asked, arrays_depend);
+        for added in self.log.drain(log..) {
+            match added {
+                Added::Holds(leaf) => self.holds.remove(&leaf),
+                Added::Fails(leaf) => self.fails.remove(&leaf),
+                Added::Taken(variable, negated) => {
+                    self.taken.remove(&(variable, negated)).is_some()
+                }
+                Added::Met(open, from) => self.met.remove(&(open, from)),
+            };
+        }
+        // A branch that was refuted may have left terms that it did not take in.
+        self.todo.clear();
+        self.choices.truncate(choices);
+        self.split = split;
+        self.numbers.undo(numbers);
+        self.strings.undo(strings);
+        self.objects.undo(objects);
+        self.arrays.undo(arrays);
     }
 
     /// The types of which the branch is known to accept an instance if it stands: no leaf
@@ -319,16 +444,56 @@ impl Branch {
     }
 }
 
+/// A place where a branch splits: a disjunction, of which it follows one alternative at a
+/// time.
+struct Split {
+    /// The branch as it was when it came here, to which it is taken back for each
+    /// alternative.
+    mark: Mark,
+    /// The alternatives that are still to come, each made when it is asked for.
+    still_to_come: Box<dyn Iterator<Item = Alternative>>,
+    /// A copy of the branch as it was, which a debug build holds the branch against
+    /// whenever it is taken back.
+    #[cfg(debug_assertions)]
+    was: Branch,
+}
+
+impl Split {
+    fn at(branch: &Branch, alternatives: Box<dyn Iterator<Item = Alternative>>) -> Self {
+        Self {
+            mark: branch.mark(),
+            still_to_come: alternatives,
+            #[cfg(debug_assertions)]
+            was: branch.clone(),
+        }
+    }
+
+    /// Takes a branch back to where it split.
+    fn back(&self, branch: &mut Branch) {
+        branch.undo(self.mark);
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            *branch, self.was,
+            "what is undone leaves a branch as it was"
+        );
+    }
+}
+
 /// A c-reference that is being decided: the search for an instance that satisfies it.
 struct Task {
     of: CRefId,
-    /// A branch that was split, with the alternatives of the split that are still to come.
-    /// The last split is the one at work: each of its alternatives is followed to its end
-    /// before the next is made, so an instance is found without the alternatives after it,
-    /// and a long `oneOf` is never written out. The task begins as a split in one.
-    splits: Vec<(Branch, Box<dyn Iterator<Item = Alternative>>)>,
-    /// A branch that waits for the engine to decide the c-references that it asked for.
-    waiting: Option<Branch>,
+    /// The one branch of the task. It follows an alternative of its last split as far as
+    /// that goes, and is taken back to the split for the next.
+    branch: Branch,
+    /// The splits that the branch is past, each with the alternatives that are still to
+    /// come. The last split is the one at work: each of its alternatives is followed to
+    /// its end before the next is made, so an instance is found without the alternatives
+    /// after it, and a long `oneOf` is never written out. The task begins as a split in
+    /// one.
+    splits: Vec<Split>,
+    /// Whether the branch waits for the engine to decide the c-references that it asked
+    /// for.
+    waiting: bool,
     wanted: Vec<CRefId>,
     /// What some branch depends on, once there is such a branch. From then on the answer
     /// is not that nothing satisfies the c-reference.
@@ -440,11 +605,14 @@ impl Engine<'_> {
             }
         }
         let whole: Box<dyn Iterator<Item = Alternative>> = Box::new(std::iter::once(whole));
+        let branch = Branch::default();
+        let splits = vec![Split::at(&branch, whole)];
         self.at_work.insert(of, self.tasks.len());
         self.tasks.push(Task {
             of,
-            splits: vec![(Branch::default(), whole)],
-            waiting: None,
+            branch,
+            splits,
+            waiting: false,
             wanted: Vec::new(),
             depends_on: None,
             lowest: usize::MAX,
@@ -506,51 +674,60 @@ impl Engine<'_> {
     /// Follows one alternative of the task at work as far as it goes without a split.
     /// Returns what the task found, if that ended it.
     fn step(&mut self) -> Result<Option<Found>, Exhausted> {
+        // The branch is out of its task while it is worked on, and goes back after.
         let task = self.tasks.last_mut().expect("a task is at work");
-        let mut branch = match task.waiting.take() {
-            Some(branch) => branch,
-            None => {
-                let depends = task.depends_on;
-                let Some((split, still_to_come)) = task.splits.last_mut() else {
-                    // Every alternative was followed to its end.
-                    return Ok(Some(depends.map_or(Found::Nothing, Found::Unknown)));
-                };
-                let alternative = if depends.is_some() && split.free().is_empty() {
-                    None
-                } else {
-                    still_to_come.next()
-                };
-                let Some(alternative) = alternative else {
-                    task.splits.pop();
-                    return Ok(None);
-                };
-                self.context.budget.charge(1 + split.weight() / 32)?;
-                let mut branch = split.clone();
-                branch.todo.extend(alternative);
-                branch
-            }
-        };
-        match self.settle(&mut branch)? {
+        let mut branch = std::mem::take(&mut task.branch);
+        let found = self.follow(&mut branch);
+        let task = self.tasks.last_mut().expect("a task is at work");
+        task.branch = branch;
+        found
+    }
+
+    /// What [`Self::step`] does, with the branch of the task at work.
+    fn follow(&mut self, branch: &mut Branch) -> Result<Option<Found>, Exhausted> {
+        let task = self.tasks.last_mut().expect("a task is at work");
+        // A branch that waited goes on from where it is. Any other is taken back to its
+        // last split, and takes the next alternative from there.
+        if !std::mem::take(&mut task.waiting) {
+            let depends = task.depends_on;
+            let Some(split) = task.splits.last_mut() else {
+                // Every alternative was followed to its end.
+                return Ok(Some(depends.map_or(Found::Nothing, Found::Unknown)));
+            };
+            split.back(branch);
+            let alternative = if depends.is_some() && branch.free().is_empty() {
+                None
+            } else {
+                split.still_to_come.next()
+            };
+            let Some(alternative) = alternative else {
+                task.splits.pop();
+                return Ok(None);
+            };
+            self.context.budget.charge(1)?;
+            branch.todo.extend(alternative);
+        }
+        match self.settle(branch)? {
             Settled::Refuted => return Ok(None),
             Settled::Needs(wanted) => {
-                self.wait(branch, wanted);
+                self.wait(wanted);
                 return Ok(None);
             }
             Settled::Stands => {}
         }
-        if self.is_hopeless(&branch) {
+        if self.is_hopeless(branch) {
             return Ok(None);
         }
-        if let Some(choice) = branch.choices.pop_front() {
+        if let Some(choice) = branch.choice() {
             let alternatives = alternatives(&self.context.terms, &choice);
             let task = self.tasks.last_mut().expect("a task is at work");
-            task.splits.push((branch, alternatives));
+            task.splits.push(Split::at(branch, alternatives));
             return Ok(None);
         }
         // Nothing is left to take in, and the branch stands.
-        match self.instance(&branch)? {
+        match self.instance(branch)? {
             Given::Instance(witness) => return Ok(Some(Found::Instance(witness))),
-            Given::Needs(wanted) => self.wait(branch, wanted),
+            Given::Needs(wanted) => self.wait(wanted),
             Given::Depends(cause) => {
                 let task = self.tasks.last_mut().expect("a task is at work");
                 task.depends_on.get_or_insert(cause);
@@ -559,10 +736,10 @@ impl Engine<'_> {
         Ok(None)
     }
 
-    /// Lets a branch of the task at work wait for c-references to be decided.
-    fn wait(&mut self, branch: Branch, wanted: Vec<CRefId>) {
+    /// Lets the branch of the task at work wait for c-references to be decided.
+    fn wait(&mut self, wanted: Vec<CRefId>) {
         let task = self.tasks.last_mut().expect("a task is at work");
-        (task.waiting, task.wanted) = (Some(branch), wanted);
+        (task.waiting, task.wanted) = (true, wanted);
     }
 
     /// Whether a branch of the task at work can be left alone: the task will not find that
@@ -825,7 +1002,7 @@ impl Engine<'_> {
                 true
             }
             (Term::AnyOf(_), false) | (Term::AllOf(_), true) | (Term::OneOf(_), _) => {
-                branch.choices.push_back(item);
+                branch.choices.push(item);
                 true
             }
             (Term::Not(inner), _) => {
@@ -886,22 +1063,23 @@ impl Engine<'_> {
             Item::new(terms.reference(variable), false),
         ];
         let whole: Box<dyn Iterator<Item = Alternative>> = Box::new(std::iter::once(whole));
-        let mut splits = vec![(Branch::default(), whole)];
+        let mut branch = Branch::default();
+        let mut splits = vec![Split::at(&branch, whole)];
         let mut all = Some(Languages::NOTHING);
-        while let Some((split, still_to_come)) = splits.last_mut() {
-            let (Some(alternative), Some(so_far)) = (still_to_come.next(), all) else {
+        while let Some(split) = splits.last_mut() {
+            let (Some(alternative), Some(so_far)) = (split.still_to_come.next(), all) else {
                 splits.pop();
                 continue;
             };
-            self.context.budget.charge(1 + split.weight() / 32)?;
-            let mut branch = split.clone();
+            split.back(&mut branch);
+            self.context.budget.charge(1)?;
             branch.todo.extend(alternative);
             if !matches!(self.settle(&mut branch)?, Settled::Stands) {
                 continue;
             }
-            if let Some(choice) = branch.choices.pop_front() {
+            if let Some(choice) = branch.choice() {
                 let alternatives = alternatives(&self.context.terms, &choice);
-                splits.push((branch, alternatives));
+                splits.push(Split::at(&branch, alternatives));
                 continue;
             }
             let Context {
@@ -955,8 +1133,8 @@ impl Engine<'_> {
             }
             if self.leads_to(branch, open, from, false)? {
                 self.depend_on_recursion(branch, variable, from);
-            } else {
-                branch.met.insert((open, from));
+            } else if branch.met.insert((open, from)) {
+                branch.log.push(Added::Met(open, from));
             }
             return Ok(true);
         }
@@ -967,6 +1145,7 @@ impl Engine<'_> {
             within,
         });
         branch.taken.insert((variable, negated), unfolding);
+        branch.log.push(Added::Taken(variable, negated));
         branch.todo.push_back(Item {
             term: self.context.terms.variable(variable).body,
             negated,
@@ -1009,8 +1188,7 @@ impl Engine<'_> {
         let closes = self.unfoldings[from].variable;
         let closes = self.context.terms.variable(closes).node;
         let leaf = self.context.terms.recursion(variable, closes);
-        branch.holds.insert(leaf);
-        branch.covered = TypeSet::ALL;
+        branch.hold(leaf, TypeSet::ALL);
     }
 }
 
