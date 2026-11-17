@@ -39,6 +39,7 @@ use serde_json::{Map, Value};
 use super::search::{self, Place, Placed, Places, Slot};
 use super::{Left, Solver, State, state};
 use crate::context::{Budget, Exhausted};
+use crate::flat::FlatSet;
 use crate::language::{LanguageId, Languages, Lengths, Shape};
 use crate::normalize::{Cause, DEEPEST, Found, Witness};
 use crate::term::{CRefId, Term, Terms};
@@ -47,10 +48,10 @@ use crate::term::{CRefId, Term, Terms};
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Objects {
     /// What the value of every property with a name of a language satisfies.
-    every: BTreeSet<(LanguageId, CRefId)>,
+    every: FlatSet<(LanguageId, CRefId)>,
     /// The properties that there have to be: each with a name of a language and a value
     /// that satisfies something.
-    some: BTreeSet<(LanguageId, CRefId)>,
+    some: FlatSet<(LanguageId, CRefId)>,
     /// The least number of properties, and the most if there is a most.
     min: u64,
     max: Option<u64>,
@@ -61,20 +62,30 @@ pub(crate) struct Objects {
 impl Objects {
     /// Takes in what a term about objects asks of an object, as it stands or negated.
     /// `PNames` is not among them: the engine works out the language of the names first.
-    pub fn take(&mut self, term: &Term, negated: bool, terms: &mut Terms) {
+    ///
+    /// # Errors
+    ///
+    /// When the budget does not cover putting what is asked among what was asked before.
+    pub fn take(
+        &mut self,
+        term: &Term,
+        negated: bool,
+        terms: &mut Terms,
+        budget: &mut Budget,
+    ) -> Result<(), Exhausted> {
         match (term, negated) {
             (Term::PProp(names, variable), false) => {
                 let of = terms.literal(*variable, false);
-                self.every(*names, of, terms);
+                self.every(*names, of, terms, budget)?;
             }
             // Some property with such a name has a value that the schema does not accept.
             (Term::PProp(names, variable), true) => {
                 let of = terms.literal(*variable, true);
-                self.some(*names, of, terms);
+                self.some(*names, of, terms, budget)?;
             }
-            (Term::PReq(names), false) => self.some(*names, Terms::ANYTHING, terms),
+            (Term::PReq(names), false) => self.some(*names, Terms::ANYTHING, terms, budget)?,
             // No property has such a name: the value of one that has satisfies nothing.
-            (Term::PReq(names), true) => self.every(*names, Terms::NOTHING, terms),
+            (Term::PReq(names), true) => self.every(*names, Terms::NOTHING, terms, budget)?,
             (Term::MinProps(least), false) => self.min = self.min.max(*least),
             // Fewer than the least.
             (Term::MinProps(least), true) => match least.checked_sub(1) {
@@ -87,21 +98,38 @@ impl Objects {
             (Term::MaxProps(most), true) => self.min = self.min.max(most.saturating_add(1)),
             (other, _) => unreachable!("{other:?} is not about objects"),
         }
+        Ok(())
     }
 
     /// Takes in that every property has a name outside a language, or with `negated` that
     /// some property has one.
-    pub fn names(&mut self, outside: LanguageId, negated: bool, terms: &mut Terms) {
+    ///
+    /// # Errors
+    ///
+    /// When the budget does not cover it, as for [`take`](Self::take).
+    pub fn names(
+        &mut self,
+        outside: LanguageId,
+        negated: bool,
+        terms: &mut Terms,
+        budget: &mut Budget,
+    ) -> Result<(), Exhausted> {
         if negated {
-            self.some(outside, Terms::ANYTHING, terms);
+            self.some(outside, Terms::ANYTHING, terms, budget)
         } else {
-            self.every(outside, Terms::NOTHING, terms);
+            self.every(outside, Terms::NOTHING, terms, budget)
         }
     }
 
-    fn every(&mut self, names: LanguageId, of: CRefId, terms: &mut Terms) {
+    fn every(
+        &mut self,
+        names: LanguageId,
+        of: CRefId,
+        terms: &mut Terms,
+        budget: &mut Budget,
+    ) -> Result<(), Exhausted> {
         if of == Terms::ANYTHING || names == Languages::NOTHING {
-            return;
+            return Ok(());
         }
         // A property that there has to be with just these names satisfies this too.
         let mut there = self
@@ -110,10 +138,17 @@ impl Objects {
         if there.any(|(_, other)| terms.both(of, *other) == Terms::NOTHING) {
             self.none = true;
         }
-        self.every.insert((names, of));
+        self.every.insert((names, of), budget)?;
+        Ok(())
     }
 
-    fn some(&mut self, names: LanguageId, of: CRefId, terms: &mut Terms) {
+    fn some(
+        &mut self,
+        names: LanguageId,
+        of: CRefId,
+        terms: &mut Terms,
+        budget: &mut Budget,
+    ) -> Result<(), Exhausted> {
         let mut all = self
             .every
             .range((names, CRefId::FIRST)..=(names, CRefId::LAST));
@@ -123,7 +158,8 @@ impl Objects {
         {
             self.none = true;
         }
-        self.some.insert((names, of));
+        self.some.insert((names, of), budget)?;
+        Ok(())
     }
 
     fn at_most(&mut self, most: u64) {
@@ -641,22 +677,25 @@ mod tests {
         /// Every property with such a name satisfies these.
         fn every(mut self, names: &str, variables: &[i32]) -> Self {
             let (names, of) = (self.names(names), self.engine.of(variables));
-            self.objects.every(names, of, &mut self.engine.terms);
+            let (terms, budget) = (&mut self.engine.terms, &mut Budget::new(u64::MAX));
+            self.objects.every(names, of, terms, budget).unwrap();
             self
         }
 
         /// No property has such a name.
         fn none(mut self, names: &str) -> Self {
             let names = self.names(names);
-            let terms = &mut self.engine.terms;
-            self.objects.every(names, Terms::NOTHING, terms);
+            let (terms, budget) = (&mut self.engine.terms, &mut Budget::new(u64::MAX));
+            let nothing = Terms::NOTHING;
+            self.objects.every(names, nothing, terms, budget).unwrap();
             self
         }
 
         /// Some property with such a name satisfies these.
         fn some(mut self, names: &str, variables: &[i32]) -> Self {
             let (names, of) = (self.names(names), self.engine.of(variables));
-            self.objects.some(names, of, &mut self.engine.terms);
+            let (terms, budget) = (&mut self.engine.terms, &mut Budget::new(u64::MAX));
+            self.objects.some(names, of, terms, budget).unwrap();
             self
         }
 

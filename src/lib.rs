@@ -42,6 +42,7 @@ mod canonical;
 mod checker;
 mod context;
 mod error;
+mod flat;
 mod formats;
 mod generate;
 mod inspect;
