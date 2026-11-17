@@ -27,7 +27,7 @@
 mod classes;
 mod scopes;
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 
 use serde_json::Value;
 
@@ -35,6 +35,7 @@ use self::classes::written;
 use self::scopes::{Reached, ScopeId, Scopes};
 use crate::context::{Context, Exhausted};
 use crate::formats;
+use crate::hash::IdMap;
 use crate::language::LanguageId;
 use crate::normalize::DEEPEST;
 use crate::rational::{Rational, exact};
@@ -57,8 +58,8 @@ pub(crate) fn lower<'g>(
         scopes: &scopes,
         classes: &classes,
         context,
-        variables: HashMap::new(),
-        constants: HashMap::new(),
+        variables: IdMap::default(),
+        constants: IdMap::default(),
         pending: VecDeque::new(),
         scope: ScopeId::NOTHING,
     };
@@ -88,11 +89,11 @@ struct Lowering<'g, 'c> {
     classes: &'c [u32],
     context: &'c mut Context,
     /// The variable of each class that has one.
-    variables: HashMap<u32, VarId>,
+    variables: IdMap<u32, VarId>,
     /// The variable of each term that has one without being the term of a schema: of a
     /// value inside a constant, by the term that says "the instance is this value", and of
     /// what an item is to satisfy unless it is evaluated.
-    constants: HashMap<TermId, VarId>,
+    constants: IdMap<TermId, VarId>,
     /// The variables that have no term yet, in the order in which they were made, each
     /// with the schema that gives it its term, as it is reached.
     pending: VecDeque<(VarId, usize)>,

@@ -30,6 +30,7 @@ use regex_syntax::hir::Hir;
 
 use self::dfa::{CHARACTERS, Dfa, LAST, character, plainness};
 use crate::context::{Budget, Exhausted};
+use crate::hash::IdMap;
 
 /// The id of a language in the store of a check.
 ///
@@ -105,35 +106,35 @@ pub(crate) enum Shape<'l> {
 pub(crate) struct Languages {
     languages: Vec<Language>,
     /// What each language came in as, if it came in as a pattern or a format.
-    sources: HashMap<LanguageId, String>,
+    sources: IdMap<LanguageId, String>,
     patterns: HashMap<Box<str>, Result<LanguageId, Unsupported>>,
     formats: HashMap<Box<str>, LanguageId>,
     of_words: HashMap<(Words, bool), LanguageId>,
     of_dfas: HashMap<Rc<Dfa>, LanguageId>,
-    outsides: HashMap<Box<[LanguageId]>, LanguageId>,
+    outsides: IdMap<Box<[LanguageId]>, LanguageId>,
     /// The DFA of a set of words, or of what is outside a few languages, once
     /// something has asked for it.
-    as_dfas: HashMap<LanguageId, Rc<Dfa>>,
-    intersections: HashMap<(LanguageId, LanguageId), LanguageId>,
-    complements: HashMap<LanguageId, LanguageId>,
+    as_dfas: IdMap<LanguageId, Rc<Dfa>>,
+    intersections: IdMap<(LanguageId, LanguageId), LanguageId>,
+    complements: IdMap<LanguageId, LanguageId>,
     /// How many words a language has that is no set of words, once that was asked.
-    sizes: HashMap<LanguageId, Option<u64>>,
+    sizes: IdMap<LanguageId, Option<u64>>,
 }
 
 impl Default for Languages {
     fn default() -> Self {
         let mut languages = Self {
             languages: Vec::new(),
-            sources: HashMap::new(),
+            sources: IdMap::default(),
             patterns: HashMap::new(),
             formats: HashMap::new(),
             of_words: HashMap::new(),
             of_dfas: HashMap::new(),
-            outsides: HashMap::new(),
-            as_dfas: HashMap::new(),
-            intersections: HashMap::new(),
-            complements: HashMap::new(),
-            sizes: HashMap::new(),
+            outsides: IdMap::default(),
+            as_dfas: IdMap::default(),
+            intersections: IdMap::default(),
+            complements: IdMap::default(),
+            sizes: IdMap::default(),
         };
         let none: [&str; 0] = [];
         assert_eq!(languages.words(none), Self::NOTHING);

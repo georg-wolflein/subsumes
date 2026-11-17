@@ -3,9 +3,10 @@
 //! A term says which instances it accepts. Terms are kept once each: two that are written
 //! alike have one id, so equal ids mean equal terms.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Write;
 
+use crate::hash::{IdMap, IdSet};
 use crate::language::{LanguageId, Languages};
 use crate::rational::{Rational, shown};
 use crate::schema::{Graph, NodeId};
@@ -244,7 +245,7 @@ pub(crate) struct Terms {
     variables: Vec<Variable>,
     /// The c-references of more than no variable, the first of them with the id 2.
     references: Vec<Box<[Literal]>>,
-    reference_ids: HashMap<Box<[Literal]>, CRefId>,
+    reference_ids: IdMap<Box<[Literal]>, CRefId>,
 }
 
 impl Terms {
@@ -447,7 +448,7 @@ impl Terms {
 
     /// The conjunction, without what says nothing in it.
     pub fn all_of(&mut self, terms: impl IntoIterator<Item = TermId>) -> TermId {
-        let (mut kept, mut seen) = (Vec::new(), HashSet::new());
+        let (mut kept, mut seen) = (Vec::new(), IdSet::default());
         for id in terms {
             let flat = match self.term(id) {
                 Term::True => continue,
@@ -466,7 +467,7 @@ impl Terms {
 
     /// The disjunction, without what says nothing in it.
     pub fn any_of(&mut self, terms: impl IntoIterator<Item = TermId>) -> TermId {
-        let (mut kept, mut seen) = (Vec::new(), HashSet::new());
+        let (mut kept, mut seen) = (Vec::new(), IdSet::default());
         for id in terms {
             let flat = match self.term(id) {
                 Term::False => continue,

@@ -40,6 +40,7 @@ use super::search::{self, Place, Placed, Places, Slot};
 use super::{Left, Solver, State, state};
 use crate::context::{Budget, Exhausted};
 use crate::flat::FlatSet;
+use crate::hash::IdMap;
 use crate::language::{LanguageId, Languages, Lengths, Shape};
 use crate::normalize::{Cause, DEEPEST, Found, Witness};
 use crate::term::{CRefId, Term, Terms};
@@ -234,7 +235,7 @@ pub(crate) struct Partition {
     /// How many of them are of one name each.
     named: usize,
     /// The fragments that each language of the list holds, in order.
-    within: HashMap<LanguageId, Box<[u32]>>,
+    within: IdMap<LanguageId, Box<[u32]>>,
 }
 
 #[derive(Debug)]
@@ -267,8 +268,8 @@ struct Rest {
 /// The partitions of a check, each made once.
 #[derive(Debug, Default)]
 pub(crate) struct Partitions {
-    of: HashMap<Box<[LanguageId]>, Rc<Partition>>,
-    rests: HashMap<Box<[LanguageId]>, Rc<[Rest]>>,
+    of: IdMap<Box<[LanguageId]>, Rc<Partition>>,
+    rests: IdMap<Box<[LanguageId]>, Rc<[Rest]>>,
 }
 
 impl Partitions {
@@ -343,7 +344,7 @@ impl Partitions {
         }
 
         // Whether one of the languages that the list is made of holds a fragment.
-        let place: HashMap<LanguageId, usize> = patterns.iter().copied().zip(0..).collect();
+        let place: IdMap<LanguageId, usize> = patterns.iter().copied().zip(0..).collect();
         let named = names.len();
         let holds = |languages: &Languages, language: LanguageId, fragment: usize| match (
             languages.shape(language),
@@ -355,7 +356,8 @@ impl Partitions {
             (_, Some(rest)) => kept[rest].within[place[&language]],
         };
         let index: HashMap<&str, u32> = names.iter().map(AsRef::as_ref).zip(0..).collect();
-        let mut within = HashMap::with_capacity(asked.len());
+        let mut within = IdMap::default();
+        within.reserve(asked.len());
         for language in asked {
             let all = 0..fragments.len();
             let held: Vec<u32> = match languages.shape(*language) {
@@ -590,7 +592,7 @@ impl Search<'_> {
         let mut members = Map::new();
         let mut size = 1_u64;
         // The names that were made up for each fragment of more than one name.
-        let mut made_up: HashMap<usize, Vec<String>> = HashMap::new();
+        let mut made_up: IdMap<usize, Vec<String>> = IdMap::default();
         for (fragment, count, value) in filled.chain(added) {
             for _ in 0..count {
                 // A step for everything that is copied.
