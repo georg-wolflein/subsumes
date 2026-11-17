@@ -2440,7 +2440,8 @@ mod tests {
     fn more_names_than_can_be_counted_are_never_too_few() {
         // The pattern matches 2^64 names, and one of them may not be there. As many
         // properties as the largest count are still to be had, so B accepts an object. It
-        // is larger than the budget covers, and the answer is not that there is none.
+        // is larger than a budget covers, and the answer is not that there is none. A small
+        // budget says so as well as the default, in less time.
         let name = "a".repeat(64);
         let many = |least: u64| {
             json!({
@@ -2450,7 +2451,9 @@ mod tests {
                 "minProperties": least,
             })
         };
-        assert_eq!(reason(&json!(false), &many(u64::MAX)), Reason::Budget);
+        let small = Checker::new().budget(100_000);
+        let check = small.check(&json!(false), &many(u64::MAX)).unwrap();
+        assert_eq!(reason_of(&check.verdict), Some(Reason::Budget));
         // With one property to have, it is the plainest name that is left.
         let other = format!("{}b", "a".repeat(63));
         assert_eq!(
@@ -2675,9 +2678,12 @@ mod tests {
             counterexample(&json!(false), &filled),
             json!(["a", "a", "a"])
         );
-        // A count that no array of the budget has is not reached.
+        // A count that no array of the budget has is not reached. A small budget says so as
+        // well as the default, in less time.
         let endless = json!({"type": "array", "minItems": u64::MAX});
-        assert_eq!(reason(&json!(false), &endless), Reason::Budget);
+        let small = Checker::new().budget(100_000);
+        let check = small.check(&json!(false), &endless).unwrap();
+        assert_eq!(reason_of(&check.verdict), Some(Reason::Budget));
         yes(&json!({"minItems": 3}), &endless);
     }
 
