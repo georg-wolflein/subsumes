@@ -1010,6 +1010,16 @@ mod tests {
     }
 
     /// The term of a schema, as text.
+    /// Whether a schema is lowered within a budget, against `true`, and the steps that it
+    /// takes.
+    fn steps(schema: &Value, budget: u64) -> (bool, u64) {
+        let truth = json!(true);
+        let graph = parse(schema, &truth).unwrap().link().unwrap();
+        let mut context = Context::new(budget);
+        let lowered = lower(&graph, &mut context);
+        (lowered.is_ok(), context.budget.spent())
+    }
+
     fn term(schema: &Value) -> String {
         let (terms, a, _) = lowered(schema, &json!(true));
         terms.show(terms.variable(a).body)
@@ -1697,13 +1707,6 @@ mod tests {
 
     #[test]
     fn the_ways_of_evaluating_cost_steps_where_they_multiply() {
-        let steps = |schema: &Value, budget: u64| {
-            let truth = json!(true);
-            let graph = parse(schema, &truth).unwrap().link().unwrap();
-            let mut context = Context::new(budget);
-            let lowered = lower(&graph, &mut context);
-            (lowered.is_ok(), context.budget.spent())
-        };
         // So many schemas of `anyOf`, each with a property of its own, in one `allOf`.
         let choices = |count: usize| {
             let choice = |name: usize| json!({"anyOf": [{"properties": {format!("p{name}"): {}}}, {"type": "object"}]});
@@ -2008,13 +2011,6 @@ mod tests {
 
     #[test]
     fn a_schema_in_a_second_scope_costs_a_step() {
-        let steps = |schema: &Value, budget: u64| {
-            let truth = json!(true);
-            let graph = parse(schema, &truth).unwrap().link().unwrap();
-            let mut context = Context::new(budget);
-            let lowered = lower(&graph, &mut context);
-            (lowered.is_ok(), context.budget.spent())
-        };
         // Without a `$dynamicRef` that looks for an anchor, nothing is bound and nothing
         // costs a step, whatever anchors there are.
         let mut unused = lists();
@@ -2082,13 +2078,6 @@ mod tests {
                 definitions.insert(format!("r{index}"), resource);
             }
             json!({"$id": "https://example.com/root", "$ref": "r0", "$defs": definitions})
-        };
-        let steps = |schema: &Value, budget: u64| {
-            let truth = json!(true);
-            let graph = parse(schema, &truth).unwrap().link().unwrap();
-            let mut context = Context::new(budget);
-            let lowered = lower(&graph, &mut context);
-            (lowered.is_ok(), context.budget.spent())
         };
         // The scopes bind one name, two, three and four.
         assert_eq!(steps(&chain(4), u64::MAX), (true, 1 + 2 + 3 + 4));

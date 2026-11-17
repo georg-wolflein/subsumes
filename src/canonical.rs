@@ -7,6 +7,8 @@
 //! object or an array is left is one search for both, in `search`.
 
 pub(crate) mod array;
+#[cfg(test)]
+mod made_up;
 pub(crate) mod number;
 pub(crate) mod object;
 mod search;
