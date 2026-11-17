@@ -45,7 +45,7 @@ A float from 2^53 on, which is about 9e15, stands for the whole number that the 
 
 A `Yes` holds for every number, however many digits it has. The counterexample of a `No` is a number that a `serde_json` value holds exactly. Where the library finds only numbers with more digits to tell two schemas apart, such as those between two floats that are next to each other, the verdict is `Unknown`.
 
-## Formats
+## Format annotations
 
 `format` is asserted for the formats whose strings are a regular language that can be written down exactly. Of the formats that draft 2020-12 [defines](https://json-schema.org/draft/2020-12/json-schema-validation#section-7.3), these are supported:
 
@@ -79,4 +79,4 @@ A few JSON schema constructs are not modelled. A check whose answer depends on o
 - `maxContains`, and a `minContains` of two or more.
 - `unevaluatedProperties` and `unevaluatedItems` in a schema that leads back to itself without a property or an item in between, through `allOf`, `anyOf`, `$ref` and the like.
 - Patterns with lookaround or backreferences, which the `regex` crate does not accept either, and patterns with word boundaries (`\b`, `\B`).
-- Formats that are not ticked under [Formats](#formats), and formats that the draft does not define.
+- Formats that are not ticked under [Format annotations](#format-annotations), and formats that the draft does not define.

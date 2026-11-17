@@ -7,4 +7,4 @@
 
 ## The README
 
-- **Ask before you change `README.md`.** Do not edit it as part of another change, such as to describe a feature that you added; propose the change to the user and wait for their approval.
+Ask the user before you change `README.md`, and say what you would change and why.
