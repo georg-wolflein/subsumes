@@ -16,62 +16,24 @@ Each check returns one of three verdicts:
 
 - **`Yes`**: Every instance valid under B is also valid under A.
 - **`No`**: Some instance is valid under B but invalid under A. The verdict carries such an instance as a counterexample.
-- **`Unknown`**: The library cannot decide and provides a reason: the answer depends on an [unsupported construct](#unsupported-constructs), the check ran out of its work budget, or the schemas differ only in instances that cannot be given: a [number](#numbers) that cannot be written exactly, or a value that is nested deeper than 127 levels.
-
-## Status
-
-The engine is being built keyword by keyword. So far it models the types, `null`, the booleans, numbers, strings, objects, arrays, `allOf`, `anyOf`, `oneOf`, `not`, `if`/`then`/`else`, `$ref` and `$dynamicRef`. For numbers that is `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, `integer`, and a number in `const` or `enum`. For strings it is `minLength`, `maxLength`, `pattern`, `format`, and a string in `const` or `enum`. For objects it is `properties`, `patternProperties`, `additionalProperties`, `propertyNames`, `required`, `dependentRequired`, `dependentSchemas`, `minProperties`, `maxProperties` and `unevaluatedProperties`. For arrays it is `prefixItems`, `items`, `contains`, `minItems`, `maxItems` and `unevaluatedItems`. A `const` or an `enum` may hold any value. A check whose answer depends on any other keyword returns `Unknown` and names the keyword: `uniqueItems`, `maxContains`, and a `minContains` of two or more.
-
-Two schemas that share such a keyword with the same value can still be decided, because what both say cancels. The engine decides 97 in 100 of the checks of the benchmark corpus.
+- **`Unknown`**: The library cannot decide and provides a reason: either the answer depends on an [unsupported construct](#unsupported-constructs), or the check ran out of its work budget.
 
 ## Goals
 
 - **Soundness:** `Yes` and `No` are returned only when certain; whatever we cannot model exactly leads to `Unknown` with a reason.
 - **Support JSON Schema draft 2020-12** (including [`format`](https://json-schema.org/understanding-json-schema/reference/type#format), which is asserted rather than treated as an annotation), with the exceptions listed under [Unsupported constructs](#unsupported-constructs).
-- **Fast and efficient.** A check should be cheap enough to run on every save/commit.
-- **Correctness and performance** are benchmarked on a large corpus of schema pairs with known answers, and a validator checks every counterexample.
+- **Fast and efficient.** A check should be cheap enough to run on every save/commit, usually in milliseconds.
+- **Correctness and performance** are benchmarked on a large corpus of schema pairs with known answers. For `No` results, the example is validated against both schemas.
 
 ## Regular expressions
 
 JSON Schema recommends ECMA-262 regular expressions for `pattern` and `patternProperties`, but in practice a schema carries the dialect of whatever produced it. `subsumes` reads patterns in the dialect of the Rust [`regex`](https://docs.rs/regex/latest/regex/#syntax) crate, which is the engine that [Pydantic](https://docs.pydantic.dev/) uses by default to validate `pattern` constraints.
 
-The dialect changes answers. In ECMA-262, `\d` matches only `0` to `9`; in the `regex` crate it matches every Unicode decimal digit. So `^\d+$` accepts `"٣"` here and `^[0-9]+$` does not subsume it, although the two patterns are equivalent under ECMA-262.
-
-A pattern matches a string when it matches anywhere in it, as the draft says, so `a` accepts `"banana"`. A counterexample that is a string is the shortest of the alternative in which the library finds one, such as `"A"` for a string of letters that is not one of lower-case letters. Where a schema has several alternatives, as an `enum` has, a later one may hold a shorter string.
+The dialect changes answers. In ECMA-262, `\d` matches only `0` to `9`; in the `regex` crate it matches every Unicode decimal digit. So `^\d+$` accepts `"٣"` here and `^[0-9]+$` does not subsume it, although the two patterns are equivalent under ECMA-262. A pattern matches a string when it matches anywhere in it, as the draft says, so `a` accepts `"banana"`.
 
 The keys of `patternProperties` are read the same way, and so is a `pattern` under `propertyNames`.
 
 Other dialects may be supported later. For now this is the only one.
-
-## Formats
-
-`format` is asserted for the formats whose strings are a regular language that can be written down exactly: `date`, `time`, `date-time`, `duration`, `uuid`, `ipv4`, `ipv6`, `uri`, `uri-reference`, `json-pointer` and `relative-json-pointer`. Each follows the grammar of the document that defines it, so a `date` has the days of its month, and February has 29 in a leap year.
-
-A time may have the second 60 only where a leap second was, which no grammar says. So the library leaves open whether a `time` or a `date-time` with the second 60 is one, and a check whose answer depends on such a string returns `Unknown`.
-
-A `duration` in lower-case letters, such as `p1d`, is left open too: the grammar that the draft names allows it, and validators do not take it.
-
-An `ipv4` address has no number with a zero before it, so `01.2.3.4` is none. The grammar that the draft names would allow it. The library follows the benchmark corpus and validators here, which do not.
-
-Any other format is an [unsupported construct](#unsupported-constructs).
-
-## Objects
-
-The value of a property is an instance of its own, and is compared as one: its numbers exactly, its strings as languages, and an object inside it the same way again. A schema may hold itself in a property, as a list or a tree does. It then accepts the instances that can be built in finitely many steps, so a list whose every element must have a next one accepts nothing.
-
-`unevaluatedProperties` is about the properties that nothing in its schema evaluates, and which those are depends on the instance: a branch of `anyOf` evaluates the properties that it names only where the instance satisfies the branch. The library works out every way in which the schemas in place can be satisfied together, with what each way evaluates. A schema with many such branches has many ways, and a check of it may end at the budget.
-
-A counterexample that is an object has the properties that it must have and no more, such as `{"name": null}` for a `name` that should have been a string. A name that no schema lists is made up: `"a"`, then `"b"`. A counterexample holds at most 127 objects and arrays inside one another, which is as deep as `serde_json` reads a value back from text.
-
-## Arrays
-
-An item of an array is an instance of its own too, and so is each value inside a `const` or an `enum` that is an array or an object. A schema may hold itself in an item, as a tree does, and accepts the instances that can be built in finitely many steps.
-
-`unevaluatedItems` is about the items that nothing in its schema evaluates, as `unevaluatedProperties` is about properties. `prefixItems` evaluates the items that it names, `items` every item, and `contains` each item that its schema accepts.
-
-A counterexample that is an array is as short as it may be, such as `[null]` for an item that should have been a string, and `[]` wherever the empty array will do.
-
-`contains` asks for one item that its schema accepts. A `maxContains`, or a `minContains` of two or more, is not supported yet: a check whose answer depends on one returns `Unknown`.
 
 ## Numbers
 
@@ -83,13 +45,31 @@ A float from 2^53 on, which is about 9e15, stands for the whole number that the 
 
 A `Yes` holds for every number, however many digits it has. The counterexample of a `No` is a number that a `serde_json` value holds exactly. Where the library finds only numbers with more digits to tell two schemas apart, such as those between two floats that are next to each other, the verdict is `Unknown`.
 
-## References
+## Format annotations
 
-A schema has to stand on its own. A `$ref` resolves inside the schema or to a meta-schema of draft 2020-12; nothing is fetched, and a reference that resolves to nothing is an error.
+`format` is asserted for the formats whose strings are a regular language that can be written down exactly. Of the formats that draft 2020-12 [defines](https://json-schema.org/draft/2020-12/json-schema-validation#section-7.3), these are supported:
 
-A schema that is spread over several files is bundled into one first, as [the specification describes](https://json-schema.org/draft/2020-12/json-schema-core#section-9.3): each file goes under `$defs` with its URI as its `$id`, and no reference has to change.
+- [x] `date-time` (except with the second 60, which depends on whether a leap second was there)
+- [x] `date`
+- [x] `time` (except with the second 60, which depends on whether a leap second was there)
+- [x] `duration` (except in lower-case letters, such as `p1d`, which the grammar allows and validators reject)
+- [ ] `email`
+- [ ] `idn-email`
+- [ ] `hostname`
+- [ ] `idn-hostname`
+- [x] `ipv4`
+- [x] `ipv6`
+- [x] `uri`
+- [x] `uri-reference`
+- [ ] `iri`
+- [ ] `iri-reference`
+- [x] `uuid`
+- [ ] `uri-template`
+- [x] `json-pointer`
+- [x] `relative-json-pointer`
+- [ ] `regex`
 
-A `$dynamicRef` leads to the dynamic anchor of the outermost resource on the way to it that has one of its name, as the draft says. Which resource that is depends on the schemas alone, so the library works it out for every way before it compares anything. The scope begins at the schema that is checked: `subsumes(a, b)` reads each of the two as a root. A `$ref` leads where it says, also when it names a dynamic anchor. Some validators look for the anchor on the way there too, which the draft does not say.
+A check whose answer depends on one of the exceptions returns `Unknown`.
 
 ## Unsupported constructs
 
@@ -98,5 +78,5 @@ A few JSON schema constructs are not modelled. A check whose answer depends on o
 - `uniqueItems: true`.
 - `maxContains`, and a `minContains` of two or more.
 - `unevaluatedProperties` and `unevaluatedItems` in a schema that leads back to itself without a property or an item in between, through `allOf`, `anyOf`, `$ref` and the like.
-- Patterns with lookaround or backreferences, which the `regex` crate does not accept either, and patterns that ask where a word or a line begins or ends (`\b`, `\B`, and `^` or `$` under `(?m)`).
-- Formats other than those listed under [Formats](#formats), such as `hostname`, `email`, `regex` and `iri`.
+- Patterns with lookaround or backreferences, which the `regex` crate does not accept either, and patterns with word boundaries (`\b`, `\B`).
+- Formats that are not ticked under [Format annotations](#format-annotations), and formats that the draft does not define.
