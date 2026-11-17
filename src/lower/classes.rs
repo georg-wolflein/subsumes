@@ -12,7 +12,7 @@
 //! below it may lead to one schema in one scope and to another in the next. Where it leads
 //! to in a scope is a reference target like any other.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Write;
 
 use serde_json::{Number, Value};
@@ -20,6 +20,7 @@ use serde_json::{Number, Value};
 use super::scopes::Scopes;
 use super::too_deep;
 use crate::context::{Budget, Exhausted};
+use crate::hash::{IdMap, IdSet};
 use crate::rational::exact;
 use crate::schema::{Count, Graph, Keywords, Node, NodeId, Part, Schema};
 
@@ -60,7 +61,7 @@ pub(super) fn classes(
     // block at first, and each round separates those that differ one step further in. When a
     // round separates nothing, nothing will.
     const UNTOLD: u32 = u32::MAX;
-    let mut numbers: HashMap<(u32, Vec<u32>), u32> = HashMap::new();
+    let mut numbers: IdMap<(u32, Vec<u32>), u32> = IdMap::default();
     let mut previous = vec![UNTOLD; count];
     let mut blocks = usize::from(cyclic.contains(&true));
     loop {
@@ -81,7 +82,7 @@ pub(super) fn classes(
             current[node] = *class;
         }
         let on_cycles = (0..count).filter(|&node| cyclic[node]);
-        let told_apart: HashSet<u32> = on_cycles.map(|node| current[node]).collect();
+        let told_apart: IdSet<u32> = on_cycles.map(|node| current[node]).collect();
         if told_apart.len() == blocks {
             return Ok(current);
         }

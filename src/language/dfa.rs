@@ -9,6 +9,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use super::Lengths;
 use crate::context::{Budget, Exhausted};
+use crate::hash::IdMap;
 
 /// A character by its place among the Unicode scalar values. The surrogates are no scalar
 /// values and are left out, so the places run from 0 to [`LAST`] without a gap.
@@ -96,7 +97,7 @@ impl Classes {
     /// class of the first and of the second that it is part of.
     fn common(&self, other: &Self) -> (Self, Vec<(u32, u32)>) {
         let mut pairs: Vec<(u32, u32)> = Vec::new();
-        let mut ids: HashMap<(u32, u32), u32> = HashMap::new();
+        let mut ids: IdMap<(u32, u32), u32> = IdMap::default();
         let mut runs = Vec::new();
         let (mut mine, mut theirs) = (0, 0);
         let mut at = 0;
@@ -154,7 +155,7 @@ impl Dfa {
 
         // Classes that lead to the same state from every state are one class. They are
         // numbered in the order in which their first characters come.
-        let mut columns: HashMap<Vec<u32>, u32> = HashMap::new();
+        let mut columns: IdMap<Vec<u32>, u32> = IdMap::default();
         let mut merged = vec![u32::MAX; width];
         let mut kept = Vec::new();
         for (_, class) in &classes.runs {
@@ -294,7 +295,7 @@ impl Dfa {
     pub fn intersection(&self, other: &Self, budget: &mut Budget) -> Result<Self, Exhausted> {
         let (classes, pairs) = self.classes.common(&other.classes);
         let (mine, theirs) = (self.classes.count(), other.classes.count());
-        let mut ids: HashMap<(u32, u32), u32> = HashMap::from([((0, 0), 0)]);
+        let mut ids: IdMap<(u32, u32), u32> = IdMap::from_iter([((0, 0), 0)]);
         let mut pending = VecDeque::from([(0, 0)]);
         let (mut next, mut accepts) = (Vec::new(), Vec::new());
         while let Some((a, b)) = pending.pop_front() {
@@ -423,7 +424,7 @@ impl Dfa {
         let width = self.classes.count();
         let words = self.accepts.len().div_ceil(64);
         let accepted = |ends: &[u64]| members(ends).any(|state| self.accepts[state]);
-        let mut seen: HashMap<Vec<u64>, usize> = HashMap::new();
+        let mut seen: IdMap<Vec<u64>, usize> = IdMap::default();
         let mut reached: Vec<Vec<u64>> = Vec::new();
         let mut ends = vec![0_u64; words];
         ends[0] = 1;

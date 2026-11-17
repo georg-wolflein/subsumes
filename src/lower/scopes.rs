@@ -21,6 +21,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::context::{Budget, Exhausted};
+use crate::hash::{IdMap, IdSet};
 use crate::schema::{DynamicReference, Graph, Keywords, NodeId, Schema};
 
 /// The id of a dynamic scope.
@@ -52,16 +53,16 @@ pub(super) struct Scopes<'g> {
     graph: &'g Graph<'g>,
     /// The dynamic anchors of each resource that a `$dynamicRef` looks for, by the node
     /// that begins the resource: the name, and the node that has the anchor.
-    anchors: HashMap<NodeId, Vec<(&'g str, NodeId)>>,
+    anchors: IdMap<NodeId, Vec<(&'g str, NodeId)>>,
     bound: Vec<Bound<'g>>,
     scope_ids: HashMap<Bound<'g>, ScopeId>,
     /// The scope that entering a resource from a scope leads to, by the two, for every
     /// resource with an anchor to bind that has been entered.
-    entered: HashMap<(ScopeId, NodeId), ScopeId>,
+    entered: IdMap<(ScopeId, NodeId), ScopeId>,
     reached: Vec<Reached>,
-    places: HashMap<Reached, usize>,
+    places: IdMap<Reached, usize>,
     /// The schemas that have been reached, in whichever scope.
-    seen: HashSet<NodeId>,
+    seen: IdSet<NodeId>,
     /// For each schema as it is reached, the schemas that it leads to, as they are reached
     /// from it: those of its keywords, the target of its `$ref`, and what its `$dynamicRef`
     /// leads to in its scope.
@@ -88,7 +89,7 @@ impl<'g> Scopes<'g> {
         let looked_for: HashSet<&str> = nodes()
             .filter_map(|id| keywords(graph, id)?.dynamic_reference?.anchor)
             .collect();
-        let mut anchors: HashMap<NodeId, Vec<(&str, NodeId)>> = HashMap::new();
+        let mut anchors: IdMap<NodeId, Vec<(&str, NodeId)>> = IdMap::default();
         for id in nodes() {
             let name = keywords(graph, id).and_then(|keywords| keywords.dynamic_anchor);
             if let Some(name) = name.filter(|name| looked_for.contains(name)) {
@@ -101,10 +102,10 @@ impl<'g> Scopes<'g> {
             anchors,
             bound: vec![Bound::new()],
             scope_ids: HashMap::from([(Bound::new(), ScopeId::NOTHING)]),
-            entered: HashMap::new(),
+            entered: IdMap::default(),
             reached: Vec::new(),
-            places: HashMap::new(),
-            seen: HashSet::new(),
+            places: IdMap::default(),
+            seen: IdSet::default(),
             leads_to: Vec::new(),
         };
         for root in [graph.a, graph.b] {

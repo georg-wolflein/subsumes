@@ -40,7 +40,7 @@
 #[cfg(test)]
 mod exhaustive;
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::rc::Rc;
 
 use serde_json::Value;
@@ -53,6 +53,7 @@ use crate::canonical::{Left, Solver};
 use crate::context::{Context, Exhausted};
 use crate::flat::FlatMap;
 use crate::generate;
+use crate::hash::IdMap;
 use crate::language::{LanguageId, Languages};
 use crate::term::{CRefId, InstanceType, LeafId, Term, TermId, Terms, TypeSet, VarId};
 
@@ -127,11 +128,11 @@ pub(crate) fn decide(context: &mut Context, a: VarId, b: VarId) -> Result<Outcom
         context,
         unfoldings: Vec::new(),
         tasks: Vec::new(),
-        found: HashMap::new(),
-        assumed: HashMap::new(),
-        at_work: HashMap::new(),
+        found: IdMap::default(),
+        assumed: IdMap::default(),
+        at_work: IdMap::default(),
         answers: 0,
-        names: HashMap::new(),
+        names: IdMap::default(),
         partitions: Partitions::default(),
     };
     Ok(match engine.decide(both)? {
@@ -375,16 +376,16 @@ struct Engine<'c> {
     /// others waits for the one after it.
     tasks: Vec<Task>,
     /// What is known of a c-reference for good.
-    found: HashMap<CRefId, Found>,
+    found: IdMap<CRefId, Found>,
     /// What is known of one for as long as tasks that are at work accept nothing.
-    assumed: HashMap<CRefId, Assumed>,
+    assumed: IdMap<CRefId, Assumed>,
     /// Where on the stack the task of a c-reference is.
-    at_work: HashMap<CRefId, usize>,
+    at_work: IdMap<CRefId, usize>,
     /// How many answers were found so far.
     answers: u64,
     /// The language of the strings that the schema of a variable accepts, or `None` if no
     /// language says it.
-    names: HashMap<VarId, Option<LanguageId>>,
+    names: IdMap<VarId, Option<LanguageId>>,
     partitions: Partitions,
 }
 

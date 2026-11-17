@@ -164,6 +164,7 @@ Regular languages of strings are one module of the library, `language`. It uses 
 - Two schemas are of one class when they have the same keywords with the same values and their subschemas and reference targets are of one class in turn. A number is the same value as another when it is the same number, however the two are written: `1.0` says what `1` says. That holds inside an array or an object of a `const` or an `enum` too, and the properties of such an object are in no order. The schemas that are classed are those that A and B lead to, each once for every dynamic scope that it is reached in. For schemas on no cycle that is one pass from the leaves up. Schemas on cycles are told apart in rounds, each round by one step further in, until a round separates nothing; every round but the first charges the budget a step for each schema that is classed.
 - Fast mode and the budget are ordinary return values. Recursion depth is counted, because a stack overflow would abort the process.
 - **What a branch copies is flat.** The variables that a branch has taken, and what it asks of the properties of an object, are flat maps and sets: sorted vectors that are read like the B-trees of the standard library. A branch is copied for every alternative of a split, and a sorted vector is copied and dropped as one allocation, where a B-tree is one for every few entries. An insertion moves the entries after it and charges the budget for them, so one at the end, which is the usual one, costs nothing.
+- **A map that is keyed by ids hashes with FxHash.** The maps of the standard library hash with SipHash under a random key, so that whoever chooses the keys cannot make them collide. Most maps of a check are keyed by ids that the library hands out, or by pairs and lists of them, and nobody chooses those. They hash with FxHash, finished with the finalizer of MurmurHash3: without it, lists that end alike and sets of ids that are kept as bits crowd into a few places of a table. A map whose keys hold text or numbers that a schema wrote keeps the standard hash, and so does the load stage.
 
 ## Testing
 
@@ -212,6 +213,7 @@ src/
   formats.rs      the format table (exists)
   meta_schemas.rs the meta-schema of draft 2020-12 and those of its vocabularies (exists)
   generate.rs     counterexamples (exists)
+  hash.rs         hash maps and sets for keys that are ids, with FxHash (exists)
 harness/          the benchmark runner with its check of counterexamples, and the viewer (exists)
 ```
 

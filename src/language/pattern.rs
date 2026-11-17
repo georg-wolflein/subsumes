@@ -20,6 +20,7 @@ use regex_syntax::hir::{Class, Hir, HirKind, Look};
 use super::Unsupported;
 use super::dfa::{Classes, Dfa, LAST, Place, cost, place};
 use crate::context::{Budget, Exhausted};
+use crate::hash::IdMap;
 
 /// Parses a pattern as the `regex` crate does.
 ///
@@ -296,7 +297,7 @@ struct Marks {
 #[derive(Default)]
 struct Found {
     states: Vec<Reached>,
-    ids: HashMap<Reached, u32>,
+    ids: IdMap<Reached, u32>,
 }
 
 impl Found {
@@ -375,7 +376,7 @@ fn determinized(
     let mut at = 0;
     // Where each class leads from the state at hand, by the states that read it.
     let mut read: Vec<Vec<u32>> = vec![Vec::new(); width];
-    let mut led: HashMap<Vec<u32>, u32> = HashMap::new();
+    let mut led: IdMap<Vec<u32>, u32> = IdMap::default();
     // The state after a character that nothing reads: a match may still begin after it.
     let mut afresh = None;
     while let Some(reached) = found.states.get(at).cloned() {
