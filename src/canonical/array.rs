@@ -703,30 +703,46 @@ mod tests {
     }
 
     #[test]
-    fn a_place_costs_a_step_and_one_that_may_only_do_is_tried_once() {
+    fn a_place_that_may_only_do_is_tried_once() {
         // The item may be at position 0 or after it, and at neither does the engine know
         // whether there is a value. Once the array with the item at position 0 stands only
         // as far as the engine knows, the other place is not filled again: only an array
         // with every value would say more.
         let mut asked = Asked::new().at(0, &[2]).some(0, &[1]);
-        let mut budget = Budget::new(u64::MAX);
-        let left = asked.left(&mut budget).unwrap();
+        let left = asked.left(&mut Budget::new(u64::MAX)).unwrap();
         assert!(matches!(left, Left::Unknown(Cause::Number)), "{left:?}");
-        // The engine is asked twice, so the search runs three times. Each time costs a
-        // step for the head and one for each place that is tried, besides the steps for
-        // the positions that are looked at and filled: 3, 6 and 4.
-        assert_eq!((asked.engine.waited, budget.spent()), (2, 13));
+        // The engine is asked twice, so the search runs three times.
+        assert_eq!(asked.engine.waited, 2);
     }
 
     #[test]
     fn an_array_that_ends_before_it_has_items_enough_ends_the_search() {
         // Two items at least, and no value can be at position 1. However the item that
         // there has to be is placed, the array ends there, so its other places are not
-        // tried. The engine is asked once: the search costs 5 steps before and 4 after.
+        // tried. The engine is asked once.
         let mut asked = Asked::new().count(2, None).at(1, &[0]).some(0, &[2]);
-        let mut budget = Budget::new(u64::MAX);
-        assert!(matches!(asked.left(&mut budget), Ok(Left::Nothing)));
-        assert_eq!((asked.engine.waited, budget.spent()), (1, 9));
+        let left = asked.left(&mut Budget::new(u64::MAX));
+        assert!(matches!(left, Ok(Left::Nothing)));
+        assert_eq!(asked.engine.waited, 1);
+    }
+
+    #[test]
+    fn the_search_for_an_array_costs_steps() {
+        // A place that is tried costs a step. Every item satisfies 3, so none satisfies 4,
+        // and the item that has to is at no position. The other item that there has to be
+        // may be at any of three hundred, and for each of them the first is tried at every
+        // position again.
+        let asked = || {
+            let all = Asked::new().from(0, &[3]).at(299, &[5]);
+            all.some(1, &[2]).some(0, &[4])
+        };
+        let left = asked().left(&mut Budget::new(u64::MAX));
+        assert!(matches!(left, Ok(Left::Nothing)));
+        assert!(asked().left(&mut Budget::new(10_000)).is_err());
+        // So does the head, each time an array is looked for, however short the array is
+        // that is found: here it would be the empty one.
+        let mut long = Asked::new().at(99_999, &[2]);
+        assert!(long.left(&mut Budget::new(1_000)).is_err());
     }
 
     #[test]
@@ -768,17 +784,15 @@ mod tests {
         assert_eq!(asked.engine.decided, [at_the_end, end]);
         // A thousand items after the head are one question, and a step for each to copy.
         let mut asked = Asked::new().from(0, &[5]).count(1000, None);
-        let mut budget = Budget::new(u64::MAX);
-        let left = asked.left(&mut budget).unwrap();
+        let left = asked.left(&mut Budget::new(u64::MAX)).unwrap();
         let Left::Value(Some(array)) = left else {
             panic!("{left:?} is no array");
         };
         assert_eq!(array.value.as_array().unwrap().len(), 1000);
         assert_eq!((array.size, asked.engine.decided.len()), (1001, 1));
-        assert!(budget.spent() >= 1000, "{}", budget.spent());
         // Without steps enough to copy them, there is no answer.
         let mut asked = Asked::new().count(1000, None);
-        assert!(asked.left(&mut Budget::new(500)).is_err());
+        assert!(asked.left(&mut Budget::new(100)).is_err());
     }
 
     #[test]

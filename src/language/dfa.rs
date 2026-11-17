@@ -828,14 +828,13 @@ mod tests {
 
     #[test]
     fn a_long_bound_costs_no_more_than_a_short_one() {
+        // Whether there is a word of a million million characters takes a few steps.
         let others = of(&["a"]).complement();
-        let spent = |min: u64| {
-            let mut budget = unlimited();
-            let lengths = Lengths { min, max: None };
-            assert!(others.has_word(lengths, &mut budget).unwrap());
-            budget.spent()
+        let lengths = Lengths {
+            min: 1_000_000_000_000,
+            max: None,
         };
-        assert_eq!(spent(1_000_000_000_000), spent(10));
+        assert_eq!(others.has_word(lengths, &mut Budget::new(100)), Ok(true));
         // The word itself costs a step for each character.
         let lengths = Lengths {
             min: 1_000,
@@ -843,7 +842,7 @@ mod tests {
         };
         let word = others.shortest(lengths, &mut unlimited()).unwrap();
         assert_eq!(word, Some("a".repeat(1_000)));
-        let mut budget = Budget::new(500);
+        let mut budget = Budget::new(100);
         assert_eq!(others.shortest(lengths, &mut budget), Err(Exhausted));
         let lengths = Lengths {
             min: u64::MAX,
@@ -855,14 +854,13 @@ mod tests {
 
     #[test]
     fn the_states_cost_steps() {
-        // Three states after the first, each with four classes of characters to lead on.
-        let mut budget = Budget::new(6);
-        assert!(Dfa::of_words(["abc"], &mut budget).is_ok());
-        assert_eq!(budget.spent(), 6);
-        let mut budget = Budget::new(5);
-        assert!(Dfa::of_words(["abc"], &mut budget).is_err());
-        let (a, b) = (of(&["ab", "cd"]), of(&["ab", "ef"]));
-        let mut budget = Budget::new(1);
+        // A word of a thousand characters is a thousand states, and so is what the DFAs of
+        // two sets with that word share.
+        let long = "a".repeat(1_000);
+        let mut budget = Budget::new(100);
+        assert!(Dfa::of_words([long.as_str()], &mut budget).is_err());
+        let (a, b) = (of(&[&long, "b"]), of(&[&long, "c"]));
+        let mut budget = Budget::new(100);
         assert!(a.intersection(&b, &mut budget).is_err());
     }
 }

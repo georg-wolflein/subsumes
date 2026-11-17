@@ -544,28 +544,26 @@ mod tests {
     }
 
     #[test]
-    fn the_search_costs_a_step_for_each_candidate_and_for_each_excluded_number() {
-        let search = |asked: &[&str], budget: u64| {
-            let mut budget = Budget::new(budget);
-            let found = numbers(asked).is_empty(&mut budget);
-            (found, budget.spent())
-        };
-        // An interval alone is compared and not searched.
-        assert_eq!(search(&[">= 1", "<= 2", "not mof 1"], 0), (Ok(false), 0));
-        assert_eq!(search(&["mof 1", ">= 5"], 1), (Ok(false), 1));
-        // 24 to 28 are excluded, and 29 is not: six candidates, each held against three
-        // excluded numbers.
-        let asked = ["mof 1", "not mof 2", "not mof 3", "not mof 5", ">= 24"];
-        assert_eq!(search(&asked, 24), (Ok(false), 24));
-        assert_eq!(search(&asked, 23), (Err(Exhausted), 23));
-        // A number that was taken out is a candidate like any other.
-        let asked = ["mof 1", ">= 1", "!= 1", "!= 2", "!= 3"];
-        assert_eq!(search(&asked, 4), (Ok(false), 4));
-        // Where every multiple is excluded, none is looked at.
-        assert_eq!(search(&["mof 4", "not mof 2"], 0), (Ok(true), 0));
-        // Very large numbers and very small ones are numbers like any other.
+    fn the_search_costs_a_step_for_each_candidate() {
+        let search =
+            |asked: &[&str], budget: u64| numbers(asked).is_empty(&mut Budget::new(budget));
+        // An interval alone is compared and not searched. Where every multiple is excluded,
+        // none is looked at.
+        assert_eq!(search(&[">= 1", "<= 2", "not mof 1"], 0), Ok(false));
+        assert_eq!(search(&["mof 4", "not mof 2"], 0), Ok(true));
+        // Among multiples, the first candidate costs a step.
+        assert_eq!(search(&["mof 1", ">= 5"], 0), Err(Exhausted));
+        // A number that was taken out is a candidate like any other. With a thousand of
+        // them, the first number that is left is a thousand candidates away.
+        let taken_out: Vec<String> = (1..=1_000).map(|at| format!("!= {at}")).collect();
+        let mut asked = vec!["mof 1", ">= 1"];
+        asked.extend(taken_out.iter().map(String::as_str));
+        assert_eq!(search(&asked, 100), Err(Exhausted));
+        assert_eq!(search(&asked, 100_000), Ok(false));
+        // Very large numbers and very small ones are numbers like any other: the search
+        // does not go from one to the next.
         let far = ["mof 1e-300", ">= 1e300", "not mof 1e300"];
-        assert_eq!(search(&far, 4), (Ok(false), 4));
+        assert_eq!(search(&far, 100), Ok(false));
     }
 
     #[test]

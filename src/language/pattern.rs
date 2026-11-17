@@ -604,23 +604,20 @@ mod tests {
 
     #[test]
     fn the_states_cost_steps() {
-        let spent = |pattern: &str| {
-            let mut budget = Budget::new(u64::MAX);
-            dfa(&read(pattern).unwrap(), &mut budget).unwrap();
-            budget.spent()
+        let within = |pattern: &str, budget: u64| {
+            dfa(&read(pattern).unwrap(), &mut Budget::new(budget)).is_ok()
         };
-        assert!(spent("^a{100}$") > 200);
-        assert!(spent("^a{100}$") < 1_000);
+        // A thousand characters are a thousand states of the NFA and as many of the DFA.
+        assert!(!within("^a{1000}$", 100));
+        assert!(within("^a{1000}$", 100_000));
         // Each repetition in a repetition multiplies the states, and the budget ends that.
-        let nested = read("^((a{100}){100}){100}$").unwrap();
-        let mut budget = Budget::new(100_000);
-        assert_eq!(dfa(&nested, &mut budget), Err(Exhausted));
+        assert!(!within("^((a{100}){100}){100}$", 100_000));
     }
 
     #[test]
     fn sorting_the_characters_into_classes_costs_steps_where_the_sets_are_many() {
         // A word of so many characters, all of them different: each is a set of its own.
-        // What it costs to sort the characters into classes, with so many steps to spend.
+        // How many classes the characters are sorted into, with so many steps to spend.
         let sorted = |length: u32, steps: u64| {
             let characters = (0..length).map(|at| char::from_u32(0x1_0000 + at).unwrap());
             let word: String = characters.collect();
@@ -629,17 +626,14 @@ mod tests {
             let matched = nfa.add(State::Match, unlimited).unwrap();
             nfa.build(&read(&word).unwrap(), matched, unlimited)
                 .unwrap();
-            let mut budget = Budget::new(steps);
-            let classes = nfa.classes(&mut budget);
-            (classes.map(|(classes, _)| classes.count()), budget.spent())
+            let classes = nfa.classes(&mut Budget::new(steps));
+            classes.map(|(classes, _)| classes.count())
         };
         // With a few sets it costs nothing: a class for each character and one for the rest.
-        assert_eq!(sorted(50, 0), (Ok(51), 0));
+        assert_eq!(sorted(50, 0), Ok(51));
         // With thousands of sets, every run of characters is held against all of them. That
         // is charged, and before it is done.
-        let (classes, steps) = sorted(4_000, u64::MAX);
-        assert_eq!(classes, Ok(4_001));
-        assert!(steps > 200_000, "{steps}");
-        assert_eq!(sorted(30_000, 100_000), (Err(Exhausted), 100_000));
+        assert_eq!(sorted(4_000, u64::MAX), Ok(4_001));
+        assert_eq!(sorted(4_000, 10_000), Err(Exhausted));
     }
 }

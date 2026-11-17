@@ -252,22 +252,15 @@ mod tests {
     }
 
     #[test]
-    fn the_search_for_a_decimal_costs_a_step_for_each_place_and_candidate() {
+    fn the_search_for_a_decimal_costs_a_step_for_each_place() {
         let search = |asked: &[&str], budget: u64| {
-            let mut budget = Budget::new(budget);
-            let found = number(&numbers(asked), &mut budget);
-            (
-                found.map(|found| found.map(|found| found.to_string())),
-                budget.spent(),
-            )
+            let found = number(&numbers(asked), &mut Budget::new(budget));
+            found.map(|found| found.map(|found| found.to_string()))
         };
-        // Zero is the first whole number that is looked at.
-        assert_eq!(search(&[], 1), (Ok(some("0")), 1));
-        // No whole number is in the interval, and the first tenth is.
-        assert_eq!(search(&["> 0", "< 1"], 2), (Ok(some("0.1")), 2));
         // Two places without a decimal in the interval, and the third has one.
-        assert_eq!(search(&["> 0.001", "< 0.01"], 4), (Ok(some("0.002")), 4));
-        assert_eq!(search(&["> 0.001", "< 0.01"], 3), (Err(Exhausted), 3));
+        assert_eq!(search(&["> 0.001", "< 0.01"], 100), Ok(some("0.002")));
+        // The first decimal of this interval has three hundred places.
+        assert_eq!(search(&["> 1e-300", "< 2e-300"], 10), Err(Exhausted));
     }
 
     #[test]

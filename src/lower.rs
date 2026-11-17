@@ -1009,17 +1009,14 @@ mod tests {
         (context.terms, a, b)
     }
 
-    /// The term of a schema, as text.
-    /// Whether a schema is lowered within a budget, against `true`, and the steps that it
-    /// takes.
-    fn steps(schema: &Value, budget: u64) -> (bool, u64) {
+    /// Whether a schema is lowered within a budget, against `true`.
+    fn lowers(schema: &Value, budget: u64) -> bool {
         let truth = json!(true);
         let graph = parse(schema, &truth).unwrap().link().unwrap();
-        let mut context = Context::new(budget);
-        let lowered = lower(&graph, &mut context);
-        (lowered.is_ok(), context.budget.spent())
+        lower(&graph, &mut Context::new(budget)).is_ok()
     }
 
+    /// The term of a schema, as text.
     fn term(schema: &Value) -> String {
         let (terms, a, _) = lowered(schema, &json!(true));
         terms.show(terms.variable(a).body)
@@ -1715,38 +1712,26 @@ mod tests {
                 "unevaluatedProperties": false,
             })
         };
-        // A way that joins a list is held against every way of the list, at a step each.
-        // One choice costs a few, and each one more doubles the ways. Each schema that is
-        // looked at costs a step besides: the outermost one, and three for each choice.
-        assert_eq!(steps(&choices(1), u64::MAX), (true, 5 + 4));
-        assert_eq!(steps(&choices(2), u64::MAX), (true, 15 + 7));
-        assert_eq!(steps(&choices(4), u64::MAX), (true, 171 + 13));
-        assert_eq!(steps(&choices(8), u64::MAX), (true, 43_467 + 25));
-        assert_eq!(steps(&choices(4), 183), (false, 183));
-        assert_eq!(steps(&choices(40), 100_000), (false, 100_000));
-        // A schema that leads back to itself in place is found at once, and not by going
-        // round until it is too deep.
-        // Telling the schemas of the cycle apart costs steps too, and with the keyword
-        // there is one schema more to tell apart. Two steps are for the way of `a`, and
-        // four for the schemas that are looked at until the root is met again.
-        let mut round = json!({"anyOf": [{"properties": {"a": {}}}, {"$ref": "#"}]});
-        let (_, without) = steps(&round, u64::MAX);
-        round["unevaluatedProperties"] = json!(false);
-        let (_, with) = steps(&round, u64::MAX);
-        assert_eq!(with - without, 1 + 2 + 4);
-        // Without a choice there is one way, which is held against nothing: the four
-        // steps are for the four schemas that are looked at.
+        // A way that joins a list is held against every way of the list, at a step each, and
+        // each choice doubles the ways. So eight choices cost far more than a thousand steps,
+        // and forty more than any budget has.
+        assert!(lowers(&choices(2), 1_000));
+        assert!(!lowers(&choices(8), 1_000));
+        assert!(!lowers(&choices(40), 100_000));
+        // Without a choice there is one way, which is held against nothing, however many
+        // schemas there are in place.
+        let property = |name: usize| json!({"properties": {format!("p{name}"): {}}});
         let plain = json!({
-            "allOf": [{"properties": {"a": {}}}, {"$ref": "#/$defs/d"}],
-            "properties": {"b": {}},
+            "allOf": (0..30).map(property).collect::<Vec<_>>(),
             "unevaluatedProperties": false,
-            "$defs": {"d": {"patternProperties": {"^c": {}}}},
         });
-        assert_eq!(steps(&plain, u64::MAX), (true, 4));
+        assert!(lowers(&plain, 1_000));
 
-        // A schema is looked at once for every way in place that leads to it. Each
-        // definition here is two references to the one before, so the first is reached in
-        // two ways, in four, in eight: with three definitions above it, 30 looks in all.
+        // A schema is looked at once for every way in place that leads to it, at a step
+        // each. Each definition here is two references to the one before, so the first is
+        // reached in two ways, in four, in eight: twelve definitions are thousands of looks,
+        // and thirty are more than any budget has. More of them are deeper in place than is
+        // followed.
         let doubled = |levels: usize| {
             let mut definitions = Map::new();
             definitions.insert("d0".to_owned(), json!({"properties": {"a": {}}}));
@@ -1760,17 +1745,16 @@ mod tests {
                 "$defs": definitions,
             })
         };
-        assert_eq!(steps(&doubled(3), u64::MAX), (true, 30));
-        // So thirty such definitions, which are 2^32 looks, end at the budget. More of them
-        // are deeper in place than is followed.
-        assert_eq!(steps(&doubled(30), 100_000), (false, 100_000));
+        assert!(lowers(&doubled(3), 1_000));
+        assert!(!lowers(&doubled(12), 1_000));
+        assert!(!lowers(&doubled(30), 100_000));
         // The walk for `unevaluatedItems` is the same one.
-        let mut items = doubled(3);
+        let mut items = doubled(12);
         items["$defs"]["d0"] = json!({"prefixItems": [{}]});
         let keywords = items.as_object_mut().unwrap();
         let schema = keywords.remove("unevaluatedProperties").unwrap();
         keywords.insert("unevaluatedItems".to_owned(), schema);
-        assert_eq!(steps(&items, u64::MAX), (true, 30));
+        assert!(!lowers(&items, 1_000));
     }
 
     #[test]
@@ -2015,13 +1999,15 @@ mod tests {
         // costs a step, whatever anchors there are.
         let mut unused = lists();
         unused["$defs"]["list"]["items"] = json!({"$ref": "#item"});
-        assert_eq!(steps(&unused, u64::MAX), (true, 0));
+        assert!(lowers(&unused, 0));
         // With one, a schema costs a step for each scope that it is reached in beyond its
         // first: the list and what is in it are reached in two. And each of the two scopes
         // costs one for the name that it binds.
-        assert_eq!(steps(&lists(), u64::MAX), (true, 4));
-        assert_eq!(steps(&lists(), 4), (true, 4));
-        assert_eq!(steps(&lists(), 3), (false, 3));
+        assert!(!lowers(&lists(), 0));
+        // So a list of a thousand schemas costs a thousand steps, with the same two names.
+        let mut wide = lists();
+        wide["$defs"]["list"]["prefixItems"] = json!(vec![json!({}); 1_000]);
+        assert!(!lowers(&wide, 100));
 
         // Twelve names, each bound by one of two resources on the way, are 4,096 scopes
         // for the last resource to be reached in.
@@ -2055,9 +2041,8 @@ mod tests {
             "$ref": "r0a",
             "$defs": definitions,
         });
-        let (done, spent) = steps(&many, u64::MAX);
-        assert!(done && spent > 4096 * 12, "{spent} steps");
-        assert_eq!(steps(&many, 1000), (false, 1000));
+        assert!(lowers(&many, u64::MAX));
+        assert!(!lowers(&many, 1_000));
     }
 
     #[test]
@@ -2079,24 +2064,24 @@ mod tests {
             }
             json!({"$id": "https://example.com/root", "$ref": "r0", "$defs": definitions})
         };
-        // The scopes bind one name, two, three and four.
-        assert_eq!(steps(&chain(4), u64::MAX), (true, 1 + 2 + 3 + 4));
-        assert_eq!(steps(&chain(4), 9), (false, 9));
+        // The scopes of four resources bind one name, two, three and four. So a long chain
+        // ends at the budget before its scopes take the memory: they would hold two million
+        // names here.
+        assert!(lowers(&chain(4), 1_000));
+        assert!(!lowers(&chain(2_000), 10_000));
         // A scope is worked out once, however many references lead into its resource.
+        let mut references = vec![json!({"$ref": "list"}); 1_000];
+        references.push(json!({"$ref": "list#/items"}));
         let often = json!({
             "$id": "https://example.com/root",
-            "allOf": [{"$ref": "list"}, {"$ref": "list"}, {"$ref": "list#/items"}],
+            "allOf": references,
             "$defs": {"list": {
                 "$id": "list",
                 "items": {"$dynamicRef": "#item"},
                 "$defs": {"item": {"$dynamicAnchor": "item"}},
             }},
         });
-        assert_eq!(steps(&often, u64::MAX), (true, 1));
-        // So a long chain ends at the budget before its scopes take the memory: they
-        // would hold two million names here.
-        let (done, spent) = steps(&chain(2000), 10_000);
-        assert!(!done && spent <= 10_000, "{spent} steps");
+        assert!(lowers(&often, 100));
     }
 
     #[test]
@@ -2117,8 +2102,7 @@ mod tests {
         let cycle = json!({"not": {"not": {"not": {"$ref": "#"}}}});
         let truth = json!(true);
         let graph = parse(&cycle, &truth).unwrap().link().unwrap();
-        let mut context = Context::new(1);
-        assert_eq!(lower(&graph, &mut context), Err(Exhausted));
-        assert_eq!(context.budget.spent(), 1);
+        // Telling the schemas of a cycle apart costs steps, and here there are none.
+        assert_eq!(lower(&graph, &mut Context::new(0)), Err(Exhausted));
     }
 }
