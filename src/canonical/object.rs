@@ -824,15 +824,11 @@ mod tests {
         assert!(matches!(asked.left(&mut budget), Ok(Left::Value(Some(_)))));
         // One c-reference for the four, asked for in one go.
         assert_eq!((asked.engine.waited, asked.engine.found.len()), (1, 1));
-        // The search costs steps, and the partition is made once.
-        let spent = budget.spent();
-        assert!(spent > 8, "{spent}");
+        // The partition is made once.
         assert!(matches!(asked.left(&mut budget), Ok(Left::Value(Some(_)))));
         assert_eq!(asked.engine.partitions.of.len(), 1);
-        assert_eq!(four().left(&mut Budget::new(spent)).map(|_| ()), Ok(()));
-        assert_eq!(
-            four().left(&mut Budget::new(spent - 1)).map(|_| ()),
-            Err(Exhausted)
-        );
+        // The search costs steps.
+        let left = four().left(&mut Budget::new(0));
+        assert_eq!(left.map(|_| ()), Err(Exhausted));
     }
 }

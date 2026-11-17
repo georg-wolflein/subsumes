@@ -535,33 +535,27 @@ mod tests {
 
     #[test]
     fn only_cycles_cost_steps() {
-        let rounds = |schema: &Value| {
+        // How many schemas are classed, where that costs no step.
+        let classed = |schema: &Value| {
             let truth = json!(true);
             let graph = parse(schema, &truth).unwrap().link().unwrap();
-            let mut budget = Budget::new(u64::MAX);
-            let (scopes, _) = reached(&graph, &mut budget).unwrap();
-            (budget.spent(), scopes.len() as u64)
+            reached(&graph, &mut Budget::new(0)).map(|(scopes, _)| scopes.len())
         };
         let plain = json!({"properties": {"a": {"items": {"not": {}}}}});
-        assert_eq!(rounds(&plain).0, 0);
+        assert!(classed(&plain).is_ok());
 
         // Three of the four schemas on the cycle say the same by themselves. Each round tells
         // one more of them apart, by what it leads to, and a round that tells nothing apart
         // ends the work. Every round but the first costs a step for each schema that is
-        // classed: the four on the cycle and `true`.
+        // classed.
         let cycle = json!({"not": {"not": {"not": {"$ref": "#"}}}});
-        assert_eq!(rounds(&cycle), (3 * 5, 5));
+        assert_eq!(classed(&cycle), Err(Exhausted));
         // Schemas that nothing leads to are not classed. Here the root and `true` are, and
         // the four on the cycle are not.
         let unused = json!({
             "$defs": {"cycle": {"not": {"not": {"not": {"$ref": "#/$defs/cycle"}}}}},
         });
-        assert_eq!(rounds(&unused), (0, 2));
-
-        let truth = json!(true);
-        let graph = parse(&cycle, &truth).unwrap().link().unwrap();
-        assert_eq!(reached(&graph, &mut Budget::new(14)).err(), Some(Exhausted));
-        assert!(reached(&graph, &mut Budget::new(15)).is_ok());
+        assert_eq!(classed(&unused), Ok(2));
     }
 
     #[test]

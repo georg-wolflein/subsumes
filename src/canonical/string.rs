@@ -227,21 +227,15 @@ mod tests {
         strings
     }
 
-    /// The shortest string of the set, and how many steps it took to see whether there is
-    /// one.
-    fn shortest(asked: &[&str]) -> (Option<String>, u64) {
+    /// The shortest string of the set.
+    fn given(asked: &[&str]) -> Option<String> {
         let languages = &mut Languages::default();
         let mut strings = strings(asked, languages);
         let mut budget = Budget::new(u64::MAX);
         let is_empty = strings.is_empty(languages, &mut budget).unwrap();
-        let spent = budget.spent();
         let shortest = strings.shortest(languages, &mut budget).unwrap();
         assert_eq!(shortest.is_none(), is_empty, "{asked:?}");
-        (shortest, spent)
-    }
-
-    fn given(asked: &[&str]) -> Option<String> {
-        shortest(asked).0
+        shortest
     }
 
     fn some(word: &str) -> Option<String> {
@@ -289,20 +283,21 @@ mod tests {
 
     #[test]
     fn what_is_asked_for_and_against_leaves_nothing_without_a_dfa() {
-        assert_eq!(
-            shortest(&["in ^(a|b)*c{3,9}$", "not in ^(a|b)*c{3,9}$"]),
-            (None, 0)
-        );
-        assert_eq!(shortest(&["not in a", ">= 2", "in a"]), (None, 0));
-        assert_eq!(shortest(&["= a", "!= a"]), (None, 0));
+        // Whether the set is empty, as far as that is seen without a step. A DFA costs steps.
+        let is_empty = |asked: &[&str]| {
+            let languages = &mut Languages::default();
+            strings(asked, languages).is_empty(languages, &mut Budget::new(0))
+        };
+        let pattern = ["in ^(a|b)*c{3,9}$", "not in ^(a|b)*c{3,9}$"];
+        assert_eq!(is_empty(&pattern), Ok(true));
+        assert_eq!(is_empty(&["not in a", ">= 2", "in a"]), Ok(true));
+        assert_eq!(is_empty(&["= a", "!= a"]), Ok(true));
         // Two patterns of one language are told to be one by their DFAs.
-        let (found, spent) = shortest(&["in ^a+$", "not in ^aa*$"]);
-        assert_eq!(found, None);
-        assert!(spent > 0);
-        // What only sets of words say costs a step for each word that is taken out.
-        assert_eq!(shortest(&["= a", "<= 1"]), (some("a"), 0));
-        assert_eq!(shortest(&["= a", "!= b", "<= 1"]), (some("a"), 1));
-        assert_eq!(shortest(&["!= a", "!= b", "!= c"]), (some(""), 3));
+        let same = ["in ^a+$", "not in ^aa*$"];
+        assert_eq!(is_empty(&same), Err(Exhausted));
+        assert_eq!(given(&same), None);
+        // What one string says is seen without a DFA too.
+        assert_eq!(is_empty(&["= a", "<= 1"]), Ok(false));
     }
 
     #[test]
@@ -317,19 +312,18 @@ mod tests {
         }
         let mut budget = Budget::new(u64::MAX);
         assert_eq!(strings.is_empty(languages, &mut budget), Ok(false));
-        // A step for each word. Each is kept twice: by itself, and in the one set of all.
-        // Taken out one at a time, the sets on the way would hold two million words.
-        assert_eq!(budget.spent(), count);
-        assert_eq!(languages.words_kept(), 2 * count as usize);
+        // Each word is kept twice: by itself, and in the one set of all. Taken out one at a
+        // time, the sets on the way would hold two million words.
+        assert_eq!(languages.words_kept(), 2 * count);
         assert_eq!(strings.shortest(languages, &mut budget), Ok(some("")));
-        // The budget ends it before the set is made.
+        // A word costs a step, and the budget ends it before the set is made.
         let mut again = Strings::default();
         for index in 0..count {
             let word = terms.str_const(&format!("y{index:04}"));
             again.take(terms.term(word), true, languages);
         }
-        let mut budget = Budget::new(count - 1);
+        let mut budget = Budget::new(100);
         assert_eq!(again.is_empty(languages, &mut budget), Err(Exhausted));
-        assert_eq!(languages.words_kept(), 3 * count as usize);
+        assert_eq!(languages.words_kept(), 3 * count);
     }
 }

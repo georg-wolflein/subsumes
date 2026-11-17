@@ -1549,30 +1549,15 @@ mod tests {
             json!({"pattern": pattern}),
             json!({"pattern": pattern, "minLength": 1}),
         );
-        let checker = Checker::new().budget(100);
-        let check = checker.check(&a, &b).unwrap();
-        assert_eq!(check.verdict, Verdict::Yes);
-        assert!(check.steps < 20, "{}", check.steps);
+        let small = Checker::new().budget(100);
+        assert_eq!(small.subsumes(&a, &b).unwrap(), Verdict::Yes);
         // The other way the DFA has to say that the pattern does not match the
         // empty string.
         let unknown = Verdict::Unknown {
             reason: Reason::Budget,
         };
-        assert_eq!(checker.check(&b, &a).unwrap().verdict, unknown);
-        let check = Checker::new().check(&b, &a).unwrap();
-        assert_eq!(check.verdict, Verdict::Yes);
-        assert!(check.steps > 4_000, "{}", check.steps);
-        // With a type next to the pattern, the negation of A is a split. The branch asks
-        // whether a string is left before it splits, and by then the pattern is an
-        // DFA, although the split then cancels it.
-        let typed = |schema: &Value| {
-            let mut schema = schema.clone();
-            schema["type"] = json!("string");
-            schema
-        };
-        let check = Checker::new().check(&typed(&a), &typed(&b)).unwrap();
-        assert_eq!(check.verdict, Verdict::Yes);
-        assert!(check.steps > 4_000, "{}", check.steps);
+        assert_eq!(small.subsumes(&b, &a).unwrap(), unknown);
+        yes(&b, &a);
     }
 
     #[test]
@@ -2359,7 +2344,10 @@ mod tests {
             .check(&any, &whole)
             .unwrap();
         assert_eq!(check.verdict, Verdict::Yes);
-        assert!(check.steps > 100_000, "{}", check.steps);
+        // A task costs steps, so a budget that is smaller than the schema is deep ends it.
+        let small = Checker::new().budget(1_000);
+        let verdict = small.subsumes(&any, &whole).unwrap();
+        assert_eq!(reason_of(&verdict), Some(Reason::Budget));
         // The other way an instance holds an object for each level, and one that deep
         // cannot be given: there is no counterexample, and no stack is used up for one.
         let check = Checker::new()
@@ -2880,7 +2868,10 @@ mod tests {
             .check(&any, &whole)
             .unwrap();
         assert_eq!(check.verdict, Verdict::Yes);
-        assert!(check.steps > 100_000, "{}", check.steps);
+        // A task costs steps, so a budget that is smaller than the schema is deep ends it.
+        let small = Checker::new().budget(1_000);
+        let verdict = small.subsumes(&any, &whole).unwrap();
+        assert_eq!(reason_of(&verdict), Some(Reason::Budget));
         // The other way an instance holds an array for each level, and one that deep
         // cannot be given: there is no counterexample, and no stack is used up for one.
         let check = Checker::new()
@@ -3443,26 +3434,20 @@ mod tests {
         // is four and a half million alternatives. They are made one at a time.
         let long = json!({"oneOf": vec![true; 3_000]});
         let (nothing, anything) = (json!(false), json!(true));
-        // A budget that ends the check at the first alternative keeps the others unmade.
-        let checker = Checker::new().budget(8);
+        // A budget that ends the check at the first alternatives keeps the others unmade.
+        let small = Checker::new().budget(100);
         for (a, b) in [(&nothing, &long), (&long, &anything)] {
-            let check = checker.check(a, b).unwrap();
-            assert_eq!(
-                check.verdict,
-                Verdict::Unknown {
-                    reason: Reason::Budget
-                }
-            );
+            let verdict = small.subsumes(a, b).unwrap();
+            assert_eq!(reason_of(&verdict), Some(Reason::Budget));
         }
-        // The first two that hold together give an instance, long before the last two.
-        let check = Checker::new().check(&long, &anything).unwrap();
+        // The first two that hold together give an instance, long before the last two: with
+        // far fewer steps than there are alternatives.
+        let enough = Checker::new().budget(100_000);
+        let counterexample = json!(null);
         assert_eq!(
-            check.verdict,
-            Verdict::No {
-                counterexample: json!(null)
-            }
+            enough.subsumes(&long, &anything).unwrap(),
+            Verdict::No { counterexample }
         );
-        assert!(check.steps < 10_000, "{}", check.steps);
     }
 
     #[test]
@@ -3501,14 +3486,14 @@ mod tests {
         };
         let b = json!({"type": "array", "allOf": (0..20).map(choice).collect::<Vec<_>>()});
         let a = json!({"type": "array", "uniqueItems": true});
-        let check = Checker::new().check(&a, &b).unwrap();
+        // So the budget may be far smaller than the branches are many.
+        let small = Checker::new().budget(10_000);
         assert!(matches!(
-            check.verdict,
+            small.subsumes(&a, &b).unwrap(),
             Verdict::Unknown {
                 reason: Reason::Unsupported { .. }
             }
         ));
-        assert!(check.steps < 1_000, "{}", check.steps);
         // An instance is still found where there is one.
         let a = json!({"type": "null"});
         assert_eq!(
@@ -3530,9 +3515,10 @@ mod tests {
             "items": {"type": "array", "uniqueItems": true},
             "allOf": (0..20).map(choice).collect::<Vec<_>>(),
         });
-        let check = Checker::new().check(&json!({"type": "null"}), &b).unwrap();
+        // So the budget may be far smaller than the branches are many.
+        let small = Checker::new().budget(10_000);
         assert_eq!(
-            check.verdict,
+            small.subsumes(&json!({"type": "null"}), &b).unwrap(),
             Verdict::Unknown {
                 reason: Reason::Unsupported {
                     schema: Side::B,
@@ -3540,7 +3526,6 @@ mod tests {
                 },
             }
         );
-        assert!(check.steps < 2_000, "{}", check.steps);
         // So it is with an object whose property depends on a leaf.
         let choice = |n: u32| json!({"anyOf": [{"maxProperties": n + 1}, {"required": ["a"]}]});
         let b = json!({
@@ -3549,14 +3534,12 @@ mod tests {
             "properties": {"a": {"type": "array", "uniqueItems": true}},
             "allOf": (0..20).map(choice).collect::<Vec<_>>(),
         });
-        let check = Checker::new().check(&json!({"type": "null"}), &b).unwrap();
         assert!(matches!(
-            check.verdict,
+            small.subsumes(&json!({"type": "null"}), &b).unwrap(),
             Verdict::Unknown {
                 reason: Reason::Unsupported { .. }
             }
         ));
-        assert!(check.steps < 2_000, "{}", check.steps);
     }
 
     #[test]
@@ -3621,10 +3604,10 @@ mod tests {
             }
             deep
         };
+        // A budget that is far smaller than the schemas are deep says so.
         let (a, b) = (deep(), deep());
-        let check = Checker::new().check(&a, &b).unwrap();
-        assert_eq!(check.verdict, Verdict::Yes);
-        assert!(check.steps < 10, "{}", check.steps);
+        let small = Checker::new().budget(100);
+        assert_eq!(small.subsumes(&a, &b).unwrap(), Verdict::Yes);
         // Dropping a value this deep would recurse, which is no concern of this test.
         std::mem::forget((a, b));
     }

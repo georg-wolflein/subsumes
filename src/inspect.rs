@@ -370,7 +370,7 @@ mod tests {
     #[test]
     fn without_the_budget_for_them_there_are_no_terms() {
         let cycle = json!({"not": {"not": {"not": {"$ref": "#"}}}});
-        let shown = shown(&cycle, &json!(true), 1);
+        let shown = shown(&cycle, &json!(true), 0);
         assert_eq!(shown["stages"].as_array().unwrap().len(), 1);
     }
 }
