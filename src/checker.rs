@@ -4,8 +4,10 @@ use crate::context::Context;
 use crate::normalize::{self, Cause, Outcome};
 use crate::{Error, Reason, Verdict, inspect, lower, schema};
 
-/// The work budget of the Python version; to be set anew once there is an engine to measure.
-const DEFAULT_BUDGET: u64 = 500_000;
+/// The work budget of a check, unless another is set. It is there so that a check ends: one
+/// that spends all of it takes a few seconds. How many steps a check takes is no measure of how
+/// fast it is.
+const DEFAULT_BUDGET: u64 = 10_000_000;
 
 /// The settings of a check. So far that is its work budget.
 ///
@@ -28,7 +30,8 @@ pub struct Checker {
 }
 
 impl Checker {
-    /// A checker with the default work budget.
+    /// A checker with the default work budget: 10 million steps, which is a few seconds of work
+    /// at most.
     #[must_use]
     pub fn new() -> Self {
         Self {
