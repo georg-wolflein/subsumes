@@ -45,11 +45,11 @@ use std::rc::Rc;
 
 use serde_json::Value;
 
-use crate::canonical::Left;
 use crate::canonical::array::Arrays;
 use crate::canonical::number::Numbers;
-use crate::canonical::object::{Objects, Partitions, Solver};
+use crate::canonical::object::{Objects, Partitions};
 use crate::canonical::string::Strings;
+use crate::canonical::{Left, Solver};
 use crate::context::{Context, Exhausted};
 use crate::generate;
 use crate::language::{LanguageId, Languages};
@@ -673,15 +673,15 @@ impl Engine<'_> {
                 Some(assumed.found.clone())
             }
         };
+        let mut solver = Solver {
+            terms,
+            languages,
+            budget,
+            partitions,
+        };
         let left = if of == InstanceType::Array {
-            branch.arrays.left(terms, budget, &mut ask, give)?
+            branch.arrays.left(&mut solver, &mut ask, give)?
         } else {
-            let mut solver = Solver {
-                terms,
-                languages,
-                budget,
-                partitions,
-            };
             branch.objects.left(&mut solver, &mut ask, give)?
         };
         if let Some(task) = tasks.last_mut() {

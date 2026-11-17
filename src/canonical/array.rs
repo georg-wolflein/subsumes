@@ -37,7 +37,8 @@ use std::rc::Rc;
 
 use serde_json::Value;
 
-use super::{Left, State, state};
+use super::search::{self, Place, Placed, Places, Slot};
+use super::{Left, Solver, State, state};
 use crate::context::{Budget, Exhausted};
 use crate::normalize::{Cause, DEEPEST, Found, Witness};
 use crate::term::{CRefId, Term, Terms};
@@ -177,8 +178,7 @@ impl Arrays {
     /// When the budget does not cover the search.
     pub fn left(
         &self,
-        terms: &mut Terms,
-        budget: &mut Budget,
+        with: &mut Solver,
         ask: &mut dyn FnMut(CRefId) -> Option<Found>,
         give: bool,
     ) -> Result<Left, Exhausted> {
@@ -188,7 +188,8 @@ impl Arrays {
         // The head, as far as the last position that an item has to be at or after. So
         // every position after the head will do for every such item.
         let last = self.some.last().map_or(0, |(from, _)| index(*from));
-        budget.charge(1 + (self.head.len().max(last) / 8) as u64)?;
+        with.budget
+            .charge(1 + (self.head.len().max(last) / 8) as u64)?;
         let mut head = Cow::Borrowed(self.head.as_slice());
         if head.len() < last {
             head.to_mut().resize(last, self.tail);
@@ -201,54 +202,17 @@ impl Arrays {
             arrays: self,
             head: &head,
             some: &some,
-            slots: Vec::new(),
             at_head: vec![None; head.len()],
             after: Vec::new(),
             looked: 0,
             end: None,
-            wanted: Vec::new(),
-            depends: None,
         };
-        search.run(terms, budget, ask, give)
+        search::run(search, with, ask, give)
     }
 }
 
-/// An item of the array that is being put together of which more is asked than its position
-/// asks: where it is, and what its value satisfies.
-#[derive(Debug)]
-struct Slot {
-    position: u64,
-    of: CRefId,
-    /// A value. Without one: what stands in the way, or nothing if the engine has yet to
-    /// decide whether there is one.
-    value: Result<Rc<Witness>, Option<Cause>>,
-}
-
-/// Where an item that there has to be may go: to an item of which more is asked already,
-/// or to a position of which no more is asked yet.
-#[derive(Debug, Clone, Copy)]
-enum Place {
-    Join(usize),
-    Open(u64),
-}
-
-/// What was done for one item that there has to be, and what else can be tried.
-struct Level {
-    places: Vec<Place>,
-    next: usize,
-    /// What the place that was tried last did, if it stands.
-    done: Option<Done>,
-}
-
-/// What putting an item in a place did, to take it back.
-enum Done {
-    /// The item joined this slot, which was this before.
-    Joined(usize, Slot),
-    /// The item opened the last slot.
-    Opened,
-}
-
-/// The search for an array: a position for every item that there has to be.
+/// The search for an array: a position for every item that there has to be. A slot is an
+/// item of which more is asked than its position asks.
 struct Search<'s> {
     arrays: &'s Arrays,
     /// What the item at each position of the head satisfies.
@@ -256,7 +220,6 @@ struct Search<'s> {
     /// The items that there have to be: the first position that each may be at, and what
     /// its value satisfies.
     some: &'s [(usize, CRefId)],
-    slots: Vec<Slot>,
     /// The slot of each position of the head that has one.
     at_head: Vec<Option<usize>>,
     /// The slots after the head. They are at the positions right after it, in this order.
@@ -267,141 +230,52 @@ struct Search<'s> {
     /// The first position whose item can have no value, once it is found: an array ends
     /// before it.
     end: Option<u64>,
-    /// The c-references that the engine has yet to decide.
-    wanted: Vec<CRefId>,
-    /// What stood in the way of an array that was put together without a value for every
-    /// item. Once there is such an array, only one with every value is looked for.
-    depends: Option<Cause>,
 }
 
-impl Search<'_> {
-    /// Tries the places of each item that there has to be, one after the other, and goes
-    /// back to the one before where none is left to try.
-    fn run(
-        mut self,
-        terms: &mut Terms,
-        budget: &mut Budget,
-        ask: &mut dyn FnMut(CRefId) -> Option<Found>,
-        give: bool,
-    ) -> Result<Left, Exhausted> {
-        let mut levels: Vec<Level> = Vec::new();
-        let mut onward = true;
-        loop {
-            if onward && levels.len() == self.some.len() {
-                // Every one of them has a place.
-                if let Some(left) = self.fill(budget, ask, give)? {
-                    return Ok(left);
-                }
-            } else if onward {
-                let places = self.places(levels.len());
-                levels.push(Level {
-                    places,
-                    next: 0,
-                    done: None,
-                });
-            }
-            let Some(level) = levels.last_mut() else {
-                break;
-            };
-            match level.done.take() {
-                Some(Done::Joined(slot, was)) => self.slots[slot] = was,
-                Some(Done::Opened) => {
-                    let slot = self.slots.pop().expect("the slot that was opened is there");
-                    match self.at_head.get_mut(index(slot.position)) {
-                        Some(at) => *at = None,
-                        None => {
-                            self.after.pop();
-                        }
-                    }
-                }
-                None => {}
-            }
-            let Some(place) = level.places.get(level.next).copied() else {
-                levels.pop();
-                onward = false;
-                continue;
-            };
-            level.next += 1;
-            budget.charge(1)?;
-            let (_, asked) = self.some[levels.len() - 1];
-            let (position, of) = match place {
-                Place::Join(slot) => (self.slots[slot].position, self.slots[slot].of),
-                Place::Open(position) => (position, self.asked_at(position)),
-            };
-            // The array has to get as far as the position, and not end at it.
-            self.look(position, budget, ask)?;
-            onward = self.end.is_none_or(|end| position < end);
-            if !onward {
-                continue;
-            }
-            let of = terms.both(of, asked);
-            let value = match state(of, ask, &mut self.wanted) {
-                State::Nothing => None,
-                State::Possible(_) if self.depends.is_some() => None,
-                State::Possible(cause) => Some(Err(Some(cause))),
-                State::Sure(witness) => Some(Ok(witness)),
-                State::Wanted => Some(Err(None)),
-            };
-            onward = value.is_some();
-            let Some(value) = value else {
-                continue;
-            };
-            let slot = Slot {
-                position,
-                of,
-                value,
-            };
-            let done = match place {
-                Place::Join(at) => Done::Joined(at, std::mem::replace(&mut self.slots[at], slot)),
-                Place::Open(position) => {
-                    match self.at_head.get_mut(index(position)) {
-                        Some(at) => *at = Some(self.slots.len()),
-                        None => self.after.push(self.slots.len()),
-                    }
-                    self.slots.push(slot);
-                    Done::Opened
-                }
-            };
-            levels.last_mut().expect("a level is at work").done = Some(done);
-        }
-        Ok(match self.depends {
-            _ if !self.wanted.is_empty() => Left::Needs(self.wanted),
-            Some(cause) => Left::Unknown(cause),
-            None => Left::Nothing,
-        })
+impl Places for Search<'_> {
+    type At = u64;
+
+    fn asked(&self, which: usize) -> Option<CRefId> {
+        self.some.get(which).map(|(_, of)| *of)
     }
 
     /// What the item at a position satisfies by its position alone.
-    fn asked_at(&self, position: u64) -> CRefId {
+    fn at(&self, position: u64) -> CRefId {
         let of_the_head = usize::try_from(position).ok();
         let of_the_head = of_the_head.and_then(|position| self.head.get(position));
         of_the_head.copied().unwrap_or(self.arrays.tail)
     }
 
-    /// Looks at what the first so many positions ask, as far as the first of them that
-    /// asks what no value satisfies: the array ends before that one.
-    fn look(
+    /// The array has to get as far as the position, and not end at it.
+    fn reaches(
         &mut self,
-        length: u64,
-        budget: &mut Budget,
+        position: u64,
+        placed: &mut Placed<u64>,
+        with: &mut Solver,
         ask: &mut dyn FnMut(CRefId) -> Option<Found>,
-    ) -> Result<(), Exhausted> {
-        // Every position after the head asks the same, so the first of them stands for all.
-        let apart = self.head.len() as u64 + 1;
-        while self.end.is_none() && self.looked < length.min(apart) {
-            budget.charge(1)?;
-            let of = self.asked_at(self.looked);
-            if matches!(state(of, ask, &mut self.wanted), State::Nothing) {
-                self.end = Some(self.looked);
-            } else {
-                self.looked += 1;
+    ) -> Result<bool, Exhausted> {
+        self.look(position, &mut placed.wanted, with.budget, ask)?;
+        Ok(self.end.is_none_or(|end| position < end))
+    }
+
+    fn open(&mut self, position: u64, slot: usize) {
+        match self.at_head.get_mut(index(position)) {
+            Some(at) => *at = Some(slot),
+            None => self.after.push(slot),
+        }
+    }
+
+    fn close(&mut self, position: u64) {
+        match self.at_head.get_mut(index(position)) {
+            Some(at) => *at = None,
+            None => {
+                self.after.pop();
             }
         }
-        Ok(())
     }
 
     /// Where one of the items that there have to be may go.
-    fn places(&self, which: usize) -> Vec<Place> {
+    fn places(&self, _: &Placed<u64>, which: usize) -> Vec<Place<u64>> {
         let (from, _) = self.some[which];
         let head = self.head.len();
         // No position at which the array has ended, and none that it may not get to.
@@ -437,21 +311,23 @@ impl Search<'_> {
     /// noted.
     fn fill(
         &mut self,
-        budget: &mut Budget,
+        placed: &mut Placed<u64>,
+        with: &mut Solver,
         ask: &mut dyn FnMut(CRefId) -> Option<Found>,
         give: bool,
     ) -> Result<Option<Left>, Exhausted> {
+        let budget = &mut *with.budget;
         let min = self.arrays.min;
-        let placed = self.slots.iter().map(|slot| slot.position + 1).max();
-        let length = min.max(placed.unwrap_or(0));
-        self.look(length, budget, ask)?;
+        let last = placed.slots.iter().map(|slot| slot.at + 1).max();
+        let length = min.max(last.unwrap_or(0));
+        self.look(length, &mut placed.wanted, budget, ask)?;
         if let Some(end) = self.end.filter(|end| *end < length) {
             // However the items that there have to be are placed, the array ends where it
             // ends. So without items enough here, there is no array.
             return Ok((end < min).then_some(Left::Nothing));
         }
-        let in_the_way = |slot: &Slot| slot.value.as_ref().err().copied().flatten();
-        let mut cause = self.slots.iter().find_map(in_the_way);
+        let in_the_way = |slot: &Slot<u64>| slot.value.as_ref().err().copied().flatten();
+        let mut cause = placed.slots.iter().find_map(in_the_way);
         // The items of which no more is asked than their positions ask: those of the head,
         // in order, and one value for all that come after it.
         let head = self.head.len() as u64;
@@ -461,7 +337,7 @@ impl Search<'_> {
                 continue;
             }
             budget.charge(1)?;
-            match state(self.head[position], ask, &mut self.wanted) {
+            match state(self.head[position], ask, &mut placed.wanted) {
                 State::Nothing => unreachable!("the array ends before such a position"),
                 State::Possible(why) => {
                     cause.get_or_insert(why);
@@ -472,7 +348,7 @@ impl Search<'_> {
         }
         let mut rest = None;
         if length > head + self.after.len() as u64 {
-            match state(self.arrays.tail, ask, &mut self.wanted) {
+            match state(self.arrays.tail, ask, &mut placed.wanted) {
                 State::Nothing => unreachable!("the array ends before such a position"),
                 State::Possible(why) => {
                     cause.get_or_insert(why);
@@ -481,36 +357,63 @@ impl Search<'_> {
                 State::Wanted => {}
             }
         }
-        if !self.wanted.is_empty() {
-            return Ok(Some(Left::Needs(std::mem::take(&mut self.wanted))));
+        if !placed.wanted.is_empty() {
+            return Ok(Some(Left::Needs(std::mem::take(&mut placed.wanted))));
         }
         if let Some(cause) = cause {
-            self.depends.get_or_insert(cause);
+            placed.depends.get_or_insert(cause);
             return Ok(None);
         }
         // An array is one level deeper than the deepest of its items. One that would be too
         // deep to give is passed over for another.
-        let of_slots = self
+        let of_slots = placed
             .slots
             .iter()
             .filter_map(|slot| slot.value.as_ref().ok());
         let values = of_slots.chain(&plain).chain(&rest);
         let deepest = values.map(|value| value.depth).max().unwrap_or(0);
         if deepest >= DEEPEST {
-            self.depends.get_or_insert(Cause::Depth);
+            placed.depends.get_or_insert(Cause::Depth);
             return Ok(None);
         }
         if !give {
             return Ok(Some(Left::Value(None)));
         }
-        let array = self.given(budget, length, &plain, rest.as_ref(), deepest + 1)?;
+        let rest = rest.as_ref();
+        let array = self.given(&placed.slots, budget, length, &plain, rest, deepest + 1)?;
         Ok(Some(Left::Value(Some(array))))
+    }
+}
+
+impl Search<'_> {
+    /// Looks at what the first so many positions ask, as far as the first of them that
+    /// asks what no value satisfies: the array ends before that one.
+    fn look(
+        &mut self,
+        length: u64,
+        wanted: &mut Vec<CRefId>,
+        budget: &mut Budget,
+        ask: &mut dyn FnMut(CRefId) -> Option<Found>,
+    ) -> Result<(), Exhausted> {
+        // Every position after the head asks the same, so the first of them stands for all.
+        let apart = self.head.len() as u64 + 1;
+        while self.end.is_none() && self.looked < length.min(apart) {
+            budget.charge(1)?;
+            let of = self.at(self.looked);
+            if matches!(state(of, ask, wanted), State::Nothing) {
+                self.end = Some(self.looked);
+            } else {
+                self.looked += 1;
+            }
+        }
+        Ok(())
     }
 
     /// The array: the value of the slot at each position that has one, and at every other
     /// position a value that satisfies what the position asks. `depth` is how deep it is.
     fn given(
         &self,
+        slots: &[Slot<u64>],
         budget: &mut Budget,
         length: u64,
         plain: &[Rc<Witness>],
@@ -518,7 +421,7 @@ impl Search<'_> {
         depth: u32,
     ) -> Result<Rc<Witness>, Exhausted> {
         let of_slot = |slot: &usize| {
-            let value = self.slots[*slot].value.as_ref();
+            let value = slots[*slot].value.as_ref();
             value.expect("every slot has a value")
         };
         let head = self.head.len() as u64;
@@ -554,6 +457,8 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::canonical::object::Partitions;
+    use crate::language::Languages;
     use crate::schema::NodeId;
     use crate::term::{InstanceType, TypeSet, VarId};
 
@@ -565,6 +470,8 @@ mod tests {
     /// satisfies.
     struct Asked {
         terms: Terms,
+        languages: Languages,
+        partitions: Partitions,
         variables: Vec<VarId>,
         arrays: Arrays,
         found: HashMap<CRefId, Found>,
@@ -585,6 +492,8 @@ mod tests {
             Self {
                 variables: variables.collect(),
                 terms,
+                languages: Languages::default(),
+                partitions: Partitions::default(),
                 arrays: Arrays::default(),
                 found: HashMap::new(),
                 decided: Vec::new(),
@@ -663,7 +572,13 @@ mod tests {
                     Terms::ANYTHING => Some(Found::Instance(Witness::plain(Value::Null))),
                     _ => found.get(&of).cloned(),
                 };
-                let left = self.arrays.left(&mut self.terms, budget, &mut ask, true)?;
+                let mut solver = Solver {
+                    terms: &mut self.terms,
+                    languages: &mut self.languages,
+                    budget,
+                    partitions: &mut self.partitions,
+                };
+                let left = self.arrays.left(&mut solver, &mut ask, true)?;
                 let Left::Needs(wanted) = left else {
                     return Ok(left);
                 };
