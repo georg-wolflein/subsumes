@@ -4,6 +4,10 @@ BENCHMARK_VERSION := 0.4.0
 BENCHMARK_SHA256 := 3df28b7c331295c73a439701310402fdcf0a7f9043c8b4c01d4990d272321589
 BENCHMARK_URL := https://github.com/georg-wolflein/subsumes-benchmark/releases/download/v$(BENCHMARK_VERSION)/corpus.tar.zst
 
+# How many cases the benchmark checks at once. One, as CI runs it, measures the time of each
+# check. More is faster, and its times are no more than a hint: `make benchmark JOBS=8`.
+JOBS ?= 1
+
 .PHONY: ci lint format format-check test test-corpus corpus benchmark
 
 ci: format-check lint test  ## what CI runs on every change, without the benchmark
@@ -32,4 +36,4 @@ test-corpus:  ## the tests that read the corpus in benchmark/
 	cargo test --release --locked --lib -- --ignored
 
 benchmark:  ## run the library over the corpus in benchmark/ and write target/results.jsonl
-	cargo run --release --locked --package harness -- run benchmark target/results.jsonl
+	cargo run --release --locked --package harness -- run --jobs $(JOBS) benchmark target/results.jsonl
