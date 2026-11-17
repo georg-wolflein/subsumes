@@ -4,6 +4,8 @@ A Rust library for JSON Schema inclusion: **does schema A accept every instance 
 
 If it does, A _subsumes_ B. Use it to check whether a new schema still accepts everything the old schema allowed.
 
+> **Unstable:** `subsumes` is still in beta. Until version 1.0, the API may change from one minor version to the next.
+
 ## Why
 
 If you store JSON data, such as [structured outputs](https://developers.openai.com/api/docs/guides/structured-outputs) from a language model, changing its schema can make existing records invalid. A subsumption check can establish that those records will still validate without checking each one.
