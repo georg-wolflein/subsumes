@@ -6,6 +6,8 @@
 
 Everything Python runs through `uv`, from `python/`: `uv --directory python run pytest`. Its configuration is `python/pyproject.toml`. `uv run` builds the native module anew when the binding or the library has changed, so there is no build step to remember.
 
+`.github/workflows/release.yml` runs release-please: it keeps a release pull request open, and merging that publishes the crate to crates.io and the Python package to PyPI. `.github/workflows/wheels.yml` builds the wheels and the source distribution for it, and runs on a pull request that changes how the package is built.
+
 The release pull request raises the versions. Never change the version in `Cargo.toml`, `python/pyproject.toml`, `python/uv.lock` or `.release-please-manifest.json` by hand.
 
 ## Running the benchmark
@@ -23,6 +25,7 @@ Ask the user before you change `README.md`, and say what you would change and wh
 
 - The native module is one function that returns plain values. Verdicts and exceptions are classes of the package, in Python.
 - What the library decides is tested in the crate. The tests in `python/tests/` hold only what the binding adds.
+- `python/README.md` is the page of the package on PyPI, and `python/LICENSE` a copy of `LICENSE` that the wheels carry. Ask before you change that README, as for the other.
 - `a` is the schema that should accept everything and `b` the one whose instances must be accepted, in every name: `subsumes(a, b)`, `Side`.
 
 Coding conventions for the Python code:

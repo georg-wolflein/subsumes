@@ -2,7 +2,9 @@
 name = "subsumes"
 version = "0.1.0"
 description = "JSON Schema inclusion: does one schema accept every instance that is valid under another?"
+readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 keywords = ["json-schema", "jsonschema", "subsumption", "inclusion", "compatibility"]
 classifiers = [
@@ -27,6 +29,16 @@ build-backend = "maturin"
 # The crate in this folder is the native module, and `subsumes/` next to it is the package.
 module-name = "subsumes._native"
 python-source = "."
+exclude = [
+  # What running the package leaves next to its sources is no part of it.
+  "**/__pycache__/**",
+  # A source distribution holds the library too, at its top, where the files of this folder
+  # go as well. So the licence and the README of the two would be one file each, which
+  # maturin refuses. With these two lines it keeps those of the library: the licence is the
+  # same text, and the README of the package is still what PyPI shows, from the metadata.
+  { path = "/LICENSE", format = "sdist" },
+  { path = "/README.md", format = "sdist" },
+]
 
 [tool.uv]
 # The package is built anew when the binding or the library changes, not only this file.
