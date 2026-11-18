@@ -283,12 +283,12 @@ impl Places for Search<'_> {
         let before = self.end.map_or(most, |end| end.min(most));
         let mut places = Vec::new();
         // The first positions first, which makes the shortest array.
-        for position in from..head {
+        for (position, at) in self.at_head.iter().enumerate().skip(from) {
             if position as u64 >= before {
                 break;
             }
-            places.push(match self.at_head[position] {
-                Some(slot) => Place::Join(slot),
+            places.push(match at {
+                Some(slot) => Place::Join(*slot),
                 None => Place::Open(position as u64),
             });
         }
