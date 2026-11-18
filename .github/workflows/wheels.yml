@@ -1,0 +1,98 @@
+name: Wheels
+
+# Builds the Python package as it goes to PyPI: one wheel for each platform, and the source
+# distribution for every other. The release workflow calls it and uploads what it builds.
+# A pull request that changes how the package is built runs it too, and uploads nothing.
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: The commit to build, where it is not the commit of the run.
+        type: string
+        default: ""
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/wheels.yml
+      - python/pyproject.toml
+      - python/Cargo.toml
+
+permissions:
+  contents: read
+
+jobs:
+  # A wheel holds the native module for one platform. It uses the stable ABI, so the one
+  # wheel serves Python 3.12 and every later version.
+  wheel:
+    name: wheel (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, runner: ubuntu-latest, target: x86_64, manylinux: auto, test: true }
+          - { name: linux-aarch64, runner: ubuntu-24.04-arm, target: aarch64, manylinux: auto, test: true }
+          # A wheel for musl does not load on the runner, which has glibc.
+          - { name: musllinux-x86_64, runner: ubuntu-latest, target: x86_64, manylinux: musllinux_1_2, test: false }
+          - { name: musllinux-aarch64, runner: ubuntu-24.04-arm, target: aarch64, manylinux: musllinux_1_2, test: false }
+          - { name: macos-aarch64, runner: macos-latest, target: aarch64, test: true }
+          # Built on the same runner for the other processor, so it does not load there.
+          - { name: macos-x86_64, runner: macos-latest, target: x86_64, test: false }
+          - { name: windows-x64, runner: windows-latest, target: x64, test: true }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      # maturin links against an interpreter outside of Linux, where it builds in a container
+      # that has its own.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          working-directory: python
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --locked --out dist
+      # `python/LICENSE` is a link to the licence of the repository. A checkout that does not
+      # make links would put the path of the link into the wheel in place of the text.
+      - name: Check that the wheel carries the licence
+        shell: bash
+        run: unzip -p python/dist/*.whl '*.dist-info/licenses/LICENSE' | cmp - LICENSE
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        if: ${{ matrix.test }}
+      # The tests run against the wheel as it was built, on the oldest Python that the
+      # package supports and on the newest.
+      - name: Test the wheel
+        if: ${{ matrix.test }}
+        shell: bash
+        run: |
+          for python in 3.12 3.14; do
+            uv run --isolated --no-project --python "$python" \
+              --with pytest --with python/dist/*.whl \
+              pytest --import-mode=importlib python/tests
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: python-wheel-${{ matrix.name }}
+          path: python/dist/*.whl
+          if-no-files-found: error
+
+  # The source distribution holds the binding and the library, for a platform without a wheel.
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Build the source distribution
+        run: uv build --sdist --out-dir dist
+        working-directory: python
+      - name: Build a wheel from it
+        run: uv build --wheel --out-dir "$RUNNER_TEMP/from-sdist" python/dist/*.tar.gz
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: python-sdist
+          path: python/dist/*.tar.gz
+          if-no-files-found: error

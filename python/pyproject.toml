@@ -2,7 +2,9 @@
 name = "subsumes"
 version = "0.1.0"
 description = "JSON Schema inclusion: does one schema accept every instance that is valid under another?"
+readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 keywords = ["json-schema", "jsonschema", "subsumption", "inclusion", "compatibility"]
 classifiers = [
@@ -27,6 +29,8 @@ build-backend = "maturin"
 # The crate in this folder is the native module, and `subsumes/` next to it is the package.
 module-name = "subsumes._native"
 python-source = "."
+# What running the package leaves next to its sources is no part of it.
+exclude = ["**/__pycache__/**"]
 
 [tool.uv]
 # The package is built anew when the binding or the library changes, not only this file.

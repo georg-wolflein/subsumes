@@ -46,6 +46,15 @@ jobs:
           enable-cache: true
       - name: Check that the lockfile is current
         run: uv lock --check
+      # The release pull request raises both. One that raised only the crate's would
+      # publish the package under its old version.
+      - name: Check that the package has the version of the crate
+        run: |
+          crate=$(cargo metadata --no-deps --format-version 1 \
+            | jq --raw-output '.packages[] | select(.name == "subsumes") | .version')
+          package=$(uv version --short)
+          echo "crate $crate, package $package"
+          test "$crate" = "$package"
       - name: Install
         run: uv sync --all-groups
       - name: ruff check
