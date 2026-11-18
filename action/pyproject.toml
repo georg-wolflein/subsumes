@@ -1,0 +1,40 @@
+# The code of the GitHub Action in `action.yml`, with its tests. It is no package of its own:
+# the action puts this folder on the path and runs the module with the released `subsumes`.
+[project]
+name = "subsumes-action"
+version = "0"
+description = "The code of the subsumes GitHub Action."
+requires-python = ">=3.14"
+dependencies = ["subsumes"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+# Here the library is the one of this checkout, so that the tests see what the next release
+# of the action will run.
+subsumes = { path = "../python" }
+
+[tool.ruff]
+extend = "../python/pyproject.toml"
+target-version = "py314"
+src = [".", "tests"]
+
+[tool.ty.rules]
+unused-ignore-comment = "warn"
+redundant-cast = "ignore"
+
+[tool.ty.environment]
+root = [".", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "--import-mode=importlib"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "ruff>=0.17.4",
+    "ty>=0.0.100",
+]

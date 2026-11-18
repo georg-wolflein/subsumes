@@ -1,0 +1,144 @@
+name: subsumes
+description: >-
+  Checks what a change does to JSON Schemas: does each schema still accept everything it did,
+  and does it accept anything new?
+author: Georg Wölflein
+
+# The action compares each file that `files` names with the same file in an earlier commit,
+# which for a pull request is the commit it is based on. A file whose schema changed is asked
+# two questions, and the report answers both:
+#
+#   backward  does the schema accept everything it did?   subsumes(new, old)
+#   forward   does the schema accept nothing new?         subsumes(old, new)
+#
+# `compatibility` says which of them must be answered with yes. The action fails when a
+# required question is not: on a no, on a file that is no schema, and on a question that the
+# library cannot decide unless `unknown` is `warn`.
+#
+# A file is one schema of draft 2020-12 as JSON, which stands on its own. A file that only one
+# of the two commits has is reported and never fails.
+inputs:
+  files:
+    description: >-
+      The schemas to check: glob patterns relative to the working directory, one on a line.
+      `*` matches within a folder and `**` any number of folders.
+    required: true
+  compatibility:
+    description: >-
+      What a change must keep: `backward` (a schema accepts everything it did), `forward` (it
+      accepts nothing new), `full` (both) or `none` (nothing: the action only reports).
+    default: backward
+  unknown:
+    description: >-
+      What a required question that the library cannot decide does: `fail` or `warn`.
+    default: fail
+  comment:
+    description: >-
+      Whether to post the report as a comment on the pull request, which a later run updates.
+      It needs the permission `pull-requests: write`. A pull request from a fork gets no
+      comment, because its token may not write; the job summary has the report all the same.
+    default: "false"
+  base:
+    description: >-
+      The commit to compare with, as anything that git can fetch from `origin`. By default the
+      commit that the pull request or the merge group is based on, or the commit before a push.
+    default: ""
+  regex-dialect:
+    description: >-
+      The dialect of regular expressions that every `pattern` is read in: `ecma262`, which
+      JSON Schema recommends, or `rust`, that of the Rust `regex` crate, which Pydantic
+      validates a `pattern` with by default. The two read some patterns differently.
+    default: ecma262
+  budget:
+    description: >-
+      The work that one check may take, in steps. By default that of the library, with which
+      a check takes a few seconds at most.
+    default: ""
+  token:
+    description: The token that posts the comment.
+    default: ${{ github.token }}
+
+outputs:
+  report:
+    description: The path of the file that holds the report, as Markdown.
+    value: ${{ steps.check.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    # A job that has uv keeps the one it has.
+    - name: Look for uv
+      id: uv
+      shell: bash
+      run: |
+        if command -v uv > /dev/null; then
+          echo "found=true" >> "$GITHUB_OUTPUT"
+        fi
+    - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      if: steps.uv.outputs.found != 'true'
+      with:
+        enable-cache: false
+
+    # The step ends well whatever the schemas are, and says in `failed` whether the action is
+    # to fail: that happens in the last step, so that the comment is posted first.
+    - name: Check the schemas
+      id: check
+      shell: bash
+      env:
+        # The library that the action runs, which is the release of the same version: the
+        # release pull request raises this number with the others.
+        SUBSUMES_VERSION: 0.3.0 # x-release-please-version
+        FILES: ${{ inputs.files }}
+        COMPATIBILITY: ${{ inputs.compatibility }}
+        UNKNOWN: ${{ inputs.unknown }}
+        REGEX_DIALECT: ${{ inputs.regex-dialect }}
+        BUDGET: ${{ inputs.budget }}
+        BASE: >-
+          ${{ inputs.base || github.event.pull_request.base.sha
+          || github.event.merge_group.base_sha || github.event.before }}
+      # uv reads no project and no configuration of the repository that is checked, and
+      # Python takes no module from it: `-P` keeps the working directory off the path.
+      # SUBSUMES_ACTION_LIBRARY is for the tests of the action alone, which run it with the
+      # library of their checkout.
+      run: |
+        PYTHONPATH="$GITHUB_ACTION_PATH/action" uv run --no-project --no-config --python 3.14 \
+          --with "${SUBSUMES_ACTION_LIBRARY:-subsumes==$SUBSUMES_VERSION}" \
+          python -P -m subsumes_action \
+          --files "$FILES" \
+          --base "$BASE" \
+          --compatibility "$COMPATIBILITY" \
+          --unknown "$UNKNOWN" \
+          --regex-dialect "$REGEX_DIALECT" \
+          --budget "$BUDGET" \
+          --report "$RUNNER_TEMP/subsumes-report.md"
+
+    - name: Comment on the pull request
+      if: >-
+        ${{ inputs.comment == 'true' && steps.check.outputs.changed != '0'
+        && github.event.pull_request.number
+        && (github.event_name != 'pull_request'
+        || github.event.pull_request.head.repo.full_name == github.repository) }}
+      uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
+      with:
+        header: subsumes
+        path: ${{ steps.check.outputs.report }}
+        GITHUB_TOKEN: ${{ inputs.token }}
+    # A pull request that changes no schema any more loses the comment of an earlier run.
+    - name: Remove the comment of an earlier run
+      if: >-
+        ${{ inputs.comment == 'true' && steps.check.outputs.changed == '0'
+        && github.event.pull_request.number
+        && (github.event_name != 'pull_request'
+        || github.event.pull_request.head.repo.full_name == github.repository) }}
+      uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
+      with:
+        header: subsumes
+        delete: true
+        GITHUB_TOKEN: ${{ inputs.token }}
+
+    - name: Fail when a schema does not keep what is required
+      if: steps.check.outputs.failed == 'true'
+      shell: bash
+      run: |
+        echo "A schema does not keep what \`compatibility\` requires. The summary of the job has the report."
+        exit 1

@@ -24,6 +24,15 @@
           "type": "toml",
           "path": "python/uv.lock",
           "jsonpath": "$.package[?(@.name.value=='subsumes')].version"
+        },
+        {
+          "type": "toml",
+          "path": "action/uv.lock",
+          "jsonpath": "$.package[?(@.name.value=='subsumes')].version"
+        },
+        {
+          "type": "generic",
+          "path": "action.yml"
         }
       ]
     }

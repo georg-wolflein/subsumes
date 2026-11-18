@@ -70,6 +70,32 @@ The package `subsumes` in `python/` wraps the library. Its verdicts are those of
 - **One wheel for a platform,** through the stable ABI of Python 3.12, which is the oldest version supported: the first with the `type` statement.
 - **The package is released with the crate,** under the same version, by the same release pull request. The release workflow builds the wheels and the source distribution before it publishes anything, so a wheel that does not build stops the release while nothing is out. Then the crate goes to crates.io and the package to PyPI, each registry trusting the workflow, and the release stays a draft until both have it.
 
+### GitHub Action
+
+```
+- uses: georg-wolflein/subsumes@v<version>
+  with:
+    files: schemas/*.json       # glob patterns, one on a line
+    compatibility: backward     # backward | forward | full | none
+    unknown: fail               # fail | warn
+    regex-dialect: ecma262      # ecma262 | rust
+    comment: false              # the report as a comment on the pull request
+```
+
+`action.yml` at the root is the action, and `action/` holds the Python code that it runs. For a pull request it compares each schema of the checkout with the same file in the commit that the pull request is based on, and reports what the change does to the schema.
+
+- **Two questions for each change, and the report answers both.** Backward is `subsumes(new, old)`: the schema accepts everything it did, so what was stored under it stays valid. Forward is `subsumes(old, new)`: the schema accepts nothing new, so a reader that was built on the old version takes everything that is written under the new one. Together they say whether a schema accepts the same, more, less, or some of each, which is why the report has both whichever of them the workflow requires.
+- **`compatibility` says which question must be answered with yes, and the action fails when one is not.** On a `No`, on a file that is no schema the library reads, and on an `Unknown`. `none` requires nothing, so nothing fails and the action only reports. A workflow that lets a label allow a break chooses between `none` and another value with an expression, so there is no input for that.
+- **`Unknown` fails unless `unknown` is `warn`.** An undecided check does not pass for an answer, as in the Python package. It can stop a pull request for a reason that its author cannot mend, which is what `warn` is for.
+- **`regex-dialect` is the dialect of the library, for all the files of a step.** `ecma262` is the default, as in the library. A repository whose schemas Pydantic writes names `rust`, and one that has schemas of both dialects runs the action once for each. The report does not say which dialect it is of.
+- **The action lives in this repository and has the version of the library.** At the tag `v0.4.0` it runs the library 0.4.0, so the tag says which verdicts a workflow gets. A line in `action.yml` names the version, and the release pull request raises it with the others. It gives up three things: a mended action reaches a workflow only with a release of the crate and the package, the tag is there a few minutes before PyPI has the wheel and the action at that tag fails until then, and the action has no tag such as `v1` that moves.
+- **Python against the wheel from PyPI, and no command line tool.** The action is composite: it gets uv where the job has none, and runs the module of `action/` with the released package, for which there is a wheel on every runner that GitHub hosts but Windows on ARM. The code belongs to the action and promises nothing to someone who runs it by hand, so a [command line tool](#not-planned) stays unplanned. It gives up use outside of a workflow, such as before a commit.
+- **The old version comes from git and the new one from the working tree.** The commit to compare with is fetched alone, without its history, so a workflow needs no deeper checkout. A pull request is checked out as merged by default, so the two versions differ in what merging it would change. A workflow may also write the schemas before the action runs, such as from the classes of a program.
+- **A file is one schema, and a file whose schema is the same did not change.** White space and the order of the keys are no part of a schema, and a checkout on Windows writes other line ends. A file that only one of the two commits has is reported and never fails. A new version that is no schema fails where anything is required, and an old version that is none leaves both questions `Unknown`.
+- **The report goes to the job summary, to a file, and on request to a comment.** `comment: true` posts it through the action `marocchino/sticky-pull-request-comment`, which CI uses for the benchmark comment as well. A later run updates the comment, and removes it when the pull request changes no schema any more. The job then needs the permission `pull-requests: write`. A pull request from a fork gets no comment, because its token may not write.
+- **Nothing in a file is read as Markdown or as a workflow command.** Anyone may open a pull request, and the report is posted by the workflow. A path and an example stand in code, a message has its punctuation escaped, and a line of the log never begins with what a file holds.
+- **The tests in `action/tests/` use the library of the checkout,** and so does a job of CI that runs the action as a workflow does, on Linux, macOS and Windows. It names that library in `SUBSUMES_ACTION_LIBRARY`, which is there for this job alone. So a change to the library that breaks the action shows on the pull request.
+
 ## Pipeline
 
 ```
@@ -242,6 +268,8 @@ src/
   generate.rs     counterexamples (exists)
 harness/          the benchmark runner with its check of counterexamples, and the viewer (exists)
 python/           the Python package: the binding crate in src/, the package in subsumes/, its tests (exists)
+action.yml        the GitHub Action (exists)
+action/           its code in subsumes_action/, and its tests (exists)
 ```
 
 ## Order of work
@@ -289,6 +317,11 @@ What a step left open, with the step that takes it up:
 - **Wheels for more platforms, for no step yet.** A release has a wheel for Linux with glibc and with musl and for macOS, each for x86-64 and for ARM, and one for Windows on x86-64. Every other platform builds the package from the source distribution, which needs a Rust toolchain: Windows on ARM, 32-bit systems, and a free-threaded Python, which the stable ABI does not serve before Python 3.15.
 - **The README does not name the Python package, for no step yet.** The package has a README of its own in `python/`, which is what PyPI shows.
 - **Exact integers beyond 64 bits from Python, for no step yet.** Python holds an integer of any size exactly, and the binding rounds one that 64 bits do not hold to a float, because a `serde_json` value has no other place for it. It follows the item on numbers of any precision above.
+- **The README does not name the action, for no step yet.** `action.yml` describes its inputs, and this document the reasons. The action is not listed on the GitHub Marketplace either.
+- **A schema that is renamed is a deleted file and a new one to the action, for no step yet.** Neither fails, so a schema that is renamed and narrowed in one pull request passes.
+- **A schema inside another document, for no step yet.** The action reads a file as one schema in JSON. A schema in YAML, or one of several in a document such as an OpenAPI description, has to be written to a file of its own by a step before the action.
+- **The wheel that the action installs is named by its version and not by its hash, for no step yet.** The hash of a wheel is not known before the release that builds it, and the line in `action.yml` is written before that.
+- **No comment on a pull request from a fork, for no step yet.** It takes a second workflow that runs after the first with a token that may write, and is handed the report.
 
 ## Not planned
 
