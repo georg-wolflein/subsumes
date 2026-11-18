@@ -4,7 +4,8 @@ A Rust library for JSON Schema inclusion: **does schema A accept every instance 
 
 If it does, A _subsumes_ B. Use it to check whether a new schema still accepts everything the old schema allowed.
 
-> **Unstable:** `subsumes` is still in beta. Until version 1.0, the API may change from one minor version to the next.
+> [!WARNING]
+> `subsumes` is still in beta. Until version 1.0, the API may change from one minor version to the next.
 
 ## Why
 
