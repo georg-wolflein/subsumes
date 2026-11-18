@@ -36,13 +36,7 @@ Each check returns one of three verdicts:
 
 ## Regular expressions
 
-JSON Schema [recommends](https://json-schema.org/draft/2020-12/json-schema-core#section-6.4) ECMA-262 regular expressions with the `u` flag for `pattern` and `patternProperties`, and that is how `subsumes` reads them by default. In practice a schema carries the dialect of whatever produced it, so the dialect can be chosen: `Checker::new().regex_dialect(RegexDialect::Rust)` reads patterns in the dialect of the Rust [`regex`](https://docs.rs/regex/latest/regex/#syntax) crate, which is the engine that [Pydantic](https://docs.pydantic.dev/) uses by default to validate `pattern` constraints.
-
-The dialect changes answers. In ECMA-262, `\d` matches only `0` to `9`; in the `regex` crate it matches every Unicode decimal digit. So `^[0-9]+$` subsumes `^\d+$` in ECMA-262, and in the Rust dialect it does not, because `^\d+$` accepts `"٣"` there. A pattern matches a string when it matches anywhere in it, as the draft says, so `a` accepts `"banana"`.
-
-With the `u` flag, ECMA-262 rejects some patterns that it takes without it, such as `^4\-.*`, which escapes a character that needs no escape. Such a pattern is not read, and a check whose answer depends on it returns `Unknown`.
-
-The keys of `patternProperties` are read the same way, and so is a `pattern` under `propertyNames`. One dialect holds for both schemas of a check.
+`pattern` and `patternProperties` are read as ECMA-262 regular expressions with the `u` flag by default, which is what JSON Schema [recommends](https://json-schema.org/draft/2020-12/json-schema-core#section-6.4). To read them in the dialect of the Rust [`regex`](https://docs.rs/regex/latest/regex/#syntax) crate instead, use `Checker::new().regex_dialect(RegexDialect::Rust)`.
 
 ## Numbers
 
