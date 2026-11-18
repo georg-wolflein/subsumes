@@ -54,6 +54,11 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           args: --release --locked --out dist
+      # `python/LICENSE` is a link to the licence of the repository. A checkout that does not
+      # make links would put the path of the link into the wheel in place of the text.
+      - name: Check that the wheel carries the licence
+        shell: bash
+        run: unzip -p python/dist/*.whl '*.dist-info/licenses/LICENSE' | cmp - LICENSE
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         if: ${{ matrix.test }}
       # The tests run against the wheel as it was built, on the oldest Python that the

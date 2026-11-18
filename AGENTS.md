@@ -25,7 +25,7 @@ Ask the user before you change `README.md`, and say what you would change and wh
 
 - The native module is one function that returns plain values. Verdicts and exceptions are classes of the package, in Python.
 - What the library decides is tested in the crate. The tests in `python/tests/` hold only what the binding adds.
-- `python/README.md` is the page of the package on PyPI, and `python/LICENSE` a copy of `LICENSE` that the wheels carry. Ask before you change that README, as for the other.
+- `python/README.md` is the page of the package on PyPI, and `python/LICENSE` a link to `LICENSE`, so that the wheels carry the licence. Ask before you change that README, as for the other.
 - `a` is the schema that should accept everything and `b` the one whose instances must be accepted, in every name: `subsumes(a, b)`, `Side`.
 
 Coding conventions for the Python code:
