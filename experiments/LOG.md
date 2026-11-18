@@ -96,3 +96,20 @@ This is thrashing, as constraint solvers call it, and the remedies are theirs: s
 | last dead end, then fewest alternatives | 718.0 million | 1,454 |
 
 **Dropped.** The last dead end takes 1.3% fewer steps than the count and decides the same checks, which is no reason to change the rule. The fewest alternatives first loses 6 verdicts and takes 22% more steps: the order in which the disjunctions are met is the better one where nothing is known of them.
+
+### How the steps grow, on a schema made for it
+
+A `oneOf` of n kinds of object, each with a property of its own that it requires, written in two ways: A closes each kind with a second schema beside the first, as the corpus does where `unevaluatedProperties` was written out, and B closes it in the schema itself. Both say the same, so both checks are `Yes`. It is the unit test `a_disjunction_that_leaves_no_alternative_is_split_before_the_others`, and what `additional-as-uneval/o81108` comes down to.
+
+Steps of the check that A subsumes B:
+
+| kinds | baseline | E1 | E2 |
+| ---: | ---: | ---: | ---: |
+| 4 | 32,563 | 13,183 | 2,839 |
+| 5 | 231,300 | 65,712 | 5,434 |
+| 6 | 1,773,709 | 374,404 | 9,908 |
+| 7 | at the budget | 1,921,296 | 16,578 |
+| 8 | at the budget | 9,381,607 | 24,999 |
+
+- The baseline takes seven to eight times the steps for each kind that is added, and E1 five times: both are exponential, and E1 only has the smaller base.
+- E2 takes about one and a half times the steps for each kind, and less with each one: the steps grow with a power of the number of kinds, about the third.

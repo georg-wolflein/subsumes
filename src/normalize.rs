@@ -3632,6 +3632,42 @@ mod tests {
     }
 
     #[test]
+    fn a_disjunction_that_leaves_no_alternative_is_split_before_the_others() {
+        // Eight kinds of object, each with a property of its own that it requires, written
+        // in two ways: A closes each kind with a second schema beside the first, and B in
+        // the schema itself. Each alternative of the `oneOf` of B stands with the negation of
+        // every other alternative and of every alternative of A, which are fifteen
+        // disjunctions, and only the negation of its own kind in A leaves no alternative.
+        // Split in the order in which they are met, the others come first, and the steps
+        // grow fivefold or more with each kind: with seven kinds they are past ten million.
+        let names = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        let open = |name: &str| {
+            json!({
+                "type": "object",
+                "properties": {name: {"type": "string"}, "extra": {"type": "boolean"}},
+                "required": [name],
+            })
+        };
+        let plain = |name: &&str| {
+            let mut kind = open(name);
+            kind["additionalProperties"] = json!(false);
+            kind
+        };
+        let wordy = |name: &&str| {
+            let named = json!({format!("^{name}$"): true, "^extra$": true});
+            json!({"allOf": [
+                open(name),
+                {"patternProperties": named, "additionalProperties": false},
+            ]})
+        };
+        let a = json!({"oneOf": names.iter().map(wordy).collect::<Vec<_>>()});
+        let b = json!({"oneOf": names.iter().map(plain).collect::<Vec<_>>()});
+        let enough = Checker::new().budget(100_000);
+        assert_eq!(enough.subsumes(&a, &b).unwrap(), Verdict::Yes);
+        assert_eq!(enough.subsumes(&b, &a).unwrap(), Verdict::Yes);
+    }
+
+    #[test]
     fn a_split_tries_every_alternative() {
         let terms = &mut Terms::default();
         let parts: Vec<TermId> = [true, false]
