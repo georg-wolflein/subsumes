@@ -391,7 +391,7 @@ dependencies = [
 
 [[package]]
 name = "harness"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "clap",
  "jsonschema",
@@ -1238,7 +1238,7 @@ dependencies = [
 
 [[package]]
 name = "subsumes"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "fluent-uri",
  "num-bigint",
@@ -1257,7 +1257,7 @@ dependencies = [
 
 [[package]]
 name = "subsumes-py"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "pyo3",
  "serde_json",
