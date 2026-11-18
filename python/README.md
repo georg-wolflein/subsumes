@@ -62,6 +62,10 @@ except UndecidedError as undecided:
 
 A schema that cannot be checked at all raises a `SchemaError`, which is a `ValueError`: it is no schema, it declares another dialect, a keyword has a value that the draft does not allow, or a reference resolves to nothing. A schema has to stand on its own, so one that is spread over several files is bundled into one first.
 
+## Regular expressions
+
+A `pattern` is read as an ECMA-262 regular expression, which is what JSON Schema recommends. For schemas whose patterns are written for the Rust `regex` crate, as those that Pydantic validates are by default, name that dialect: `subsumes(a, b, regex_dialect="rust")`.
+
 ## What is modelled
 
 The [README of the repository](https://github.com/georg-wolflein/subsumes#readme) says how patterns, numbers and `format` are read, and which constructs are not supported.
