@@ -151,7 +151,28 @@ struct Item {
 }
 
 /// One of the alternatives of a disjunction: terms that hold together.
-type Alternative = Vec<Item>;
+#[derive(Debug)]
+struct Alternative {
+    holds: Vec<Item>,
+    /// A disjunction that holds with them, if the alternative is one of "two hold".
+    and: Option<Later>,
+}
+
+impl From<Vec<Item>> for Alternative {
+    fn from(holds: Vec<Item>) -> Self {
+        Self { holds, and: None }
+    }
+}
+
+/// The disjunction of the terms of a `OneOf` that come after a place: one of them holds.
+/// It is no term of its own, because a `OneOf` would need one for each of its places, which
+/// is the square of its length.
+#[derive(Debug, Clone, Copy)]
+struct Later {
+    one_of: TermId,
+    after: usize,
+    within: Option<usize>,
+}
 
 impl Item {
     fn new(term: TermId, negated: bool) -> Self {
@@ -211,6 +232,9 @@ struct Branch {
     todo: VecDeque<Item>,
     /// The disjunctions that were met and not split yet.
     choices: VecDeque<Item>,
+    /// A disjunction that the branch splits on before any other, as soon as it stands: the
+    /// second half of an alternative of "two hold".
+    and: Option<Later>,
 }
 
 impl Default for Branch {
@@ -235,6 +259,7 @@ impl Default for Branch {
             met: BTreeSet::new(),
             todo: VecDeque::new(),
             choices: VecDeque::new(),
+            and: None,
         }
     }
 }
@@ -463,7 +488,7 @@ impl Engine<'_> {
                 whole.push(Item::new(terms.reference(*variable), negated));
             }
         }
-        let whole: Box<dyn Iterator<Item = Alternative>> = Box::new(std::iter::once(whole));
+        let whole: Box<dyn Iterator<Item = Alternative>> = Box::new(std::iter::once(whole.into()));
         self.at_work.insert(of, self.tasks.len());
         self.tasks.push(Task {
             of,
@@ -566,7 +591,8 @@ impl Engine<'_> {
                 };
                 self.context.budget.charge(1 + split.branch.weight() / 32)?;
                 let mut branch = split.branch.clone();
-                branch.todo.extend(alternative);
+                branch.todo.extend(alternative.holds);
+                branch.and = alternative.and;
                 branch
             }
         };
@@ -580,6 +606,22 @@ impl Engine<'_> {
         }
         if self.is_hopeless(&branch) {
             self.stood();
+            return Ok(None);
+        }
+        if let Some(later) = branch.and.take() {
+            // The first of two terms holds as far as it goes. Which of the terms after it
+            // holds with it is the other half of the same alternative, so the branch
+            // splits on that before any other disjunction. The alternative has brought
+            // this split: if no term after the first stands with it, it did not stand.
+            let still_to_come = one_later(&self.context.terms, later);
+            let task = self.tasks.last_mut().expect("a task is at work");
+            task.splits.push(Split {
+                branch,
+                still_to_come,
+                choice: None,
+                brought: true,
+                stood: false,
+            });
             return Ok(None);
         }
         if let Some((choice, brought)) = self.choose(&mut branch) {
@@ -966,7 +1008,7 @@ impl Engine<'_> {
             Item::new(terms.type_is(STRING), false),
             Item::new(terms.reference(variable), false),
         ];
-        let whole: Box<dyn Iterator<Item = Alternative>> = Box::new(std::iter::once(whole));
+        let whole: Box<dyn Iterator<Item = Alternative>> = Box::new(std::iter::once(whole.into()));
         let mut splits: Vec<(Branch, Box<dyn Iterator<Item = Alternative>>)> =
             vec![(Branch::default(), whole)];
         let mut all = Some(Languages::NOTHING);
@@ -977,8 +1019,14 @@ impl Engine<'_> {
             };
             self.context.budget.charge(1 + split.weight() / 32)?;
             let mut branch = split.clone();
-            branch.todo.extend(alternative);
+            branch.todo.extend(alternative.holds);
+            branch.and = alternative.and;
             if !matches!(self.settle(&mut branch)?, Settled::Stands) {
+                continue;
+            }
+            if let Some(later) = branch.and.take() {
+                let alternatives = one_later(&self.context.terms, later);
+                splits.push((branch, alternatives));
                 continue;
             }
             if let Some(choice) = branch.choices.pop_front() {
@@ -1109,31 +1157,60 @@ fn alternatives(terms: &Terms, choice: &Item) -> Box<dyn Iterator<Item = Alterna
         (Term::AnyOf(parts), negated @ false) | (Term::AllOf(parts), negated @ true) => {
             let parts = parts.to_vec();
             let parts = parts.into_iter();
-            Box::new(parts.map(move |part| vec![item(part, negated)]))
+            Box::new(parts.map(move |part| vec![item(part, negated)].into()))
         }
         // One holds and no other does.
         (Term::OneOf(parts), false) => {
             let parts = parts.to_vec();
             Box::new((0..parts.len()).map(move |holds| {
                 let all = parts.iter().enumerate();
-                all.map(|(place, part)| item(*part, place != holds))
-                    .collect()
+                let alternative: Vec<Item> = all
+                    .map(|(place, part)| item(*part, place != holds))
+                    .collect();
+                alternative.into()
             }))
         }
-        // None holds, or two do.
+        // None holds, or two do. Two hold when one holds and one after it does: there is
+        // one such alternative for each term but the last, and not one for each pair. The
+        // pairs with the same first term share what that term takes in, and where it is
+        // refuted by itself, none of them is made.
         (Term::OneOf(parts), true) => {
-            let parts = parts.to_vec();
-            let none: Alternative = parts.iter().map(|part| item(*part, true)).collect();
-            let count = parts.len();
-            let pairs = (0..count)
-                .flat_map(move |first| (first + 1..count).map(move |second| (first, second)));
-            let two = pairs.map(move |(first, second)| {
-                vec![item(parts[first], false), item(parts[second], false)]
-            });
-            Box::new(std::iter::once(none).chain(two))
+            let none: Vec<Item> = parts.iter().map(|part| item(*part, true)).collect();
+            let one_of = choice.term;
+            let mut firsts = parts.to_vec();
+            firsts.pop();
+            let two = firsts
+                .into_iter()
+                .enumerate()
+                .map(move |(after, first)| Alternative {
+                    holds: vec![item(first, false)],
+                    and: Some(Later {
+                        one_of,
+                        after,
+                        within,
+                    }),
+                });
+            Box::new(std::iter::once(none.into()).chain(two))
         }
         (other, _) => unreachable!("{other:?} is no disjunction"),
     }
+}
+
+/// The alternatives of "one of the terms of a `OneOf` after a place holds".
+fn one_later(terms: &Terms, later: Later) -> Box<dyn Iterator<Item = Alternative>> {
+    let Term::OneOf(parts) = terms.term(later.one_of) else {
+        unreachable!("the terms after a place are those of a `OneOf`");
+    };
+    let rest = parts[later.after + 1..].to_vec();
+    let within = later.within;
+    Box::new(rest.into_iter().map(move |term| {
+        let holds = Item {
+            term,
+            negated: false,
+            within,
+        };
+        vec![holds].into()
+    }))
 }
 
 #[cfg(test)]
@@ -3650,8 +3727,22 @@ mod tests {
                     term
                 }
             };
+            let together = |all: &Alternative| {
+                let all = all.holds.iter().map(literal);
+                all.collect::<Vec<_>>().join(" and ")
+            };
             alternatives(terms, &choice)
-                .map(|all| all.iter().map(literal).collect::<Vec<_>>().join(" and "))
+                .map(|all| match all.and {
+                    None => together(&all),
+                    // Which of the terms after the first holds with it is a split of its
+                    // own, with an alternative for each.
+                    Some(later) => {
+                        let later: Vec<String> = one_later(terms, later)
+                            .map(|other| together(&other))
+                            .collect();
+                        format!("{} and one of [{}]", together(&all), later.join(", "))
+                    }
+                })
                 .collect::<Vec<_>>()
         };
         let any = terms.any_of(parts.clone());
@@ -3677,10 +3768,48 @@ mod tests {
             shown(terms, one, true),
             [
                 "not is(true) and not is(false) and not type(null)",
-                "is(true) and is(false)",
-                "is(true) and type(null)",
-                "is(false) and type(null)",
+                "is(true) and one of [is(false), type(null)]",
+                "is(false) and one of [type(null)]",
             ]
+        );
+    }
+
+    #[test]
+    fn two_of_a_long_one_of_take_each_of_them_in_once() {
+        // Sixty schemas that exclude each other, as `anyOf` and as `oneOf`. That an
+        // instance of one of them is an instance of exactly one is that no two hold
+        // together, for each of the sixty: 1,770 pairs each time, which is over a hundred
+        // thousand, each with two schemas to take in. A schema that is refuted by itself
+        // is taken in once, and none of its pairs is made.
+        let kinds = |keyword: &str| {
+            let kind = |n: u32| {
+                json!({
+                    "type": "object",
+                    "required": ["kind", "x", "y"],
+                    "properties": {
+                        "kind": {"const": n},
+                        "x": {"type": "number"},
+                        "y": {"type": "string"},
+                    },
+                })
+            };
+            Value::Object(Map::from_iter([(
+                keyword.to_owned(),
+                (0..60).map(kind).collect(),
+            )]))
+        };
+        let (any, one) = (kinds("anyOf"), kinds("oneOf"));
+        let enough = Checker::new().budget(1_000_000);
+        assert_eq!(enough.subsumes(&one, &any).unwrap(), Verdict::Yes);
+        // Where two of them do hold together, those two are found.
+        let overlap = json!({"oneOf": [
+            {"type": "number", "minimum": 0},
+            {"type": "string"},
+            {"type": "number", "maximum": 0},
+        ]});
+        assert_eq!(
+            counterexample(&overlap, &json!({"type": "number"})),
+            json!(0)
         );
     }
 
