@@ -81,3 +81,18 @@ This is thrashing, as constraint solvers call it, and the remedies are theirs: s
 | the whole run, one job | 382 s to 423 s | 130 s | 36 s |
 
 **Kept.** A run takes 9% of the time it took, which is past the goal of a quarter.
+
+### E3. Other rules for which disjunction to split first
+
+**Hypothesis.** The count of E1 and E2 is one of several rules that constraint solvers use. Another may decide more checks or take fewer steps: the disjunction whose dead end was the last one, in place of the one with the most, or the disjunction with the fewest alternatives where the counts are equal.
+
+**Change.** Four variants of the rule behind a switch, each run over the whole corpus. Steps do not depend on the machine, so the runs are held against each other by steps and verdicts.
+
+| rule | steps | `Unknown` |
+| --- | ---: | ---: |
+| most dead ends, then first met (E2) | 571.5 million | 1,448 |
+| last dead end, then first met | 564.3 million | 1,448 |
+| most dead ends, then fewest alternatives | 698.7 million | 1,454 |
+| last dead end, then fewest alternatives | 718.0 million | 1,454 |
+
+**Dropped.** The last dead end takes 1.3% fewer steps than the count and decides the same checks, which is no reason to change the rule. The fewest alternatives first loses 6 verdicts and takes 22% more steps: the order in which the disjunctions are met is the better one where nothing is known of them.
