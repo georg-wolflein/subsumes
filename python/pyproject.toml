@@ -1,0 +1,101 @@
+[project]
+name = "subsumes"
+version = "0.1.0"
+description = "JSON Schema inclusion: does one schema accept every instance that is valid under another?"
+license = "MIT"
+requires-python = ">=3.12"
+keywords = ["json-schema", "jsonschema", "subsumption", "inclusion", "compatibility"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Rust",
+  "Typing :: Typed",
+]
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/georg-wolflein/subsumes"
+Issues = "https://github.com/georg-wolflein/subsumes/issues"
+
+[build-system]
+requires = ["maturin>=1.16,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+# The crate in this folder is the native module, and `subsumes/` next to it is the package.
+module-name = "subsumes._native"
+python-source = "."
+
+[tool.uv]
+# The package is built anew when the binding or the library changes, not only this file.
+cache-keys = [
+  { file = "pyproject.toml" },
+  { file = "Cargo.toml" },
+  { file = "src/**/*.rs" },
+  { file = "../Cargo.toml" },
+  { file = "../Cargo.lock" },
+  { file = "../src/**/*.rs" },
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = [".", "tests"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.ruff.lint]
+select = [
+  "E",       # pycodestyle errors
+  "W",       # pycodestyle warnings
+  "F",       # pyflakes
+  "I",       # isort
+  "B",       # flake8-bugbear
+  "C4",      # flake8-comprehensions
+  "UP",      # pyupgrade
+  "D",       # pydocstyle
+  "TID",     # tidy imports (disallow relative imports)
+  "ICN",     # import conventions
+  "SIM",     # simplify code
+  "PTH",     # use pathlib
+  "N",       # PEP8 naming
+  "FURB",    # refurb
+  "RUF",     # Ruff rules
+  "PT",      # pytest style
+  "TC",      # imports only needed for type checking
+  "PLC0415", # import-outside-top-level
+]
+ignore = [
+  "D417",   # requires documentation for every function parameter
+  "D1",     # missing docstrings
+  "RUF001", # unicode
+]
+pydocstyle = { convention = "google" }
+isort = { combine-as-imports = true }
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
+
+[tool.ty.rules]
+unused-ignore-comment = "warn"
+redundant-cast = "ignore"
+
+[tool.ty.environment]
+root = [".", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--import-mode=importlib"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "ruff>=0.17.4",
+    "ty>=0.0.100",
+]

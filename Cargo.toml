@@ -31,4 +31,4 @@ regexsolver = { version = "1", default-features = false }
 referencing = "0.61"
 
 [workspace]
-members = ["harness"]
+members = ["harness", "python"]

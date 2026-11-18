@@ -1,2 +1,8 @@
 /target
 /benchmark
+# The Python package: its environment, its caches and the native module that a build puts next to the sources.
+/python/.venv
+/python/subsumes/*.so
+__pycache__/
+.pytest_cache/
+.ruff_cache/

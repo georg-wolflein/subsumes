@@ -1,0 +1,20 @@
+[package]
+name = "subsumes-py"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+# The native half of the Python package `subsumes`, which imports it as `subsumes._native`.
+name = "_native"
+crate-type = ["cdylib"]
+# The module finds the interpreter's symbols only when an interpreter loads it, so a test
+# binary of it would not link. The tests are in Python: `tests/`.
+test = false
+doctest = false
+
+[dependencies]
+# The stable ABI of Python 3.12: one wheel for a platform serves that version and every later one.
+pyo3 = { version = "0.30", features = ["abi3-py312"] }
+serde_json = "1"
+subsumes = { path = ".." }
