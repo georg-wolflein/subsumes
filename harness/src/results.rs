@@ -30,12 +30,12 @@ impl Direction {
         }
     }
 
-    /// The file of the wide schema, which was to accept everything, and the file of the
+    /// The name in the case of the wide schema, which was to accept everything, and of the
     /// narrow schema, whose instances it was to accept.
-    pub fn files(self) -> (&'static str, &'static str) {
+    pub fn schemas(self) -> (&'static str, &'static str) {
         match self {
-            Self::ASubsumesB => ("a.json", "b.json"),
-            Self::BSubsumesA => ("b.json", "a.json"),
+            Self::ASubsumesB => ("a", "b"),
+            Self::BSubsumesA => ("b", "a"),
         }
     }
 }
@@ -126,7 +126,8 @@ fn keyword(location: &str) -> String {
 /// One line of the results file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Record {
-    /// The folder of the case inside the corpus, such as `rb-testset/additional_items`.
+    /// The id of the case: the path of its file inside the corpus without the `.json`, such
+    /// as `rb-testset/additional_items`.
     pub case: String,
     pub direction: Direction,
     /// The label of the corpus; `None` where it claims nothing.
@@ -144,7 +145,7 @@ impl Record {
         (&self.case, self.direction)
     }
 
-    /// The collection of the case: the first folder of its path.
+    /// The collection of the case: the first folder of its id.
     pub fn collection(&self) -> &str {
         self.case.split('/').next().unwrap_or(&self.case)
     }
@@ -172,7 +173,7 @@ impl Record {
             confirmation,
         } = &self.outcome
         {
-            let (wide, narrow) = self.direction.files();
+            let (wide, narrow) = self.direction.schemas();
             let instance = shortened(&counterexample.to_string());
             match confirmation {
                 Confirmation::RejectedByNarrow => {
@@ -420,13 +421,13 @@ mod tests {
             assert!(rejected.is_wrong());
             assert_eq!(
                 rejected.described(),
-                "`collection/group/case` a_subsumes_b: No, and `b.json` rejects the counterexample `0`"
+                "`collection/group/case` a_subsumes_b: No, and `b` rejects the counterexample `0`"
             );
             let accepted = record(expected, no(json!("x"), Confirmation::AcceptedByWide));
             assert!(accepted.is_wrong());
             assert_eq!(
                 accepted.described(),
-                "`collection/group/case` a_subsumes_b: No, and `a.json` accepts the counterexample `\"x\"`"
+                "`collection/group/case` a_subsumes_b: No, and `a` accepts the counterexample `\"x\"`"
             );
         }
         // The other way round, the two files change places.
@@ -435,14 +436,13 @@ mod tests {
         assert!(
             other
                 .described()
-                .ends_with("`a.json` rejects the counterexample `0`")
+                .ends_with("`a` rejects the counterexample `0`")
         );
         // Both faults are named.
         let both = record(Some(true), no(json!(0), Confirmation::AcceptedByWide));
         assert!(
-            both.described().ends_with(
-                "No, and the corpus says Yes, and `a.json` accepts the counterexample `0`"
-            )
+            both.described()
+                .ends_with("No, and the corpus says Yes, and `a` accepts the counterexample `0`")
         );
         let counts = Counts::of([&both, &other]);
         assert_eq!((counts.no, counts.wrong), (2, 2));
