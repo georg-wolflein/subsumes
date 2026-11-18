@@ -3,6 +3,8 @@
 # The Python package: its environment, its caches and the native module that a build puts next to the sources.
 /python/.venv
 /python/subsumes/*.so
+# The code of the GitHub Action: its environment.
+/action/.venv
 __pycache__/
 .pytest_cache/
 .ruff_cache/

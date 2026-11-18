@@ -11,6 +11,8 @@ JOBS ?= 1
 # The Python package in python/ has its own environment, which uv keeps. `uv run` builds the
 # native module anew when the binding or the library has changed.
 PYTHON := uv --directory python run
+# The code of the GitHub Action in action/ has one too, with the library of this checkout.
+ACTION := uv --directory action run
 
 .PHONY: ci lint format format-check typecheck test test-corpus corpus benchmark
 
@@ -19,22 +21,28 @@ ci: format-check lint typecheck test  ## what CI runs on every change, without t
 lint:
 	cargo clippy --workspace --locked --all-targets -- --deny warnings
 	$(PYTHON) ruff check .
+	$(ACTION) ruff check .
 
 format:
 	cargo fmt --all
 	$(PYTHON) ruff format .
 	$(PYTHON) ruff check --fix .
+	$(ACTION) ruff format .
+	$(ACTION) ruff check --fix .
 
 format-check:
 	cargo fmt --all --check
 	$(PYTHON) ruff format --check .
+	$(ACTION) ruff format --check .
 
-typecheck:  ## the Python package only; the compiler checks the rest
+typecheck:  ## the Python code only; the compiler checks the rest
 	$(PYTHON) ty check
+	$(ACTION) ty check
 
 test:
 	cargo test --workspace --locked
 	$(PYTHON) pytest
+	$(ACTION) pytest
 
 corpus:  ## download the pinned benchmark corpus and unpack it into benchmark/
 	mkdir -p target

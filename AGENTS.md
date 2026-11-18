@@ -2,13 +2,13 @@
 
 ## Tooling
 
-`make ci` runs what CI runs on a pull request, without the benchmark: `cargo fmt --check`, `cargo clippy` and `cargo test` for the workspace, and for the Python package in `python/` `ruff check`, `ruff format --check`, `ty check` and `pytest`. `make format` fixes what the formatters can fix.
+`make ci` runs what CI runs on a pull request, without the benchmark: `cargo fmt --check`, `cargo clippy` and `cargo test` for the workspace, and `ruff check`, `ruff format --check`, `ty check` and `pytest` for the Python package in `python/` and for the code of the action in `action/`. `make format` fixes what the formatters can fix.
 
-Everything Python runs through `uv`, from `python/`: `uv --directory python run pytest`. Its configuration is `python/pyproject.toml`. `uv run` builds the native module anew when the binding or the library has changed, so there is no build step to remember.
+Everything Python runs through `uv`, from `python/` or from `action/`: `uv --directory python run pytest`. Each has its configuration in its own `pyproject.toml`. `uv run` builds the native module anew when the binding or the library has changed, so there is no build step to remember.
 
 `.github/workflows/release.yml` runs release-please: it keeps a release pull request open, and merging that publishes the crate to crates.io and the Python package to PyPI. `.github/workflows/wheels.yml` builds the wheels and the source distribution for it, and runs on a pull request that changes how the package is built.
 
-The release pull request raises the versions. Never change the version in `Cargo.toml`, `python/pyproject.toml`, `python/uv.lock` or `.release-please-manifest.json` by hand.
+The release pull request raises the versions. Never change the version in `Cargo.toml`, `python/pyproject.toml`, `python/uv.lock`, `action/uv.lock`, `action.yml` or `.release-please-manifest.json` by hand.
 
 ## Running the benchmark
 
@@ -28,7 +28,18 @@ Ask the user before you change `README.md`, and say what you would change and wh
 - `python/README.md` is the page of the package on PyPI, and `python/LICENSE` a link to `LICENSE`, so that the wheels carry the licence. Ask before you change that README, as for the other.
 - `a` is the schema that should accept everything and `b` the one whose instances must be accepted, in every name: `subsumes(a, b)`, `Side`.
 
-Coding conventions for the Python code:
+## The action
+
+`action.yml` at the root is the GitHub Action, and `action/` the Python code that it runs: the module `subsumes_action` and its tests. [DESIGN.md](DESIGN.md#github-action) has its inputs and the reasons for them.
+
+- A release of the action is a release of the library: at a tag, `action.yml` installs the package of that version from PyPI. The tests and the job `action-run` of CI use the library of the checkout instead.
+- The old version of a schema is `old` and the changed one `new` in every name. `backward` is `subsumes(new, old)` and `forward` is `subsumes(old, new)`.
+- A path, an example and a message come from the files of a pull request, which anyone may open. Write none of them into the report as Markdown, and none at the start of a line of the log.
+- The module is the step of the action and no tool: it has no README and promises nothing to someone who runs it by hand.
+
+## Python conventions
+
+For the code in `python/` and in `action/`:
 
 - Use the narrowest practical type.
 - `Sequence[T]` for variable-length collections. Use `tuple[...]` only for fixed-length positional data like `tuple[str, int]`, or where you actually need tuple behaviour. Don't write `tuple[T, ...]`.
