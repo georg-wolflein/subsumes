@@ -1,8 +1,8 @@
 //! The native half of the Python package `subsumes`: one function that takes two schemas as
 //! Python objects, runs the check and hands the outcome back as a tuple of plain values. The
-//! package makes its verdicts and its exceptions of that tuple, so no class is defined here.
+//! package makes its verdicts and its exception of that tuple, so no class is defined here.
 
-use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use serde_json::{Map, Number, Value};
@@ -21,8 +21,7 @@ mod _native {
     /// Checks whether `a` accepts every instance that is valid under `b`.
     ///
     /// The outcome is a tuple that begins with what it is: `("yes",)`, `("no", counterexample)`,
-    /// `("unsupported", message, side, location)`, `("unrepresentable", message)`,
-    /// `("budget", message)`, `("undecided", message)` for a reason without a name here, or
+    /// `("unsupported", side, location)`, `("unrepresentable",)`, `("budget",)`, or
     /// `("invalid", message, side, location)` for a schema that cannot be checked at all,
     /// where the location is `None` when the schema as a whole is at fault.
     ///
@@ -56,19 +55,19 @@ mod _native {
             Ok(Verdict::No { counterexample }) => {
                 ("no", instance(py, &counterexample)?).into_pyobject(py)
             }
-            Ok(Verdict::Unknown { reason }) => {
-                let message = reason.to_string();
-                match reason {
-                    Reason::Unsupported { schema, location } => {
-                        ("unsupported", message, name(schema), location).into_pyobject(py)
-                    }
-                    Reason::Unrepresentable => ("unrepresentable", message).into_pyobject(py),
-                    Reason::Budget => ("budget", message).into_pyobject(py),
-                    // `Reason` may grow. A reason that the package does not know by name is
-                    // raised as the exception that all the reasons share.
-                    _ => ("undecided", message).into_pyobject(py),
+            Ok(Verdict::Unknown { reason }) => match reason {
+                Reason::Unsupported { schema, location } => {
+                    ("unsupported", name(schema), location).into_pyobject(py)
                 }
-            }
+                Reason::Unrepresentable => ("unrepresentable",).into_pyobject(py),
+                Reason::Budget => ("budget",).into_pyobject(py),
+                // `Reason` may grow, and the package has a class for each reason. One that
+                // has none yet is a fault of the package. It raises, so that the check
+                // passes for no answer.
+                reason => Err(PyRuntimeError::new_err(format!(
+                    "the package has no class for the reason: {reason}"
+                ))),
+            },
             Err(error) => {
                 let message = error.to_string();
                 let (side, location) = match error {

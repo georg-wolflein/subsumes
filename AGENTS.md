@@ -23,7 +23,8 @@ Ask the user before you change `README.md`, and say what you would change and wh
 
 `python/` holds the binding: the crate in `python/src/` is the native module `subsumes._native`, and `python/subsumes/` is the package that users import. [DESIGN.md](DESIGN.md#python) has its API and the reasons for it.
 
-- The native module is one function that returns plain values. Verdicts and exceptions are classes of the package, in Python.
+- The native module is one function that returns plain values. The verdicts, the reasons and the exception are classes of the package, in Python.
+- A check that the library cannot decide returns `Unknown` and raises nothing. A reason that the crate gains needs a class in the package and an arm in the native module.
 - What the library decides is tested in the crate. The tests in `python/tests/` hold only what the binding adds.
 - `python/README.md` is the page of the package on PyPI, and `python/LICENSE` a link to `LICENSE`, so that the wheels carry the licence. Ask before you change that README, as for the other.
 - `a` is the schema that should accept everything and `b` the one whose instances must be accepted, in every name: `subsumes(a, b)`, `Side`.
