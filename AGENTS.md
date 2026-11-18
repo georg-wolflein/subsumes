@@ -14,8 +14,13 @@ The release pull request raises the versions. Never change the version in `Cargo
 
 ## Running the benchmark
 
-- **`make benchmark`** checks the cases of the corpus one after the other. Use it whenever the time of the checks matters: to measure speed, or for results whose times are held against those of another run. CI runs it this way.
+The benchmark is the package `subsumes-benchmark` at the version that the `Makefile` pins, which `uvx` fetches: it holds the corpus of that version and the runner. `make corpus` unpacks the corpus into `benchmark/`. The runner drives the library through `harness adapter`, which it builds from the working tree first, and writes the run to `target/results/harness/`.
+
+- **`make benchmark`** checks the cases of the corpus one after the other, prints how the run went, and fails on a wrong verdict or an error. Use it whenever the time of the checks matters: to measure speed, or for results whose times are held against those of another run. CI runs it this way.
 - **`make benchmark JOBS=8`** checks eight cases at once and is several times faster. Use it when only the verdicts matter, such as to see that a change loses none. The times in its results are no more than a hint, since the checks share the machine.
+- **`make benchmark-comment DIFF="--base <folder>"`** holds that run against another one, such as a copy of `target/results/harness/` from before a change, and writes `target/benchmark-comment.md`. It fails besides on a check that the other run decided and this one does not.
+
+What a case, a task and a wrong answer are, and how a run is scored and reported, is decided in the benchmark. Change it there, release it, and raise the pin here.
 
 ## The README
 

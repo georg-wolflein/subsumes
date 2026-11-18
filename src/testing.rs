@@ -30,7 +30,7 @@ impl Random {
     }
 }
 
-/// The file of every case of the corpus in `benchmark/`, which `make corpus` downloads: every
+/// The file of every case of the corpus in `benchmark/`, which `make corpus` unpacks: every
 /// JSON file in the folder of a collection, which `collections.json` names.
 pub(crate) fn corpus_cases() -> Vec<PathBuf> {
     let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("benchmark");
