@@ -348,7 +348,12 @@ struct Split {
     still_to_come: Box<dyn Iterator<Item = Alternative>>,
     /// The disjunction, unless this is the split in one that a task begins as.
     choice: Option<Disjunction>,
-    /// Whether an alternative stood when it had taken in what needs no split.
+    /// Whether the disjunction came with the alternative that the split below was at: it
+    /// was not among those that the branch of that split had met.
+    brought: bool,
+    /// Whether an alternative stood by more than itself: it was not refuted when it had
+    /// taken in what needs no split, and it did not end in a split on a disjunction that it
+    /// brought and that left it with no alternative either.
     stood: bool,
 }
 
@@ -466,6 +471,7 @@ impl Engine<'_> {
                 branch: Branch::default(),
                 still_to_come: whole,
                 choice: None,
+                brought: false,
                 stood: true,
             }],
             waiting: None,
@@ -541,13 +547,21 @@ impl Engine<'_> {
                 };
                 if depends.is_some() && split.branch.free().is_empty() {
                     task.splits.pop();
+                    self.stood();
                     return Ok(None);
                 }
                 let Some(alternative) = split.still_to_come.next() else {
-                    if let (Some(choice), false) = (split.choice, split.stood) {
+                    let dead_end = !split.stood;
+                    if let (Some(choice), true) = (split.choice, dead_end) {
                         *self.dead_ends.entry(choice).or_default() += 1;
                     }
+                    // An alternative that brought the disjunction and was left with no
+                    // alternative of it did not stand by more than itself.
+                    let stood = !(split.brought && dead_end);
                     task.splits.pop();
+                    if stood {
+                        self.stood();
+                    }
                     return Ok(None);
                 };
                 self.context.budget.charge(1 + split.branch.weight() / 32)?;
@@ -562,22 +576,25 @@ impl Engine<'_> {
                 self.wait(branch, wanted);
                 return Ok(None);
             }
-            Settled::Stands => self.stood(),
+            Settled::Stands => {}
         }
         if self.is_hopeless(&branch) {
+            self.stood();
             return Ok(None);
         }
-        if let Some(choice) = self.choose(&mut branch) {
+        if let Some((choice, brought)) = self.choose(&mut branch) {
             let still_to_come = alternatives(&self.context.terms, &choice);
             let task = self.tasks.last_mut().expect("a task is at work");
             task.splits.push(Split {
                 branch,
                 still_to_come,
                 choice: Some((choice.term, choice.negated)),
+                brought,
                 stood: false,
             });
             return Ok(None);
         }
+        self.stood();
         // Nothing is left to take in, and the branch stands.
         match self.instance(&branch)? {
             Given::Instance(witness) => return Ok(Some(Found::Instance(witness))),
@@ -590,7 +607,7 @@ impl Engine<'_> {
         Ok(None)
     }
 
-    /// Notes that an alternative of the split at work stood.
+    /// Notes that an alternative of the split at work stood by more than itself.
     fn stood(&mut self) {
         let task = self.tasks.last_mut().expect("a task is at work");
         if let Some(split) = task.splits.last_mut() {
@@ -598,24 +615,29 @@ impl Engine<'_> {
         }
     }
 
-    /// Takes the disjunction that the branch splits on next: the one that most often left
-    /// a branch with no alternative, and of several the one that was met first.
-    fn choose(&self, branch: &mut Branch) -> Option<Item> {
-        if self.dead_ends.is_empty() {
-            return branch.choices.pop_front();
-        }
-        let dead_ends = |choice: &Item| {
-            let known = self.dead_ends.get(&(choice.term, choice.negated));
-            known.copied().unwrap_or(0)
-        };
+    /// Takes the disjunction that the branch splits on next, and says whether the branch
+    /// brought it: whether it was not yet met when the split at work was made. It is the
+    /// disjunction that most often left a branch with no alternative, and of several the
+    /// one that was met first.
+    fn choose(&self, branch: &mut Branch) -> Option<(Item, bool)> {
+        let task = self.tasks.last().expect("a task is at work");
+        let split = task.splits.last().expect("a branch is of a split");
+        let met = split.branch.choices.len();
         let mut most = (0, 0);
-        for (place, choice) in branch.choices.iter().enumerate() {
-            let count = dead_ends(choice);
-            if count > most.1 {
-                most = (place, count);
+        if !self.dead_ends.is_empty() {
+            let dead_ends = |choice: &Item| {
+                let known = self.dead_ends.get(&(choice.term, choice.negated));
+                known.copied().unwrap_or(0)
+            };
+            for (place, choice) in branch.choices.iter().enumerate() {
+                let count = dead_ends(choice);
+                if count > most.1 {
+                    most = (place, count);
+                }
             }
         }
-        branch.choices.remove(most.0)
+        let choice = branch.choices.remove(most.0)?;
+        Some((choice, most.0 >= met))
     }
 
     /// Lets a branch of the task at work wait for c-references to be decided.

@@ -60,3 +60,24 @@ This is thrashing, as constraint solvers call it, and the remedies are theirs: s
 | the whole run, one job | 382 s to 423 s | 130 s |
 
 **Kept.** A run takes 34% of the time it took.
+
+### E2. A disjunction inside a disjunction counts against the one that brought it
+
+**Hypothesis.** After E1, a trace of `additional-as-uneval/o81108` shows the thrashing one level up. The negation of an alternative of A is the negation of a conjunction of two conjunctions, `not all[X, Y]`. Each of its two alternatives stands when it is taken in and brings a disjunction of its own, `not X` or `not Y`, and it is that one whose alternatives are all refuted. E1 counts the inner disjunction, which a branch has only met once it has split on the outer one. The outer one never has a count, so it is still split last: 17,862 times in one check.
+
+**Change.** An alternative that stands, and then splits on a disjunction that it brought itself, does not count as standing if that split leaves it with no alternative. So a split on `not all[X, Y]` whose two alternatives both end that way is a dead end of `not all[X, Y]`, and the count goes up the nesting. A split notes whether its disjunction was brought by the alternative that led to it: whether it was not among the disjunctions that the split below had met.
+
+**A variant that was dropped.** To split first on a disjunction that the alternative brought, where no disjunction has a count, so that a nest of negated conjunctions is always taken apart in one go. On one case of each of the 62 schemas it decides 15 checks fewer than the change above, 90 where that decides 105, and takes 376 million steps where that takes 233 million.
+
+**Result.** 44 more checks are decided: 42 `Yes` and 2 `No`. None is lost and none is wrong. 36 checks still end at the budget.
+
+| | baseline | E1 | E2 |
+| --- | ---: | ---: | ---: |
+| `Yes` | 23,597 | 23,777 | 23,819 |
+| `No` | 8,719 | 8,733 | 8,735 |
+| `Unknown` | 1,686 | 1,492 | 1,448 |
+| at the budget | 274 | 80 | 36 |
+| steps | 3,096 million | 1,173 million | 572 million |
+| the whole run, one job | 382 s to 423 s | 130 s | 36 s |
+
+**Kept.** A run takes 9% of the time it took, which is past the goal of a quarter.
