@@ -132,6 +132,7 @@ pub(crate) fn decide(context: &mut Context, a: VarId, b: VarId) -> Result<Outcom
         answers: 0,
         names: HashMap::new(),
         partitions: Partitions::default(),
+        dead_ends: HashMap::new(),
     };
     Ok(match engine.decide(both)? {
         Found::Nothing => Outcome::Yes,
@@ -326,7 +327,7 @@ struct Task {
     /// The last split is the one at work: each of its alternatives is followed to its end
     /// before the next is made, so an instance is found without the alternatives after it,
     /// and a long `oneOf` is never written out. The task begins as a split in one.
-    splits: Vec<(Branch, Box<dyn Iterator<Item = Alternative>>)>,
+    splits: Vec<Split>,
     /// A branch that waits for the engine to decide the c-references that it asked for.
     waiting: Option<Branch>,
     wanted: Vec<CRefId>,
@@ -339,6 +340,20 @@ struct Task {
     /// How many answers had been found when the task began.
     began: u64,
 }
+
+/// A branch that was split on one of its disjunctions.
+struct Split {
+    branch: Branch,
+    /// The alternatives of the disjunction that are still to come.
+    still_to_come: Box<dyn Iterator<Item = Alternative>>,
+    /// The disjunction, unless this is the split in one that a task begins as.
+    choice: Option<Disjunction>,
+    /// Whether an alternative stood when it had taken in what needs no split.
+    stood: bool,
+}
+
+/// A disjunction by what it says: a term, as it is or negated.
+type Disjunction = (TermId, bool);
 
 /// What a c-reference accepts as long as the tasks at work that it took to accept nothing
 /// accept nothing.
@@ -385,6 +400,10 @@ struct Engine<'c> {
     /// language says it.
     names: HashMap<VarId, Option<LanguageId>>,
     partitions: Partitions,
+    /// How often each disjunction left a branch with no alternative: every one of them was
+    /// refuted before it came to a split. A branch splits on the one that did so most often
+    /// first, since it is likely to do so again whatever the other disjunctions are split to.
+    dead_ends: HashMap<Disjunction, u32>,
 }
 
 impl Engine<'_> {
@@ -443,7 +462,12 @@ impl Engine<'_> {
         self.at_work.insert(of, self.tasks.len());
         self.tasks.push(Task {
             of,
-            splits: vec![(Branch::default(), whole)],
+            splits: vec![Split {
+                branch: Branch::default(),
+                still_to_come: whole,
+                choice: None,
+                stood: true,
+            }],
             waiting: None,
             wanted: Vec::new(),
             depends_on: None,
@@ -511,21 +535,23 @@ impl Engine<'_> {
             Some(branch) => branch,
             None => {
                 let depends = task.depends_on;
-                let Some((split, still_to_come)) = task.splits.last_mut() else {
+                let Some(split) = task.splits.last_mut() else {
                     // Every alternative was followed to its end.
                     return Ok(Some(depends.map_or(Found::Nothing, Found::Unknown)));
                 };
-                let alternative = if depends.is_some() && split.free().is_empty() {
-                    None
-                } else {
-                    still_to_come.next()
-                };
-                let Some(alternative) = alternative else {
+                if depends.is_some() && split.branch.free().is_empty() {
+                    task.splits.pop();
+                    return Ok(None);
+                }
+                let Some(alternative) = split.still_to_come.next() else {
+                    if let (Some(choice), false) = (split.choice, split.stood) {
+                        *self.dead_ends.entry(choice).or_default() += 1;
+                    }
                     task.splits.pop();
                     return Ok(None);
                 };
-                self.context.budget.charge(1 + split.weight() / 32)?;
-                let mut branch = split.clone();
+                self.context.budget.charge(1 + split.branch.weight() / 32)?;
+                let mut branch = split.branch.clone();
                 branch.todo.extend(alternative);
                 branch
             }
@@ -536,15 +562,20 @@ impl Engine<'_> {
                 self.wait(branch, wanted);
                 return Ok(None);
             }
-            Settled::Stands => {}
+            Settled::Stands => self.stood(),
         }
         if self.is_hopeless(&branch) {
             return Ok(None);
         }
-        if let Some(choice) = branch.choices.pop_front() {
-            let alternatives = alternatives(&self.context.terms, &choice);
+        if let Some(choice) = self.choose(&mut branch) {
+            let still_to_come = alternatives(&self.context.terms, &choice);
             let task = self.tasks.last_mut().expect("a task is at work");
-            task.splits.push((branch, alternatives));
+            task.splits.push(Split {
+                branch,
+                still_to_come,
+                choice: Some((choice.term, choice.negated)),
+                stood: false,
+            });
             return Ok(None);
         }
         // Nothing is left to take in, and the branch stands.
@@ -557,6 +588,34 @@ impl Engine<'_> {
             }
         }
         Ok(None)
+    }
+
+    /// Notes that an alternative of the split at work stood.
+    fn stood(&mut self) {
+        let task = self.tasks.last_mut().expect("a task is at work");
+        if let Some(split) = task.splits.last_mut() {
+            split.stood = true;
+        }
+    }
+
+    /// Takes the disjunction that the branch splits on next: the one that most often left
+    /// a branch with no alternative, and of several the one that was met first.
+    fn choose(&self, branch: &mut Branch) -> Option<Item> {
+        if self.dead_ends.is_empty() {
+            return branch.choices.pop_front();
+        }
+        let dead_ends = |choice: &Item| {
+            let known = self.dead_ends.get(&(choice.term, choice.negated));
+            known.copied().unwrap_or(0)
+        };
+        let mut most = (0, 0);
+        for (place, choice) in branch.choices.iter().enumerate() {
+            let count = dead_ends(choice);
+            if count > most.1 {
+                most = (place, count);
+            }
+        }
+        branch.choices.remove(most.0)
     }
 
     /// Lets a branch of the task at work wait for c-references to be decided.
@@ -886,7 +945,8 @@ impl Engine<'_> {
             Item::new(terms.reference(variable), false),
         ];
         let whole: Box<dyn Iterator<Item = Alternative>> = Box::new(std::iter::once(whole));
-        let mut splits = vec![(Branch::default(), whole)];
+        let mut splits: Vec<(Branch, Box<dyn Iterator<Item = Alternative>>)> =
+            vec![(Branch::default(), whole)];
         let mut all = Some(Languages::NOTHING);
         while let Some((split, still_to_come)) = splits.last_mut() {
             let (Some(alternative), Some(so_far)) = (still_to_come.next(), all) else {
