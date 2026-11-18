@@ -1,6 +1,6 @@
 [project]
 name = "subsumes"
-version = "0.2.0"
+version = "0.3.0"
 description = "JSON Schema inclusion: does one schema accept every instance that is valid under another?"
 readme = "README.md"
 license = "MIT"
