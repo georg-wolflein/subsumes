@@ -10,20 +10,21 @@ from typing import assert_never
 import pytest
 
 from subsumes import (
-    BudgetError,
+    Budget,
     Json,
     No,
     RegexDialect,
     SchemaError,
-    UndecidedError,
-    UnrepresentableError,
-    UnsupportedError,
+    Unknown,
+    Unrepresentable,
+    Unsupported,
     Yes,
     subsumes,
 )
 
 INTEGER: Json = {"type": "integer"}
 NATURAL: Json = {"type": "integer", "minimum": 0}
+UNIQUE: Json = {"type": "array", "uniqueItems": True}
 DIGITS: Json = {"pattern": r"^\d+$"}
 ASCII_DIGITS: Json = {"pattern": "^[0-9]+$"}
 
@@ -58,6 +59,8 @@ class TestVerdict:
                 pytest.fail("the schema of the naturals accepts no negative integer")
             case No(counterexample):
                 assert counterexample == -1
+            case Unknown():
+                pytest.fail("the check is decided")
             case _ as never:
                 assert_never(never)
 
@@ -82,18 +85,13 @@ class TestVerdict:
         assert type(verdict.counterexample) is type(counterexample)
 
 
-class TestUndecided:
+class TestUnknown:
     def test_an_unsupported_construct_names_its_schema_and_location(self) -> None:
-        with pytest.raises(UnsupportedError) as raised:
-            subsumes({"properties": {"tags": {"uniqueItems": True}}}, {})
-        assert raised.value.side == "a"
-        assert raised.value.location == "#/properties/tags/uniqueItems"
-        assert str(raised.value) == "#/properties/tags/uniqueItems in schema A is not supported"
+        verdict = subsumes({"properties": {"tags": {"uniqueItems": True}}}, {})
+        assert verdict == Unknown(Unsupported("a", "#/properties/tags/uniqueItems"))
 
     def test_the_side_is_that_of_the_argument(self) -> None:
-        with pytest.raises(UnsupportedError) as raised:
-            subsumes(False, {"uniqueItems": True, "type": "array"})
-        assert raised.value.side == "b"
+        assert subsumes(False, UNIQUE) == Unknown(Unsupported("b", "#/uniqueItems"))
 
     def test_a_counterexample_that_cannot_be_given(self) -> None:
         between: Json = {
@@ -101,8 +99,7 @@ class TestUndecided:
             "exclusiveMinimum": 0.1,
             "exclusiveMaximum": 0.10000000000000002,
         }
-        with pytest.raises(UnrepresentableError, match="cannot be given"):
-            subsumes(False, between)
+        assert subsumes(False, between) == Unknown(Unrepresentable())
 
     def test_a_budget_that_is_too_small(self) -> None:
         def chain(innermost: Json) -> Json:
@@ -114,16 +111,37 @@ class TestUndecided:
             return {"$ref": "#/$defs/d0", "$defs": links}
 
         integers, numbers = chain({"type": "integer"}), chain({"type": "number"})
-        with pytest.raises(BudgetError, match="budget"):
-            subsumes(numbers, integers, budget=10)
+        assert subsumes(numbers, integers, budget=10) == Unknown(Budget())
         assert subsumes(numbers, integers)
         assert subsumes(numbers, integers, budget=2**64 - 1)
 
-    def test_every_reason_is_an_undecided_error_and_no_schema_error(self) -> None:
-        for reason in (UnsupportedError, UnrepresentableError, BudgetError):
-            assert issubclass(reason, UndecidedError)
-            assert not issubclass(reason, ValueError)
-        assert not issubclass(SchemaError, UndecidedError)
+    def test_a_reason_is_a_sentence_as_a_string(self) -> None:
+        unsupported = Unsupported("a", "#/properties/tags/uniqueItems")
+        assert str(unsupported) == "#/properties/tags/uniqueItems in schema A is not supported"
+        assert "cannot be given" in str(Unrepresentable())
+        assert str(Budget()) == "the check ran out of its work budget"
+
+    def test_it_is_no_condition(self) -> None:
+        verdict = subsumes(INTEGER, UNIQUE)
+        with pytest.raises(TypeError, match="neither true nor false: #/uniqueItems in schema B"):
+            bool(verdict)
+        with pytest.raises(TypeError, match="neither true nor false"):
+            assert not verdict
+
+    def test_a_reason_is_matched_by_its_class(self) -> None:
+        match subsumes(INTEGER, UNIQUE):
+            case Yes() | No():
+                pytest.fail("the library does not model uniqueItems")
+            case Unknown(reason):
+                match reason:
+                    case Unsupported(side, location):
+                        assert (side, location) == ("b", "#/uniqueItems")
+                    case Unrepresentable() | Budget():
+                        pytest.fail("the reason is the construct")
+                    case _ as never:
+                        assert_never(never)
+            case _ as never:
+                assert_never(never)
 
 
 class TestSchemaError:
@@ -238,9 +256,8 @@ class TestRegexDialect:
     def test_a_pattern_of_the_other_dialect_is_unsupported(
         self, dialect: RegexDialect, pattern: str
     ) -> None:
-        with pytest.raises(UnsupportedError) as raised:
-            subsumes({"pattern": pattern}, {"type": "string"}, regex_dialect=dialect)
-        assert (raised.value.side, raised.value.location) == ("a", "#/pattern")
+        verdict = subsumes({"pattern": pattern}, {"type": "string"}, regex_dialect=dialect)
+        assert verdict == Unknown(Unsupported("a", "#/pattern"))
 
     def test_a_dialect_that_is_none_is_a_value_error(self) -> None:
         with pytest.raises(ValueError, match='regex_dialect is "pcre"'):

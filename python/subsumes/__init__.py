@@ -7,29 +7,35 @@ Does schema A accept every instance that is valid under schema B? If it does, A 
     new = {"type": "integer"}
     old = {"type": "integer", "minimum": 0}
 
-    verdict = subsumes(new, old)
-    if not verdict:
-        print("no longer accepted:", verdict.counterexample)
+    match subsumes(new, old):
+        case Yes():
+            print("compatible")
+        case No(counterexample):
+            print("no longer accepted:", counterexample)
+        case Unknown(reason):
+            print("not decided:", reason)
 
-A check that the library cannot decide raises an :class:`UndecidedError`, so a verdict is
-always a :class:`Yes` or a :class:`No`.
+A :class:`Yes` and a :class:`No` are returned only when certain. A check that the library
+cannot decide returns an :class:`Unknown` with the reason, which is no condition: asking
+whether it is true raises.
 """
 
 from dataclasses import dataclass
-from typing import Literal, assert_never
+from typing import Literal, Never, assert_never
 
 from subsumes import _native
 
 __all__ = [
-    "BudgetError",
+    "Budget",
     "Json",
     "No",
+    "Reason",
     "RegexDialect",
     "SchemaError",
     "Side",
-    "UndecidedError",
-    "UnrepresentableError",
-    "UnsupportedError",
+    "Unknown",
+    "Unrepresentable",
+    "Unsupported",
     "Verdict",
     "Yes",
     "subsumes",
@@ -74,19 +80,8 @@ class No:
         return False
 
 
-type Verdict = Yes | No
-"""The answer to "does A accept every instance that is valid under B?"."""
-
-
-class UndecidedError(Exception):
-    """The library cannot decide the check. The message says why.
-
-    This is no fault of the two schemas, which are valid: see :class:`SchemaError` for
-    schemas that are not.
-    """
-
-
-class UnsupportedError(UndecidedError):
+@dataclass(frozen=True, slots=True)
+class Unsupported:
     """The answer depends on a construct that the library does not model."""
 
     side: Side
@@ -101,24 +96,63 @@ class UnsupportedError(UndecidedError):
     closes.
     """
 
-    def __init__(self, message: str, *, side: Side, location: str) -> None:
-        super().__init__(message)
-        self.side = side
-        self.location = location
+    def __str__(self) -> str:
+        return f"{self.location} in schema {self.side.upper()} is not supported"
 
 
-class UnrepresentableError(UndecidedError):
+@dataclass(frozen=True, slots=True)
+class Unrepresentable:
     """A does not subsume B, and the library found no counterexample that it can give.
 
-    Some instance is valid under B and invalid under A, so the answer is known to be no. It
-    is raised all the same, because a :class:`No` carries its counterexample. What cannot be
-    given is a number that no JSON value holds exactly, such as one between two floats that
-    are next to each other, or a value of more than 127 objects inside one another.
+    Some instance is valid under B and invalid under A, so the answer is known to be no. The
+    verdict is an :class:`Unknown` all the same, because a :class:`No` carries its
+    counterexample. What cannot be given is a number that no JSON value holds exactly, such
+    as one between two floats that are next to each other, or a value of more than 127
+    objects inside one another.
     """
 
+    def __str__(self) -> str:
+        return (
+            "the schemas differ in an instance that cannot be given: a number that a JSON "
+            "value does not hold exactly, or a value that is nested too deep"
+        )
 
-class BudgetError(UndecidedError):
+
+@dataclass(frozen=True, slots=True)
+class Budget:
     """The check ran out of its work budget. A larger ``budget`` may decide it."""
+
+    def __str__(self) -> str:
+        return "the check ran out of its work budget"
+
+
+type Reason = Unsupported | Unrepresentable | Budget
+"""Why a check ended in :class:`Unknown`. As a string it is a sentence that says so."""
+
+
+@dataclass(frozen=True, slots=True)
+class Unknown:
+    """The library cannot decide. As a condition it is neither true nor false, and raises.
+
+    This is no fault of the two schemas, which are valid: see :class:`SchemaError` for
+    schemas that are not.
+    """
+
+    reason: Reason
+    """Why it cannot."""
+
+    def __bool__(self) -> Never:
+        """Raises, so that a check that is not decided never passes for an answer.
+
+        Raises:
+            TypeError: Always.
+        """
+        message = f"the verdict is Unknown, which is neither true nor false: {self.reason}"
+        raise TypeError(message)
+
+
+type Verdict = Yes | No | Unknown
+"""The answer to "does A accept every instance that is valid under B?"."""
 
 
 class SchemaError(ValueError):
@@ -168,13 +202,10 @@ def subsumes(
             ``patternProperties`` is read in, in both schemas.
 
     Returns:
-        :class:`Yes`, which is true as a condition, or :class:`No` with a counterexample,
-        which is false.
+        :class:`Yes`, which is true as a condition, :class:`No` with a counterexample, which
+        is false, or :class:`Unknown` with the reason, which is neither and raises as one.
 
     Raises:
-        UndecidedError: The library cannot decide the check. It is an
-            :class:`UnsupportedError`, an :class:`UnrepresentableError` or a
-            :class:`BudgetError`.
         SchemaError: ``a`` or ``b`` cannot be checked at all.
         TypeError: ``a`` or ``b`` holds an object that is no JSON value, such as a ``set``.
         ValueError: ``a`` or ``b`` holds a value that JSON does not have, such as ``nan``,
@@ -187,13 +218,11 @@ def subsumes(
         case "no":
             return No(outcome[1])
         case "unsupported":
-            raise UnsupportedError(outcome[1], side=outcome[2], location=outcome[3])
+            return Unknown(Unsupported(side=outcome[1], location=outcome[2]))
         case "unrepresentable":
-            raise UnrepresentableError(outcome[1])
+            return Unknown(Unrepresentable())
         case "budget":
-            raise BudgetError(outcome[1])
-        case "undecided":
-            raise UndecidedError(outcome[1])
+            return Unknown(Budget())
         case "invalid":
             raise SchemaError(outcome[1], side=outcome[2], location=outcome[3])
         case _ as never:

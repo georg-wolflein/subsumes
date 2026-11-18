@@ -49,22 +49,24 @@ Schemas are `serde_json::Value`. A `RegexDialect` is `Ecma262`, which is the def
 ### Python
 
 ```
-subsumes(a, b, *, budget=None, regex_dialect="ecma262") -> Yes | No(counterexample)
-    raises UndecidedError    UnsupportedError(side, location) | UnrepresentableError | BudgetError
+subsumes(a, b, *, budget=None, regex_dialect="ecma262") -> Yes | No(counterexample) | Unknown(reason)
+    reason                   Unsupported(side, location) | Unrepresentable | Budget
     raises SchemaError       with its side and location
 ```
 
-The package `subsumes` in `python/` wraps the library. It is written for Python and is no copy of the Rust API:
+The package `subsumes` in `python/` wraps the library. Its verdicts are those of the Rust API, and the rest is written for Python:
 
-- **Two verdicts and an exception.** A check returns `Yes`, which is true as a condition, or `No`, which is false and carries the counterexample. A check that the library cannot decide raises, with one class of exception for each reason. So an undecided check never passes for an answer, and code that forgets about it fails loudly. No type checker makes a caller handle it, and code that checks many pairs wraps the call in `try`.
-- **`UnrepresentableError` is raised although the answer is known to be no.** A `No` carries its counterexample, and `None` is one, so a `No` without one cannot be told from a `No` with `null`.
-- **Two families of exceptions.** `SchemaError` is a `ValueError`: the caller's schema is at fault. `UndecidedError` is not, and the two share no base, so catching one never swallows the other.
+- **Three verdicts, as in Rust.** A check returns `Yes`, `No` with the counterexample, or `Unknown` with the reason: an `Unsupported` with its side and location, an `Unrepresentable` or a `Budget`. To code that checks many pairs, a check that is not decided is a result like the others, and a `match` that leaves out `Unknown` is an error to a type checker. An earlier version raised an exception for each reason. No type checker made a caller handle those, and code that checked many pairs caught each of them to make a value of it again.
+- **`Unknown` is no condition.** `Yes` is true and `No` is false, so `if subsumes(a, b):` reads as it says. Asked whether it is true, `Unknown` raises a `TypeError` with the reason, as `pandas.NA` does. So a check that is not decided never passes for an answer, and code that forgets about it fails loudly, which is what the exceptions were for. A type checker does not take `Unknown` out of either branch of such an `if`, and pyright refuses the condition, so typed code uses `match`.
+- **`Unrepresentable` is an `Unknown` although the answer is known to be no.** A `No` carries its counterexample, and `None` is one, so a `No` without one cannot be told from a `No` with `null`.
+- **A reason is a dataclass of its fields, and a sentence as a string.** So a test makes one and compares it, and `print(reason)` says why. The sentences are those of the crate and are written again in the package, which is simplicity given up: handed over from the crate, each would be a field that a caller has to write out to make a reason.
+- **One exception.** `SchemaError` is a `ValueError`: the caller's schema is at fault. It is the `Err` of the Rust API.
 - **A schema is a Python object,** as `json.load` gives it: `dict`, `list`, `str`, `int`, `float`, `bool` and `None`. Anything else is a `TypeError` that names where it stands, also a `tuple`. A string is the JSON string, never JSON text.
 - **Numbers cross as `serde_json` would read them from text.** An `int` that 64 bits hold stays an integer, and a larger one becomes the nearest float. A `float` goes over as it is: Python and `serde_json` both print the shortest decimal that gives the float, so it stands for the same decimal on both sides. `nan`, the infinities and an `int` beyond the largest float are a `ValueError`.
 - **A schema is nested 127 deep at most,** which is what `serde_json` reads from text. A deeper one is a `ValueError`. The walk over a schema recurses, and so does the drop of a `serde_json` value, and running out of stack there would crash the interpreter instead of raising.
 - **`budget` and `regex_dialect` are keywords and there is no `Checker`.** With two settings, a class holds little. For the budget, `None` is the default of the library, so the number stands in one place. The dialect is `"ecma262"` or `"rust"`, a `Literal`, and its default is written out, so that a caller sees which one a check has. Anything else is a `ValueError`. `check` with its steps and `inspect` are left out: they serve the harness.
 - **The GIL is released for the check,** which touches no Python object, so threads check pairs side by side.
-- **The classes are Python, the native module is one function.** It returns a tuple of plain values that begins with the kind of outcome, and the package makes the dataclasses and the exceptions of it. The stub of the native module is a few lines, and ruff, ty and pytest check everything else as source.
+- **The classes are Python, the native module is one function.** It returns a tuple of plain values that begins with the kind of outcome, and the package makes the dataclasses and the exception of it. The `Reason` of the crate may grow, and a reason that the package has no class for is a fault of the package, since the two are released together: the native module raises a `RuntimeError` for it. The stub of the native module is a few lines, and ruff, ty and pytest check everything else as source.
 - **One wheel for a platform,** through the stable ABI of Python 3.12, which is the oldest version supported: the first with the `type` statement.
 - **The package is released with the crate,** under the same version, by the same release pull request. The release workflow builds the wheels and the source distribution before it publishes anything, so a wheel that does not build stops the release while nothing is out. Then the crate goes to crates.io and the package to PyPI, each registry trusting the workflow, and the release stays a draft until both have it.
 
