@@ -12,13 +12,16 @@ from dataclasses import dataclass
 from typing import Literal, Self, assert_never
 
 from subsumes import (
-    BudgetError,
+    Budget,
     Json,
+    No,
+    Reason,
     SchemaError,
     Side,
-    UndecidedError,
-    UnrepresentableError,
-    UnsupportedError,
+    Unknown,
+    Unrepresentable,
+    Unsupported,
+    Yes,
     subsumes,
 )
 
@@ -135,7 +138,7 @@ class Schema:
             return Refusal("the file is nested too deep")
         try:
             # The schema `true` accepts everything, so this asks nothing of the schema but
-            # that the library reads it.
+            # that the library reads it. A schema that it reads and cannot decide is one.
             subsumes(True, value)
         except SchemaError as error:
             if error.location is None:
@@ -144,8 +147,6 @@ class Schema:
         except ValueError as error:
             # A value that JSON does not have and that Python reads all the same, such as `NaN`.
             return Refusal(_without_side(error))
-        except UndecidedError:
-            pass
         return cls(value)
 
     def text(self) -> str:
@@ -186,18 +187,30 @@ def check(direction: Direction, old: Schema, new: Schema, budget: int | None) ->
             a, b = old, new
         case _ as never:
             assert_never(never)
-    try:
-        verdict = subsumes(a.value, b.value, budget=budget)
-    except UnsupportedError as error:
-        where = version(direction, error.side)
-        return Undecided(f"{error.location} in the {where} version is not supported")
-    except UnrepresentableError:
-        return Broken(None)
-    except BudgetError:
-        return Undecided("the check ran out of its budget")
-    except UndecidedError as error:
-        return Undecided(str(error))
-    return Holds() if verdict else Broken(Example(verdict.counterexample))
+    match subsumes(a.value, b.value, budget=budget):
+        case Yes():
+            return Holds()
+        case No(counterexample):
+            return Broken(Example(counterexample))
+        case Unknown(reason):
+            return unknown(direction, reason)
+        case _ as never:
+            assert_never(never)
+
+
+def unknown(direction: Direction, reason: Reason) -> Outcome:
+    """What a check in ``direction`` says that the library did not decide for ``reason``."""
+    match reason:
+        case Unsupported(side, location):
+            where = version(direction, side)
+            return Undecided(f"{location} in the {where} version is not supported")
+        case Unrepresentable():
+            # The library knows that the answer is no, and has no instance to show it.
+            return Broken(None)
+        case Budget():
+            return Undecided("the check ran out of its budget")
+        case _ as never:
+            assert_never(never)
 
 
 def compare(path: str, old: bytes | None, new: bytes | None, budget: int | None) -> Entry | None:
