@@ -81,7 +81,7 @@ runs:
       env:
         # The library that the action runs, which is the release of the same version: the
         # release pull request raises this number with the others.
-        SUBSUMES_VERSION: 0.2.0 # x-release-please-version
+        SUBSUMES_VERSION: 0.3.0 # x-release-please-version
         FILES: ${{ inputs.files }}
         COMPATIBILITY: ${{ inputs.compatibility }}
         UNKNOWN: ${{ inputs.unknown }}
