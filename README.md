@@ -1,4 +1,6 @@
-# subsumes
+<h1 align="center">
+  <img src="https://raw.githubusercontent.com/georg-wolflein/subsumes/main/assets/subsumes.svg" alt="subsumes" width="420">
+</h1>
 
 A Rust library for JSON Schema inclusion: **does schema A accept every instance valid under schema B?**
 
