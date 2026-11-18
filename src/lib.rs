@@ -30,9 +30,11 @@
 //! Numbers are compared exactly: a number stands for the decimal that it is written as, so
 //! `0.0075` is a multiple of `0.0001`, which the two floats are not.
 //!
-//! A `pattern` is read in the dialect of the [`regex`](https://docs.rs/regex) crate and
-//! matches anywhere in a string. `format` is asserted for the formats whose strings are a
-//! regular language that can be written down exactly, such as `date`, `uuid` and `uri`.
+//! A `pattern` is read as a regular expression of ECMA-262 with the `u` flag, which is what
+//! the specification recommends, and matches anywhere in a string. A [`Checker`] can read it
+//! in the dialect of the [`regex`](https://docs.rs/regex) crate instead; see
+//! [`RegexDialect`]. `format` is asserted for the formats whose strings are a regular
+//! language that can be written down exactly, such as `date`, `uuid` and `uri`.
 //!
 //! The value of a property is compared as an instance of its own. A schema that holds
 //! itself in a property, as that of a list or a tree does, accepts the instances that can
@@ -60,6 +62,7 @@ use serde_json::Value;
 
 pub use checker::{Check, Checker};
 pub use error::Error;
+pub use language::RegexDialect;
 pub use verdict::{Reason, Side, Verdict};
 
 /// Does `a` accept every instance that is valid under `b`?

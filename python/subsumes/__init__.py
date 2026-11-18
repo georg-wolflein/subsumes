@@ -24,6 +24,7 @@ __all__ = [
     "BudgetError",
     "Json",
     "No",
+    "RegexDialect",
     "SchemaError",
     "Side",
     "UndecidedError",
@@ -42,6 +43,15 @@ type Side = Literal["a", "b"]
 
 ``a`` is the schema that should accept everything, the first argument, and ``b`` the schema
 whose instances must be accepted, the second.
+"""
+
+type RegexDialect = Literal["ecma262", "rust"]
+"""The dialect of regular expressions that a ``pattern`` is read in.
+
+``ecma262`` is ECMA-262 with the ``u`` flag, which the specification of JSON Schema
+recommends. ``rust`` is the dialect of the Rust ``regex`` crate, which Pydantic validates a
+``pattern`` with by default. The two read some patterns differently: ``\\d`` is one of the ten
+digits of ASCII in the first and any decimal digit of Unicode in the second.
 """
 
 
@@ -134,7 +144,13 @@ class SchemaError(ValueError):
         self.location = location
 
 
-def subsumes(a: Json, b: Json, *, budget: int | None = None) -> Verdict:
+def subsumes(
+    a: Json,
+    b: Json,
+    *,
+    budget: int | None = None,
+    regex_dialect: RegexDialect = "ecma262",
+) -> Verdict:
     """Does ``a`` accept every instance that is valid under ``b``?
 
     A schema is what ``json.load`` gives for its text. An ``int`` that 64 bits do not hold
@@ -148,6 +164,8 @@ def subsumes(a: Json, b: Json, *, budget: int | None = None) -> Verdict:
         b: The schema whose instances must be accepted.
         budget: The work that the check may take, in steps. Without one the check has the
             library's default, with which it takes a few seconds at most.
+        regex_dialect: The dialect that every ``pattern`` and every key of
+            ``patternProperties`` is read in, in both schemas.
 
     Returns:
         :class:`Yes`, which is true as a condition, or :class:`No` with a counterexample,
@@ -160,9 +178,9 @@ def subsumes(a: Json, b: Json, *, budget: int | None = None) -> Verdict:
         SchemaError: ``a`` or ``b`` cannot be checked at all.
         TypeError: ``a`` or ``b`` holds an object that is no JSON value, such as a ``set``.
         ValueError: ``a`` or ``b`` holds a value that JSON does not have, such as ``nan``,
-            or is nested more than 127 deep.
+            or is nested more than 127 deep, or ``regex_dialect`` is none of the two.
     """
-    outcome = _native.check(a, b, budget)
+    outcome = _native.check(a, b, budget, regex_dialect)
     match outcome[0]:
         case "yes":
             return Yes()

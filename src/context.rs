@@ -1,6 +1,6 @@
 //! The state of one check. Nothing in it outlives the check or is shared with another.
 
-use crate::language::Languages;
+use crate::language::{Languages, RegexDialect};
 use crate::term::Terms;
 
 /// Everything that a check builds on its way: the terms, the languages of strings, and the
@@ -13,11 +13,12 @@ pub(crate) struct Context {
 }
 
 impl Context {
-    pub fn new(budget: u64) -> Self {
+    /// The state of a check with a work budget, which reads its patterns in a dialect.
+    pub fn new(budget: u64, dialect: RegexDialect) -> Self {
         Self {
             budget: Budget::new(budget),
             terms: Terms::default(),
-            languages: Languages::default(),
+            languages: Languages::new(dialect),
         }
     }
 }

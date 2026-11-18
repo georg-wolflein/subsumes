@@ -173,7 +173,7 @@ mod tests {
 
     fn shown(a: &Value, b: &Value, budget: u64) -> Value {
         let graph = schema::parse(a, b).unwrap().link().unwrap();
-        let mut context = Context::new(budget);
+        let mut context = Context::new(budget, crate::RegexDialect::default());
         let roots = lower::lower(&graph, &mut context).ok();
         stages(&graph, &context, roots)
     }

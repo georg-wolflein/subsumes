@@ -19,7 +19,7 @@
 //! pointer into an unknown keyword, does it take the place from this library.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use referencing::{Draft, Registry, Resolver, ResourceRef, Retrieve, Uri};
@@ -27,7 +27,7 @@ use serde_json::{Map, Value, json};
 
 use super::parse::{Builder, ROOT, Reference, parse};
 use super::{NodeId, Origin, push_token};
-use crate::testing::Random;
+use crate::testing::{Random, corpus_cases, schemas_of};
 use crate::{Error, Side, meta_schemas};
 
 /// How this library and `referencing` resolved the references of one schema.
@@ -333,50 +333,34 @@ pub(super) fn compared(schema: &Value) -> Result<Comparison, String> {
     Ok(comparison)
 }
 
-/// Every `a.json` and `b.json` of the corpus.
-fn corpus_schemas(corpus: &Path) -> Vec<PathBuf> {
-    let (mut schemas, mut pending) = (Vec::new(), vec![corpus.to_owned()]);
-    while let Some(folder) = pending.pop() {
-        for entry in std::fs::read_dir(&folder).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                pending.push(path);
-            } else if path.ends_with("a.json") || path.ends_with("b.json") {
-                schemas.push(path);
-            }
-        }
-    }
-    schemas.sort();
-    schemas
-}
-
 #[test]
 #[ignore = "needs the corpus in benchmark/, which `make corpus` downloads"]
 fn referencing_finds_the_same_targets_in_the_corpus() {
     let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("benchmark");
-    let schemas = corpus_schemas(&corpus);
-    assert!(schemas.len() > 20_000, "{} schemas", schemas.len());
+    let cases = corpus_cases();
+    assert!(cases.len() > 10_000, "{} cases", cases.len());
     let mut total = Comparison::default();
     let mut refused = BTreeMap::new();
-    for path in &schemas {
-        let text = std::fs::read_to_string(path).unwrap();
-        let schema: Value = serde_json::from_str(&text).unwrap();
-        let name = path.strip_prefix(&corpus).unwrap().to_owned();
-        match compared(&schema) {
-            Ok(mut comparison) => {
-                for difference in &mut comparison.differences {
-                    *difference = format!("{}: {difference}", name.display());
+    for case in &cases {
+        for (key, schema) in schemas_of(case) {
+            // The schema `a` of `rb-testset/s87.json` is `rb-testset/s87.json#/a`.
+            let name = format!("{}#/{key}", case.strip_prefix(&corpus).unwrap().display());
+            match compared(&schema) {
+                Ok(mut comparison) => {
+                    for difference in &mut comparison.differences {
+                        *difference = format!("{name}: {difference}");
+                    }
+                    total.add(comparison);
                 }
-                total.add(comparison);
-            }
-            Err(error) => {
-                refused.insert(name, error);
+                Err(error) => {
+                    refused.insert(name, error);
+                }
             }
         }
     }
     println!(
         "{} schemas, {} references with the same target, {} of them placed by this library",
-        schemas.len(),
+        2 * cases.len(),
         total.same,
         total.placed_by_the_library
     );

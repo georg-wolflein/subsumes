@@ -7,6 +7,10 @@
 //!
 //! Nothing here knows of schemas or of the engine. A format is a pattern to this module.
 //!
+//! A pattern is read in the dialect of the check: as ECMA-262 reads it, or as the `regex`
+//! crate does. The dialect only says what a pattern means. Whatever it is, a language is
+//! one of strings of Unicode scalar values, and everything after the parser is the same.
+//!
 //! A language is kept in one of two ways:
 //!
 //! - As a set of words: these words and no other, or every string but these words.
@@ -20,6 +24,7 @@
 //! asks for [the shape](Languages::shape) of the language gets them.
 
 mod dfa;
+mod ecma;
 mod pattern;
 
 use std::collections::hash_map::Entry;
@@ -61,8 +66,29 @@ impl Lengths {
     }
 }
 
-/// A pattern that is not read as a language: one that the `regex` crate does not take, or
-/// one that asks where a word or a line begins or ends.
+/// The dialect of regular expressions that a `pattern` and the keys of `patternProperties`
+/// are read in.
+///
+/// The two read some patterns differently, so the answer of a check may depend on the
+/// dialect. `\d` is one of the ten digits of ASCII in ECMA-262 and any decimal digit of
+/// Unicode in the `regex` crate, so `^[0-9]+$` accepts every string that `^\d+$` accepts in
+/// the first and not in the second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum RegexDialect {
+    /// [ECMA-262](https://tc39.es/ecma262/#sec-patterns) with the `u` flag, which is what
+    /// the specification of JSON Schema recommends. A character is a code point, and a
+    /// pattern that the flag forbids is none, such as one that escapes a character that
+    /// needs no escape.
+    #[default]
+    Ecma262,
+    /// The dialect of the Rust [`regex`](https://docs.rs/regex/latest/regex/#syntax) crate,
+    /// which is what Pydantic validates a `pattern` with by default.
+    Rust,
+}
+
+/// A pattern that is not read as a language: one that is no pattern of the dialect, or one
+/// that asks for something that is not modelled, such as where a word begins or ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Unsupported;
 
@@ -103,10 +129,13 @@ pub(crate) enum Shape<'l> {
 /// The languages of a check.
 #[derive(Debug)]
 pub(crate) struct Languages {
+    /// The dialect that the patterns of the check are read in.
+    dialect: RegexDialect,
     languages: Vec<Language>,
     /// What each language came in as, if it came in as a pattern or a format.
     sources: HashMap<LanguageId, String>,
-    patterns: HashMap<Box<str>, Result<LanguageId, Unsupported>>,
+    /// The patterns that came in, by the dialect that each was read in.
+    patterns: HashMap<RegexDialect, HashMap<Box<str>, Result<LanguageId, Unsupported>>>,
     formats: HashMap<Box<str>, LanguageId>,
     of_words: HashMap<(Words, bool), LanguageId>,
     of_dfas: HashMap<Rc<Dfa>, LanguageId>,
@@ -122,7 +151,15 @@ pub(crate) struct Languages {
 
 impl Default for Languages {
     fn default() -> Self {
+        Self::new(RegexDialect::default())
+    }
+}
+
+impl Languages {
+    /// The store of a check that reads its patterns in a dialect.
+    pub fn new(dialect: RegexDialect) -> Self {
         let mut languages = Self {
+            dialect,
             languages: Vec::new(),
             sources: HashMap::new(),
             patterns: HashMap::new(),
@@ -140,9 +177,7 @@ impl Default for Languages {
         assert_eq!(languages.set(Rc::default(), true), Self::EVERYTHING);
         languages
     }
-}
 
-impl Languages {
     /// The language without a word.
     pub const NOTHING: LanguageId = LanguageId(0);
     /// The language of every string.
@@ -155,18 +190,29 @@ impl Languages {
         LanguageId(id)
     }
 
-    /// The language of every string that holds a match of the pattern, as the `regex` crate
-    /// reads the pattern. For a pattern that is one word between `^` and `$` that is the set
-    /// of this word, by the id that [`Self::words`] gives it.
+    /// The language of every string that holds a match of the pattern, as the dialect of
+    /// the check reads the pattern. For a pattern that is one word between `^` and `$` that
+    /// is the set of this word, by the id that [`Self::words`] gives it.
     ///
     /// # Errors
     ///
     /// When the pattern is not read as a language; see [`Unsupported`].
     pub fn pattern(&mut self, pattern: &str) -> Result<LanguageId, Unsupported> {
-        if let Some(known) = self.patterns.get(pattern) {
+        self.pattern_of(pattern, self.dialect)
+    }
+
+    /// The language of a pattern as a dialect reads it. The patterns that the library
+    /// writes itself are of the `regex` crate, whatever the dialect of the check.
+    fn pattern_of(
+        &mut self,
+        pattern: &str,
+        dialect: RegexDialect,
+    ) -> Result<LanguageId, Unsupported> {
+        let known = self.patterns.get(&dialect);
+        if let Some(known) = known.and_then(|known| known.get(pattern)) {
             return *known;
         }
-        let read = pattern::read(pattern).map(|read| {
+        let read = pattern::read(pattern, dialect).map(|read| {
             // A word between `^` and `$` is that word, and needs no DFA.
             if let Some(word) = pattern::one_word(&read) {
                 return self.words([word]);
@@ -175,12 +221,13 @@ impl Languages {
             self.sources.insert(id, format!("{pattern:?}"));
             id
         });
-        self.patterns.insert(pattern.into(), read);
+        let known = self.patterns.entry(dialect).or_default();
+        known.insert(pattern.into(), read);
         read
     }
 
-    /// The language of a format, which is that of its pattern. The pattern is one that is
-    /// read as a language.
+    /// The language of a format, which is that of its pattern. The pattern is one of the
+    /// `regex` crate, whatever the dialect of the check, and one that is read as a language.
     pub fn format(&mut self, name: &str, pattern: &'static str) -> LanguageId {
         if let Some(known) = self.formats.get(name) {
             return *known;
@@ -270,7 +317,8 @@ impl Languages {
             Language::Dfa(dfa) => return Ok(Rc::clone(dfa)),
             Language::Pattern(pattern) => pattern::dfa(pattern, budget)?,
             Language::Format(pattern) => {
-                let read = pattern::read(pattern).expect("the pattern of a format is supported");
+                let read =
+                    pattern::read_rust(pattern).expect("the pattern of a format is supported");
                 pattern::dfa(&read, budget)?
             }
             Language::Words { words, others } => {
@@ -467,7 +515,7 @@ impl Languages {
                 max: Some(max),
             } => format!("(?s)^.{{{min},{max}}}$"),
         };
-        self.pattern(&pattern).ok()
+        self.pattern_of(&pattern, RegexDialect::Rust).ok()
     }
 
     /// Whether the language holds the word.
@@ -708,8 +756,13 @@ mod tests {
     struct Store(Languages);
 
     impl Store {
+        /// A store for patterns of the `regex` crate, which most of the tests here write.
         fn new() -> Self {
-            Self(Languages::default())
+            Self::of(RegexDialect::Rust)
+        }
+
+        fn of(dialect: RegexDialect) -> Self {
+            Self(Languages::new(dialect))
         }
 
         fn pattern(&mut self, pattern: &str) -> LanguageId {
@@ -854,6 +907,144 @@ mod tests {
             let read = store.pattern(pattern);
             assert_eq!(store.0.show(read), format!("{pattern:?}"));
         }
+    }
+
+    #[test]
+    fn a_pattern_is_read_in_the_dialect_of_the_store() {
+        let (mut ecma, mut rust) = (Store::of(RegexDialect::Ecma262), Store::new());
+        assert_eq!(Languages::default().dialect, RegexDialect::Ecma262);
+        // To ECMA-262 a digit is one of ASCII, and to the `regex` crate any of Unicode.
+        for (store, same) in [(&mut ecma, true), (&mut rust, false)] {
+            let (digits, ascii) = (store.pattern(r"^\d+$"), store.pattern("^[0-9]+$"));
+            assert!(store.includes(digits, ascii));
+            assert_eq!(store.includes(ascii, digits), same);
+            assert_eq!(store.holds(digits, "٣"), !same);
+        }
+        // What is a pattern of one dialect may be none of the other.
+        for only_rust in ["(?i)^a$", r"^a\-b$", r"^\p{Greek}$"] {
+            assert_eq!(ecma.0.pattern(only_rust), Err(Unsupported), "{only_rust:?}");
+            assert!(rust.0.pattern(only_rust).is_ok(), "{only_rust:?}");
+        }
+        for only_ecma in [r"^\cJ$", r"^[^]$", r"^\uD83D\uDE00$"] {
+            assert!(ecma.0.pattern(only_ecma).is_ok(), "{only_ecma:?}");
+            assert_eq!(rust.0.pattern(only_ecma), Err(Unsupported), "{only_ecma:?}");
+        }
+        // And a pattern of both may say one thing in the one and another in the other.
+        let (of_ecma, of_rust) = (ecma.pattern("^[a&&b]$"), rust.pattern("^[a&&b]$"));
+        assert!(ecma.holds(of_ecma, "&") && !rust.holds(of_rust, "&"));
+        // A word between the two ends is that word in either.
+        for store in [&mut ecma, &mut rust] {
+            assert_eq!(store.pattern("^type$"), store.0.words(["type"]));
+            assert_eq!(store.pattern(r"^a\.b$"), store.0.words(["a.b"]));
+            assert_eq!(store.pattern("^$"), store.0.words([""]));
+        }
+        assert_eq!(ecma.pattern(r"^a\x62(c)$"), ecma.0.words(["abc"]));
+        // The pattern of some lengths is one that the library writes, as the `regex` crate
+        // reads it: any character, a line feed too, so many times.
+        for store in [&mut ecma, &mut rust] {
+            let short = store.0.of_lengths(between(1, 2)).unwrap();
+            for (word, held) in [("", false), ("a", true), ("é\n", true), ("abc", false)] {
+                assert_eq!(store.holds(short, word), held, "{word:?}");
+            }
+        }
+        // Written in a schema, the same pattern is none of ECMA-262.
+        assert_eq!(ecma.0.pattern("(?s)^.{1,2}$"), Err(Unsupported));
+        assert_eq!(
+            rust.0.pattern("(?s)^.{1,2}$"),
+            rust.0.of_lengths(between(1, 2)).ok_or(Unsupported)
+        );
+    }
+
+    /// Every pattern of the corpus: what stands under `pattern`, and the keys of what stands
+    /// under `patternProperties`, wherever the two are.
+    fn corpus_patterns() -> BTreeSet<String> {
+        let mut patterns = BTreeSet::new();
+        let cases = crate::testing::corpus_cases();
+        for (_, schema) in cases
+            .iter()
+            .flat_map(|case| crate::testing::schemas_of(case))
+        {
+            let mut pending: Vec<serde_json::Value> = vec![schema];
+            while let Some(value) = pending.pop() {
+                match value {
+                    serde_json::Value::Array(items) => pending.extend(items),
+                    serde_json::Value::Object(members) => {
+                        if let Some(serde_json::Value::String(pattern)) = members.get("pattern") {
+                            patterns.insert(pattern.clone());
+                        }
+                        if let Some(serde_json::Value::Object(named)) =
+                            members.get("patternProperties")
+                        {
+                            patterns.extend(named.keys().cloned());
+                        }
+                        pending.extend(members.into_iter().map(|(_, member)| member));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        patterns
+    }
+
+    #[test]
+    #[ignore = "needs the corpus in benchmark/, which `make corpus` downloads"]
+    fn the_patterns_of_the_corpus_are_read_as_ecma_262() {
+        let patterns = corpus_patterns();
+        let mut store = Store::of(RegexDialect::Ecma262);
+        let (mut invalid, mut not_modelled) = (Vec::new(), Vec::new());
+        let (mut matched, mut unmatched, mut too_large) = (0, 0, 0);
+        for pattern in &patterns {
+            // The parser of `oxc` says which are patterns of ECMA-262.
+            let valid = ecma::tests::valid(pattern);
+            match ecma::read(pattern) {
+                Ok(_) => assert!(valid, "{pattern:?}"),
+                Err(ecma::Refusal::Invalid) => {
+                    assert!(!valid, "{pattern:?}");
+                    invalid.push(pattern);
+                    continue;
+                }
+                Err(ecma::Refusal::NotModelled) => {
+                    assert!(valid, "{pattern:?}");
+                    not_modelled.push(pattern);
+                    continue;
+                }
+            }
+            // And `regress` matches the plainest string of the language of each that is read,
+            // and does not match the plainest string outside it.
+            let expected = Matcher::new(RegexDialect::Ecma262, pattern);
+            let budget = &mut Budget::new(1_000_000);
+            let language = store.pattern(pattern);
+            let words = store
+                .0
+                .shortest(language, Lengths::ANY, budget)
+                .and_then(|inside| {
+                    let outside = store.0.complement(language, budget)?;
+                    Ok((inside, store.0.shortest(outside, Lengths::ANY, budget)?))
+                });
+            let Ok((inside, outside)) = words else {
+                too_large += 1;
+                continue;
+            };
+            if let Some(word) = inside {
+                assert!(expected.is_match(&word), "{pattern:?} on {word:?}");
+                matched += 1;
+            }
+            if let Some(word) = outside {
+                assert!(!expected.is_match(&word), "{pattern:?} on {word:?}");
+                unmatched += 1;
+            }
+        }
+        println!(
+            "{} patterns: {} are none of ECMA-262, {} are not modelled, {} are too large; \
+             {matched} strings matched and {unmatched} not\nnot modelled: {not_modelled:?}",
+            patterns.len(),
+            invalid.len(),
+            not_modelled.len(),
+            too_large,
+        );
+        assert!(patterns.len() > 15_000, "{} patterns", patterns.len());
+        assert!(invalid.len() < 50 && not_modelled.len() < 20);
+        assert!(matched > 15_000 && unmatched > 15_000 && too_large < 20);
     }
 
     #[test]
@@ -1098,15 +1289,49 @@ mod tests {
         strings
     }
 
+    /// Says whether a pattern matches a string, by a crate that matches in the dialect: the
+    /// `regex` crate, or `regress` for ECMA-262.
+    struct Matcher(Box<dyn Fn(&str) -> bool>);
+
+    impl Matcher {
+        fn new(dialect: RegexDialect, pattern: &str) -> Self {
+            match dialect {
+                RegexDialect::Ecma262 => {
+                    let read = regress::Regex::with_flags(pattern, "u").unwrap();
+                    Self(Box::new(move |string| read.find(string).is_some()))
+                }
+                RegexDialect::Rust => {
+                    let read = regex::Regex::new(pattern).unwrap();
+                    Self(Box::new(move |string| read.is_match(string)))
+                }
+            }
+        }
+
+        fn is_match(&self, string: &str) -> bool {
+            (self.0)(string)
+        }
+    }
+
     #[test]
     fn the_dfas_agree_with_the_regex_crate() {
+        the_dfas_agree_with_a_matcher(RegexDialect::Rust);
+    }
+
+    #[test]
+    fn the_dfas_agree_with_regress() {
+        the_dfas_agree_with_a_matcher(RegexDialect::Ecma262);
+    }
+
+    /// The random patterns are ones of both dialects. The two read some of them differently,
+    /// such as `\w` on `é`.
+    fn the_dfas_agree_with_a_matcher(dialect: RegexDialect) {
         let random = &mut Random(2);
         let strings = strings();
-        let mut store = Store::new();
+        let mut store = Store::of(dialect);
         for _ in 0..300 {
             let (one, other) = (pattern(random, 3), pattern(random, 3));
             let (of_one, of_other) = (store.pattern(&one), store.pattern(&other));
-            let expected = [&one, &other].map(|pattern| regex::Regex::new(pattern).unwrap());
+            let expected = [&one, &other].map(|pattern| Matcher::new(dialect, pattern));
             let not_other = store.not(of_other);
             let (both, only_one) = (store.both(of_one, of_other), store.both(of_one, not_other));
             let mut told_apart = false;

@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use super::object::Partitions;
 use super::{Left, Solver};
 use crate::context::{Budget, Exhausted};
-use crate::language::Languages;
+use crate::language::{Languages, RegexDialect};
 use crate::normalize::{Cause, Found, Witness};
 use crate::schema::NodeId;
 use crate::term::{CRefId, InstanceType, Terms, TypeSet, VarId};
@@ -42,7 +42,8 @@ impl Engine {
         Self {
             variables: variables.collect(),
             terms,
-            languages: Languages::default(),
+            // The patterns of the tests are those of the `regex` crate.
+            languages: Languages::new(RegexDialect::Rust),
             partitions: Partitions::default(),
             found: HashMap::new(),
             decided: Vec::new(),
