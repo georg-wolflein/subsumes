@@ -60,7 +60,7 @@ mod verdict;
 
 use serde_json::Value;
 
-pub use checker::{Check, Checker};
+pub use checker::Checker;
 pub use error::Error;
 pub use language::RegexDialect;
 pub use verdict::{Reason, Side, Verdict};

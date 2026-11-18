@@ -2432,22 +2432,22 @@ mod tests {
             nested(20_000, json!({"type": "integer"})),
             nested(20_000, json!({"type": "number"})),
         );
-        let check = Checker::new()
+        let verdict = Checker::new()
             .budget(10_000_000)
-            .check(&any, &whole)
+            .subsumes(&any, &whole)
             .unwrap();
-        assert_eq!(check.verdict, Verdict::Yes);
+        assert_eq!(verdict, Verdict::Yes);
         // A task costs steps, so a budget that is smaller than the schema is deep ends it.
         let small = Checker::new().budget(1_000);
         let verdict = small.subsumes(&any, &whole).unwrap();
         assert_eq!(reason_of(&verdict), Some(Reason::Budget));
         // The other way an instance holds an object for each level, and one that deep
         // cannot be given: there is no counterexample, and no stack is used up for one.
-        let check = Checker::new()
+        let verdict = Checker::new()
             .budget(10_000_000)
-            .check(&whole, &any)
+            .subsumes(&whole, &any)
             .unwrap();
-        assert_eq!(reason_of(&check.verdict), Some(Reason::Unrepresentable));
+        assert_eq!(reason_of(&verdict), Some(Reason::Unrepresentable));
         // Dropping a value this deep would recurse, which is no concern of this test.
         std::mem::forget((whole, any));
     }
@@ -2510,11 +2510,11 @@ mod tests {
         }
         definitions.insert("d1500".to_owned(), json!({"type": "null"}));
         let chain = json!({"$ref": "#/$defs/d0", "$defs": definitions});
-        let check = Checker::new()
+        let verdict = Checker::new()
             .budget(2_000_000)
-            .check(&json!(false), &chain)
+            .subsumes(&json!(false), &chain)
             .unwrap();
-        assert_eq!(reason_of(&check.verdict), Some(Reason::Unrepresentable));
+        assert_eq!(reason_of(&verdict), Some(Reason::Unrepresentable));
     }
 
     #[test]
@@ -2533,8 +2533,8 @@ mod tests {
             })
         };
         let small = Checker::new().budget(100_000);
-        let check = small.check(&json!(false), &many(u64::MAX)).unwrap();
-        assert_eq!(reason_of(&check.verdict), Some(Reason::Budget));
+        let verdict = small.subsumes(&json!(false), &many(u64::MAX)).unwrap();
+        assert_eq!(reason_of(&verdict), Some(Reason::Budget));
         // With one property to have, it is the plainest name that is left.
         let other = format!("{}b", "a".repeat(63));
         assert_eq!(
@@ -2763,8 +2763,8 @@ mod tests {
         // well as the default, in less time.
         let endless = json!({"type": "array", "minItems": u64::MAX});
         let small = Checker::new().budget(100_000);
-        let check = small.check(&json!(false), &endless).unwrap();
-        assert_eq!(reason_of(&check.verdict), Some(Reason::Budget));
+        let verdict = small.subsumes(&json!(false), &endless).unwrap();
+        assert_eq!(reason_of(&verdict), Some(Reason::Budget));
         yes(&json!({"minItems": 3}), &endless);
     }
 
@@ -2956,22 +2956,22 @@ mod tests {
             nested(20_000, json!({"type": "integer"})),
             nested(20_000, json!({"type": "number"})),
         );
-        let check = Checker::new()
+        let verdict = Checker::new()
             .budget(10_000_000)
-            .check(&any, &whole)
+            .subsumes(&any, &whole)
             .unwrap();
-        assert_eq!(check.verdict, Verdict::Yes);
+        assert_eq!(verdict, Verdict::Yes);
         // A task costs steps, so a budget that is smaller than the schema is deep ends it.
         let small = Checker::new().budget(1_000);
         let verdict = small.subsumes(&any, &whole).unwrap();
         assert_eq!(reason_of(&verdict), Some(Reason::Budget));
         // The other way an instance holds an array for each level, and one that deep
         // cannot be given: there is no counterexample, and no stack is used up for one.
-        let check = Checker::new()
+        let verdict = Checker::new()
             .budget(10_000_000)
-            .check(&whole, &any)
+            .subsumes(&whole, &any)
             .unwrap();
-        assert_eq!(reason_of(&check.verdict), Some(Reason::Unrepresentable));
+        assert_eq!(reason_of(&verdict), Some(Reason::Unrepresentable));
         // An instance of 127 arrays inside one another is given, and no deeper one.
         let (integer, number) = (json!({"type": "integer"}), json!({"type": "number"}));
         let instance = counterexample(&nested(127, integer.clone()), &nested(127, number.clone()));
@@ -3547,24 +3547,25 @@ mod tests {
     fn the_budget_ends_a_check() {
         let a = json!({"anyOf": [{"type": "null"}, {"type": "string"}]});
         let b = json!({"type": ["null", "string", "number"]});
-        let steps = Checker::new().check(&a, &b).unwrap().steps;
+        // What the check spends, which only the library sees.
+        let (_, steps) = Checker::new().check(&a, &b).unwrap();
         assert!(steps > 1, "{steps}");
-        let check = Checker::new().budget(steps - 1).check(&a, &b).unwrap();
+        let (verdict, spent) = Checker::new().budget(steps - 1).check(&a, &b).unwrap();
         assert_eq!(
-            check.verdict,
+            verdict,
             Verdict::Unknown {
                 reason: Reason::Budget
             }
         );
-        assert_eq!(check.steps, steps - 1);
-        let check = Checker::new().budget(steps).check(&a, &b).unwrap();
+        assert_eq!(spent, steps - 1);
+        let (verdict, spent) = Checker::new().budget(steps).check(&a, &b).unwrap();
         assert_eq!(
-            check.verdict,
+            verdict,
             Verdict::No {
                 counterexample: json!(0)
             }
         );
-        assert_eq!(check.steps, steps);
+        assert_eq!(spent, steps);
     }
 
     #[test]
