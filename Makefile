@@ -8,21 +8,33 @@ BENCHMARK_URL := https://github.com/georg-wolflein/subsumes-benchmark/releases/d
 # check. More is faster, and its times are no more than a hint: `make benchmark JOBS=8`.
 JOBS ?= 1
 
-.PHONY: ci lint format format-check test test-corpus corpus benchmark
+# The Python package in python/ has its own environment, which uv keeps. `uv run` builds the
+# native module anew when the binding or the library has changed.
+PYTHON := uv --directory python run
 
-ci: format-check lint test  ## what CI runs on every change, without the benchmark
+.PHONY: ci lint format format-check typecheck test test-corpus corpus benchmark
+
+ci: format-check lint typecheck test  ## what CI runs on every change, without the benchmark
 
 lint:
 	cargo clippy --workspace --locked --all-targets -- --deny warnings
+	$(PYTHON) ruff check .
 
 format:
 	cargo fmt --all
+	$(PYTHON) ruff format .
+	$(PYTHON) ruff check --fix .
 
 format-check:
 	cargo fmt --all --check
+	$(PYTHON) ruff format --check .
+
+typecheck:  ## the Python package only; the compiler checks the rest
+	$(PYTHON) ty check
 
 test:
 	cargo test --workspace --locked
+	$(PYTHON) pytest
 
 corpus:  ## download the pinned benchmark corpus and unpack it into benchmark/
 	mkdir -p target

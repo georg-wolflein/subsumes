@@ -45,6 +45,27 @@ Checker::new().budget(steps)
 
 Schemas are `serde_json::Value`. A `Checker` does not change while it checks, so one can be shared between threads.
 
+### Python
+
+```
+subsumes(a, b, *, budget=None) -> Yes | No(counterexample)
+    raises UndecidedError    UnsupportedError(side, location) | UnrepresentableError | BudgetError
+    raises SchemaError       with its side and location
+```
+
+The package `subsumes` in `python/` wraps the library. It is written for Python and is no copy of the Rust API:
+
+- **Two verdicts and an exception.** A check returns `Yes`, which is true as a condition, or `No`, which is false and carries the counterexample. A check that the library cannot decide raises, with one class of exception for each reason. So an undecided check never passes for an answer, and code that forgets about it fails loudly. No type checker makes a caller handle it, and code that checks many pairs wraps the call in `try`.
+- **`UnrepresentableError` is raised although the answer is known to be no.** A `No` carries its counterexample, and `None` is one, so a `No` without one cannot be told from a `No` with `null`.
+- **Two families of exceptions.** `SchemaError` is a `ValueError`: the caller's schema is at fault. `UndecidedError` is not, and the two share no base, so catching one never swallows the other.
+- **A schema is a Python object,** as `json.load` gives it: `dict`, `list`, `str`, `int`, `float`, `bool` and `None`. Anything else is a `TypeError` that names where it stands, also a `tuple`. A string is the JSON string, never JSON text.
+- **Numbers cross as `serde_json` would read them from text.** An `int` that 64 bits hold stays an integer, and a larger one becomes the nearest float. A `float` goes over as it is: Python and `serde_json` both print the shortest decimal that gives the float, so it stands for the same decimal on both sides. `nan`, the infinities and an `int` beyond the largest float are a `ValueError`.
+- **A schema is nested 127 deep at most,** which is what `serde_json` reads from text. A deeper one is a `ValueError`. The walk over a schema recurses, and so does the drop of a `serde_json` value, and running out of stack there would crash the interpreter instead of raising.
+- **`budget` is a keyword and there is no `Checker`.** With one setting, a class holds nothing. `None` is the default of the library, so the number stands in one place. `check` with its steps and `inspect` are left out: they serve the harness.
+- **The GIL is released for the check,** which touches no Python object, so threads check pairs side by side.
+- **The classes are Python, the native module is one function.** It returns a tuple of plain values that begins with the kind of outcome, and the package makes the dataclasses and the exceptions of it. The stub of the native module is a few lines, and ruff, ty and pytest check everything else as source.
+- **One wheel for a platform,** through the stable ABI of Python 3.12, which is the oldest version supported: the first with the `type` statement.
+
 ## Pipeline
 
 ```
@@ -211,6 +232,7 @@ src/
   meta_schemas.rs the meta-schema of draft 2020-12 and those of its vocabularies (exists)
   generate.rs     counterexamples (exists)
 harness/          the benchmark runner with its check of counterexamples, and the viewer (exists)
+python/           the Python package: the binding crate in src/, the package in subsumes/, its tests (exists)
 ```
 
 ## Order of work
@@ -252,6 +274,8 @@ What a step left open, with the step that takes it up:
 - **Numbers of any precision, for no step yet.** `serde_json` has a feature that keeps every number as its text, and any crate of a build may turn it on. The library reads a number digit by digit, so `1e1000000000` would become an integer of a billion digits. An exponent that is larger still is a panic. Nothing guards against either, and no test runs with the feature. Only whether `multipleOf` is more than zero is read with the feature in mind: from the text, so that `1e-400` is no error.
 - **The validator's own option for patterns, for the release that has it.** The `jsonschema` crate is getting an option that hands each pattern to the engine as it is written ([issue 1895](https://github.com/Stranger6667/jsonschema/issues/1895), [pull request 1897](https://github.com/Stranger6667/jsonschema/pull/1897)), which is merged and in no release yet. With it the harness writes no pattern anew: the `patterns` module and its two dependencies go, and the limits of the rewrite with them. Tried on the pull request, every verdict of the corpus stays, and the validator agrees with the `regex` crate on every pattern of the corpus. One thing changes: the validator refuses a schema with a pattern that the `regex` crate does not take, where today it reads the pattern as ECMA 262 if it can. That leaves 2 of the 1,912 counterexamples unchecked, both in cases that the corpus marks as having no meaning in the dialect.
 - **Most charges have no test of their own, for no step yet.** The budget is charged in 45 places. With one of them taken away at a time, a test fails for 14 and none does for the other 31, among them every charge of `normalize` and of the search for an object. Some of the 31 share a loop with a charge that still ends it, as the charges for the positions of the head of an array do. A loop that is left with no charge would show only as a check that does not end.
+- **The Python package is not released, for no step yet.** It builds and is tested on every change, and the release pull request raises its version with that of the crate. The release workflow builds no wheels and uploads nothing to PyPI yet: one wheel for each platform and a source distribution, with PyPI trusting the workflow as crates.io does. The README does not name the package either.
+- **Exact integers beyond 64 bits from Python, for no step yet.** Python holds an integer of any size exactly, and the binding rounds one that 64 bits do not hold to a float, because a `serde_json` value has no other place for it. It follows the item on numbers of any precision above.
 
 ## Not planned
 
