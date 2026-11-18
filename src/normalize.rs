@@ -40,7 +40,7 @@
 #[cfg(test)]
 mod exhaustive;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::rc::Rc;
 
 use serde_json::Value;
@@ -51,6 +51,7 @@ use crate::canonical::object::{Objects, Partitions};
 use crate::canonical::string::Strings;
 use crate::canonical::{Left, Solver};
 use crate::context::{Context, Exhausted};
+use crate::flat::FlatMap;
 use crate::generate;
 use crate::language::{LanguageId, Languages};
 use crate::term::{CRefId, InstanceType, LeafId, Term, TermId, Terms, TypeSet, VarId};
@@ -200,7 +201,7 @@ struct Branch {
     fails: BTreeSet<LeafId>,
     /// The variables taken for true, with `false`, and those taken for false, with `true`.
     /// Each is unfolded once in a branch, and this is its unfolding.
-    taken: BTreeMap<(VarId, bool), usize>,
+    taken: FlatMap<(VarId, bool), usize>,
     /// The references to a variable that was taken before: the unfolding of the variable,
     /// and the unfolding in which the reference stands.
     met: BTreeSet<(usize, usize)>,
@@ -230,7 +231,7 @@ impl Default for Branch {
             holds: BTreeSet::new(),
             covered: TypeSet::NONE,
             fails: BTreeSet::new(),
-            taken: BTreeMap::new(),
+            taken: FlatMap::new(),
             met: BTreeSet::new(),
             todo: VecDeque::new(),
             choices: VecDeque::new(),
@@ -850,7 +851,8 @@ impl Engine<'_> {
         negated: bool,
     ) -> Result<bool, Exhausted> {
         let Term::PNames(variable) = term else {
-            branch.objects.take(term, negated, &mut self.context.terms);
+            let Context { terms, budget, .. } = &mut *self.context;
+            branch.objects.take(term, negated, terms, budget)?;
             branch.objects_asked = true;
             return Ok(true);
         };
@@ -861,10 +863,12 @@ impl Engine<'_> {
             return Ok(branch.take(leaf, negated, &self.context.terms));
         };
         let Context {
-            terms, languages, ..
+            terms,
+            languages,
+            budget,
         } = &mut *self.context;
         let outside = languages.outside([names]);
-        branch.objects.names(outside, negated, terms);
+        branch.objects.names(outside, negated, terms, budget)?;
         branch.objects_asked = true;
         Ok(true)
     }
@@ -966,7 +970,10 @@ impl Engine<'_> {
             negated,
             within,
         });
-        branch.taken.insert((variable, negated), unfolding);
+        let budget = &mut self.context.budget;
+        branch
+            .taken
+            .insert((variable, negated), unfolding, budget)?;
         branch.todo.push_back(Item {
             term: self.context.terms.variable(variable).body,
             negated,
