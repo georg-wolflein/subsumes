@@ -1,6 +1,10 @@
-<h1 align="center">
-  <img src="https://raw.githubusercontent.com/georg-wolflein/subsumes/main/assets/subsumes.svg" alt="subsumes" width="420">
-</h1>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/georg-wolflein/subsumes/main/assets/banner-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/georg-wolflein/subsumes/main/assets/banner-light.svg">
+    <img src="https://raw.githubusercontent.com/georg-wolflein/subsumes/main/assets/banner-light.svg" alt="subsumes" width="100%">
+  </picture>
+</p>
 
 A Rust library for JSON Schema inclusion: **does schema A accept every instance valid under schema B?**
 
