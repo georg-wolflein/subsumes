@@ -30,7 +30,7 @@ impl Random {
     }
 }
 
-/// The file of every case of the corpus in `benchmark/`, which `make corpus` downloads: every
+/// The file of every case of the corpus in `benchmark/`, which `make corpus` unpacks: every
 /// JSON file below the folder of a collection, which is a folder that holds a
 /// `collection.json`, except that file.
 pub(crate) fn corpus_cases() -> Vec<PathBuf> {

@@ -987,7 +987,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs the corpus in benchmark/, which `make corpus` downloads"]
+    #[ignore = "needs the corpus in benchmark/, which `make corpus` unpacks"]
     fn the_patterns_of_the_corpus_are_read_as_ecma_262() {
         let patterns = corpus_patterns();
         let mut store = Store::of(RegexDialect::Ecma262);
