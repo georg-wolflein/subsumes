@@ -5,20 +5,17 @@
 //! narrow schema, whose instances were to be accepted, and invalid under the wide schema,
 //! which was to accept them.
 //!
-//! The validator reads the schemas as the library does: as draft 2020-12, with `format`
-//! asserted, and with every pattern in the dialect of the `regex` crate, which the
-//! [`patterns`] module sees to.
+//! The validator reads the schemas as the library does by default: as draft 2020-12, with
+//! `format` asserted, and with every pattern as one of ECMA-262.
 //!
 //! What a format accepts, the validator works out with code of its own, and the library with
 //! a pattern for each format that it models. So a counterexample that is a string holds the
 //! two against each other. No string is known on which they differ. Whether a time with the
 //! second 60 is one, the library leaves open and gives no such string.
 
-use jsonschema::{Draft, PatternOptions, Validator};
+use jsonschema::{Draft, Validator};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-
-use crate::patterns;
 
 /// What the validator makes of the counterexample of a `No`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,9 +60,8 @@ pub fn confirmation(wide: &Value, narrow: &Value, counterexample: &Value) -> Con
 fn validator(schema: &Value) -> Result<Validator, String> {
     jsonschema::options()
         .with_draft(Draft::Draft202012)
-        .with_pattern_options(PatternOptions::regex())
         .should_validate_formats(true)
-        .build(&patterns::spelled_out(schema))
+        .build(schema)
         .map_err(|error| format!("the validator does not take a schema: {error}"))
 }
 
@@ -349,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pattern_is_one_of_the_regex_crate() {
+    fn a_pattern_is_one_of_ecma_262() {
         // A search, as the draft says: the pattern may match anywhere.
         let (anything, pattern) = (json!(false), json!({"pattern": "b+"}));
         assert_eq!(
@@ -360,88 +356,56 @@ mod tests {
             confirmation(&anything, &pattern, &json!("aa")),
             Confirmation::RejectedByNarrow
         );
-        // The `regex` crate has no look-around, so the validator does not take the schema
-        // and the counterexample goes unchecked, whichever of the two schemas it is.
+        // The validator has look-around, which the library does not model.
         let look_ahead = json!({"pattern": "a(?=b)"});
-        for (wide, narrow) in [(&anything, &look_ahead), (&look_ahead, &json!(true))] {
-            let Confirmation::NotChecked(why) = confirmation(wide, narrow, &json!("ab")) else {
-                panic!("the validator took a pattern with a look-ahead");
-            };
-            assert!(
-                why.starts_with("the validator does not take a schema: "),
-                "{why}"
-            );
-        }
+        assert_eq!(
+            confirmation(&anything, &look_ahead, &json!("ab")),
+            Confirmation::Confirmed
+        );
+        assert_eq!(
+            confirmation(&look_ahead, &json!(true), &json!("ac")),
+            Confirmation::Confirmed
+        );
     }
 
     #[test]
-    fn a_pattern_matches_what_it_matches_in_the_regex_crate() {
-        // Each of these says something else in ECMA 262, which the validator reads by itself:
-        // the classes of Unicode, the line ends, the operations on classes, the flags.
-        let patterns = [
-            r"^\d$",
-            r"^\D$",
-            r"^\w+$",
-            r"^\W$",
-            r"^\s$",
-            r"^\S*$",
-            "^.$",
-            "(?s)^.$",
-            r"^[\d-]+$",
-            r"^[a-z&&[^b]]$",
-            r"^[\w--\d]$",
-            r"^[a-c~~b-d]$",
-            r"^[[:alpha:]&]$",
-            r"[^\s\S]",
-            r"\P{any}",
-            r"^\a$",
-            "(?i)^straße$",
-            "(?x) ^ a b $ # and no more",
-            r"^\p{Greek}+$",
-            r"a\b",
+    fn a_pattern_matches_what_it_matches_in_ecma_262() {
+        // Each of these says something else in the `regex` crate: the classes of ASCII, the
+        // line terminators, the escapes.
+        let patterns: [(&str, &[&str], &[&str]); 9] = [
+            (r"^\d$", &["3"], &["٣", "a", ""]),
+            (r"^\D$", &["٣", "a"], &["3"]),
+            (r"^\w+$", &["a", "_", "a3"], &["é", "-", ""]),
+            (r"^\W$", &["é", "-"], &["a"]),
+            (
+                r"^\s$",
+                &[" ", "\n", "\u{a0}", "\u{2028}", "\u{feff}"],
+                &["\u{85}", "a"],
+            ),
+            (r"^\S$", &["\u{85}", "a"], &[" ", "\u{feff}"]),
+            (
+                "^.$",
+                &["a", "\u{85}", "😀"],
+                &["\n", "\r", "\u{2028}", "\u{2029}", "ab"],
+            ),
+            (r"^\cC$", &["\u{3}"], &["C", "cC"]),
+            (r"^\p{Script=Greek}+$", &["λόγος"], &["logos"]),
         ];
-        let strings = [
-            "",
-            "3",
-            "٣",
-            "a",
-            "b",
-            "d",
-            "é",
-            "_",
-            "&",
-            "-",
-            "~",
-            "[",
-            " ",
-            "\n",
-            "\r",
-            "\u{7}",
-            "\u{85}",
-            "\u{feff}",
-            "\u{2028}",
-            "ab",
-            "a b",
-            "a-",
-            "3-٣",
-            "STRASSE",
-            "Straße",
-            "λόγος",
-        ];
-        for pattern in patterns {
-            let expected = regex::Regex::new(pattern).unwrap();
+        for (pattern, matched, others) in patterns {
             let validator = validator(&json!({"pattern": pattern})).unwrap();
-            let names = validator_of_names(pattern);
-            for string in strings {
-                let matches = expected.is_match(string);
+            // The same pattern as a key of `patternProperties`, with the name as the string.
+            let names =
+                json!({"patternProperties": {pattern: true}, "additionalProperties": false});
+            let names = self::validator(&names).unwrap();
+            let strings = matched.iter().map(|string| (string, true));
+            for (string, matches) in strings.chain(others.iter().map(|string| (string, false))) {
                 assert_eq!(
                     validator.is_valid(&json!(string)),
                     matches,
                     "{pattern:?} on {string:?}"
                 );
-                // The same pattern as a key of `patternProperties`, with the name as the string.
                 assert_eq!(
-                    names.is_valid(&json!({string: null})),
+                    names.is_valid(&json!({*string: null})),
                     matches,
                     "{pattern:?} on the name {string:?}"
                 );
@@ -449,31 +413,50 @@ mod tests {
         }
     }
 
-    /// Accepts an object whose names all match the pattern, by way of `patternProperties`.
-    fn validator_of_names(pattern: &str) -> Validator {
-        let schema = json!({"patternProperties": {pattern: true}, "additionalProperties": false});
-        validator(&schema).unwrap()
-    }
-
     #[test]
-    fn a_pattern_is_read_so_wherever_a_reference_leads() {
-        // To the `regex` crate, and so to the library, `\d` is any digit of Unicode.
-        let digit = json!({
-            "$ref": "#/types/digit",
-            "types": {"digit": {"pattern": r"^\d$"}},
-        });
-        assert_eq!(
-            confirmation(&json!(false), &digit, &json!("٣")),
-            Confirmation::Confirmed
-        );
-        assert_eq!(
-            confirmation(&json!({"pattern": "^[0-9]$"}), &digit, &json!("٣")),
-            Confirmation::Confirmed
-        );
-        assert_eq!(
-            confirmation(&digit, &json!(true), &json!("٣")),
-            Confirmation::AcceptedByWide
-        );
+    fn the_validator_reads_a_pattern_as_the_library_does() {
+        let patterns = [
+            r"^\d{2}$",
+            r"^\D\d$",
+            r"^\w\W$",
+            r"^\s\S$",
+            r"^.\s$",
+            r"^[^\s]\n$",
+            r"^[\w-]+\.$",
+            r"^\cJ\x41B$",
+            r"^[a-c]{2,3}\/$",
+            r"^(?:a|b)+?c$",
+            r"^(?<year>\d{4})-(?<month>\d{2})$",
+            r"^\p{Lu}\p{Ll}$",
+            r"^[^\p{L}\d]$",
+            r"\u{1F600}$",
+            r"^😀$",
+        ];
+        for pattern in patterns {
+            // A string that the pattern matches, and one that it does not.
+            let (nothing, narrow) = (json!(false), json!({"pattern": pattern, "type": "string"}));
+            let subsumes::Verdict::No { counterexample } =
+                subsumes::subsumes(&nothing, &narrow).unwrap()
+            else {
+                panic!("the library finds no string for {pattern:?}");
+            };
+            assert_eq!(
+                confirmation(&nothing, &narrow, &counterexample),
+                Confirmation::Confirmed,
+                "{counterexample} for {pattern:?}"
+            );
+            let (wide, narrow) = (json!({"pattern": pattern}), json!({"type": "string"}));
+            let subsumes::Verdict::No { counterexample } =
+                subsumes::subsumes(&wide, &narrow).unwrap()
+            else {
+                panic!("the library finds no string against {pattern:?}");
+            };
+            assert_eq!(
+                confirmation(&wide, &narrow, &counterexample),
+                Confirmation::Confirmed,
+                "{counterexample} against {pattern:?}"
+            );
+        }
     }
 
     #[test]

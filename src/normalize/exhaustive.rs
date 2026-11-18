@@ -790,7 +790,8 @@ impl<'d> Document<'d> {
     }
 }
 
-/// Whether a pattern matches a string, by the `regex` crate.
+/// Whether a pattern matches a string, by the `regex` crate. The patterns of these tests say
+/// the same in ECMA-262, which the engine reads them as.
 fn matches(pattern: &str, string: &str) -> bool {
     thread_local! {
         static READ: RefCell<HashMap<String, regex::Regex>> = RefCell::default();

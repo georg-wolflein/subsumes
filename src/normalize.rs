@@ -1059,7 +1059,7 @@ mod tests {
     use serde_json::{Map, json};
 
     use super::*;
-    use crate::{Checker, Reason, Side, Verdict};
+    use crate::{Checker, Reason, RegexDialect, Side, Verdict};
 
     fn verdict(a: &Value, b: &Value) -> Verdict {
         Checker::new().subsumes(a, b).unwrap()
@@ -1335,10 +1335,17 @@ mod tests {
         );
         yes(&one, &other);
         yes(&other, &one);
-        // To the `regex` crate a digit is any digit of Unicode.
+        // To ECMA-262 a digit is one of the ten of ASCII, and to the `regex` crate any digit
+        // of Unicode.
         let (digits, ascii) = (json!({"pattern": r"^\d+$"}), json!({"pattern": "^[0-9]+$"}));
         yes(&digits, &ascii);
-        assert_eq!(counterexample(&ascii, &digits), json!("٠"));
+        yes(&ascii, &digits);
+        let rust = Checker::new().regex_dialect(RegexDialect::Rust);
+        assert_eq!(rust.subsumes(&digits, &ascii), Ok(Verdict::Yes));
+        let no = Verdict::No {
+            counterexample: json!("٠"),
+        };
+        assert_eq!(rust.subsumes(&ascii, &digits), Ok(no));
         // What is no string satisfies every pattern.
         assert_eq!(
             counterexample(&json!({"type": "string"}), &lower),
@@ -2012,12 +2019,12 @@ mod tests {
         );
         assert_eq!(counterexample(&both, &narrow), json!({"x-a": ""}));
         // Two patterns that are written differently and match the same names.
-        let again = json!({"patternProperties": {"(?s)^x-.*$": {"type": "string"}}});
+        let again = json!({"patternProperties": {"^x-[^]*$": {"type": "string"}}});
         yes(&again, &narrow);
         yes(&narrow, &again);
-        // Without the flag, the dot stops at the end of a line.
+        // The dot stops at the end of a line, which a separator of lines is too.
         let lines = json!({"patternProperties": {"^x-.*$": {"type": "string"}}});
-        assert_eq!(counterexample(&narrow, &lines), json!({"x-\n": null}));
+        assert_eq!(counterexample(&narrow, &lines), json!({"x-\u{2028}": null}));
         // A name that two patterns match satisfies both.
         let two = json!({"patternProperties": {"^a": {"minimum": 0}, "b$": {"maximum": 9}}});
         yes(

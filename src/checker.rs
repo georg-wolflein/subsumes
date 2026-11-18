@@ -2,22 +2,24 @@ use serde_json::Value;
 
 use crate::context::Context;
 use crate::normalize::{self, Cause, Outcome};
-use crate::{Error, Reason, Verdict, inspect, lower, schema};
+use crate::{Error, Reason, RegexDialect, Verdict, inspect, lower, schema};
 
 /// The work budget of a check, unless another is set. It is there so that a check ends: one
 /// that spends all of it takes a few seconds. How many steps a check takes is no measure of how
 /// fast it is.
 const DEFAULT_BUDGET: u64 = 10_000_000;
 
-/// The settings of a check. So far that is its work budget.
+/// The settings of a check: its work budget, and the dialect that its patterns are read in.
 ///
 /// A checker does not change while it checks, so one can be shared between threads.
 ///
 /// ```
 /// use serde_json::json;
-/// use subsumes::Checker;
+/// use subsumes::{Checker, RegexDialect};
 ///
-/// let checker = Checker::new().budget(100_000);
+/// let checker = Checker::new()
+///     .budget(100_000)
+///     .regex_dialect(RegexDialect::Rust);
 ///
 /// let a = json!({"type": "string"});
 /// let b = json!({"type": "string", "minLength": 1});
@@ -27,15 +29,17 @@ const DEFAULT_BUDGET: u64 = 10_000_000;
 #[derive(Debug, Clone)]
 pub struct Checker {
     budget: u64,
+    regex_dialect: RegexDialect,
 }
 
 impl Checker {
-    /// A checker with the default work budget: 10 million steps, which is a few seconds of work
-    /// at most.
+    /// A checker with the default work budget, 10 million steps, which is a few seconds of
+    /// work at most, and that reads patterns as ECMA-262 does.
     #[must_use]
     pub fn new() -> Self {
         Self {
             budget: DEFAULT_BUDGET,
+            regex_dialect: RegexDialect::default(),
         }
     }
 
@@ -44,6 +48,14 @@ impl Checker {
     #[must_use]
     pub fn budget(mut self, steps: u64) -> Self {
         self.budget = steps;
+        self
+    }
+
+    /// Sets the dialect that every `pattern` and every key of `patternProperties` is read
+    /// in, in both schemas. Without it that is [`RegexDialect::Ecma262`].
+    #[must_use]
+    pub fn regex_dialect(mut self, dialect: RegexDialect) -> Self {
+        self.regex_dialect = dialect;
         self
     }
 
@@ -63,7 +75,7 @@ impl Checker {
     /// When `a` or `b` cannot be checked at all; see [`Error`].
     pub fn check(&self, a: &Value, b: &Value) -> Result<Check, Error> {
         let graph = schema::parse(a, b)?.link()?;
-        let mut context = Context::new(self.budget);
+        let mut context = Context::new(self.budget, self.regex_dialect);
         let outcome = lower::lower(&graph, &mut context)
             .and_then(|(a, b)| normalize::decide(&mut context, a, b));
         let verdict = match outcome {
@@ -102,7 +114,7 @@ impl Checker {
     /// When `a` or `b` cannot be checked at all; see [`Error`].
     pub fn inspect(&self, a: &Value, b: &Value) -> Result<Value, Error> {
         let graph = schema::parse(a, b)?.link()?;
-        let mut context = Context::new(self.budget);
+        let mut context = Context::new(self.budget, self.regex_dialect);
         // Without the budget for them there are no terms to show.
         let roots = lower::lower(&graph, &mut context).ok();
         Ok(inspect::stages(&graph, &context, roots))

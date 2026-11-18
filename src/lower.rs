@@ -1004,7 +1004,7 @@ mod tests {
     /// A and B lowered: the terms, and the variables of the two.
     fn lowered(a: &Value, b: &Value) -> (Terms, VarId, VarId) {
         let graph = parse(a, b).unwrap().link().unwrap();
-        let mut context = Context::new(u64::MAX);
+        let mut context = Context::new(u64::MAX, crate::RegexDialect::default());
         let (a, b) = lower(&graph, &mut context).unwrap();
         (context.terms, a, b)
     }
@@ -1013,7 +1013,11 @@ mod tests {
     fn lowers(schema: &Value, budget: u64) -> bool {
         let truth = json!(true);
         let graph = parse(schema, &truth).unwrap().link().unwrap();
-        lower(&graph, &mut Context::new(budget)).is_ok()
+        lower(
+            &graph,
+            &mut Context::new(budget, crate::RegexDialect::default()),
+        )
+        .is_ok()
     }
 
     /// The term of a schema, as text.
@@ -1313,7 +1317,7 @@ mod tests {
     fn languages(schema: &Value) -> Vec<String> {
         let truth = json!(true);
         let graph = parse(schema, &truth).unwrap().link().unwrap();
-        let mut context = Context::new(u64::MAX);
+        let mut context = Context::new(u64::MAX, crate::RegexDialect::default());
         let (a, _) = lower(&graph, &mut context).unwrap();
         let body = context.terms.variable(a).body;
         let parts = match context.terms.term(body) {
@@ -1423,7 +1427,7 @@ mod tests {
         let a = json!({"type": "array", "uniqueItems": true});
         let b = json!({"uniqueItems": true, "format": "hostname"});
         let graph = parse(&a, &b).unwrap().link().unwrap();
-        let mut context = Context::new(u64::MAX);
+        let mut context = Context::new(u64::MAX, crate::RegexDialect::default());
         let (_, of_b) = lower(&graph, &mut context).unwrap();
         let terms = &context.terms;
         let crate::term::Term::AllOf(parts) = terms.term(terms.variable(of_b).body) else {
@@ -2103,6 +2107,9 @@ mod tests {
         let truth = json!(true);
         let graph = parse(&cycle, &truth).unwrap().link().unwrap();
         // Telling the schemas of a cycle apart costs steps, and here there are none.
-        assert_eq!(lower(&graph, &mut Context::new(0)), Err(Exhausted));
+        assert_eq!(
+            lower(&graph, &mut Context::new(0, crate::RegexDialect::default())),
+            Err(Exhausted)
+        );
     }
 }

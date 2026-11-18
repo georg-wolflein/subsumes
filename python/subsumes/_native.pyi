@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from subsumes import Json, Side
+from subsumes import Json, RegexDialect, Side
 
 type Outcome = (
     tuple[Literal["yes"]]
@@ -18,4 +18,4 @@ type Outcome = (
 A message comes first where there is one, then the schema at fault and the location in it.
 """
 
-def check(a: Json, b: Json, budget: int | None) -> Outcome: ...
+def check(a: Json, b: Json, budget: int | None, regex_dialect: RegexDialect) -> Outcome: ...
