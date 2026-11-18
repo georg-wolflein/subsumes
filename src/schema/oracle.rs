@@ -333,50 +333,71 @@ pub(super) fn compared(schema: &Value) -> Result<Comparison, String> {
     Ok(comparison)
 }
 
-/// Every `a.json` and `b.json` of the corpus.
-fn corpus_schemas(corpus: &Path) -> Vec<PathBuf> {
-    let (mut schemas, mut pending) = (Vec::new(), vec![corpus.to_owned()]);
-    while let Some(folder) = pending.pop() {
-        for entry in std::fs::read_dir(&folder).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                pending.push(path);
-            } else if path.ends_with("a.json") || path.ends_with("b.json") {
-                schemas.push(path);
+/// The file of every case of the corpus: every JSON file below the folder of a collection,
+/// which is a folder that holds a `collection.json`, except that file.
+fn corpus_cases(corpus: &Path) -> Vec<PathBuf> {
+    let entries = |folder: &Path| {
+        let entries = std::fs::read_dir(folder).unwrap();
+        entries
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>()
+    };
+    let mut cases = Vec::new();
+    for collection in entries(corpus) {
+        let described = collection.join("collection.json");
+        if !described.is_file() {
+            continue;
+        }
+        let mut pending = vec![collection];
+        while let Some(folder) = pending.pop() {
+            for path in entries(&folder) {
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|it| it == "json") && path != described {
+                    cases.push(path);
+                }
             }
         }
     }
-    schemas.sort();
-    schemas
+    cases.sort();
+    cases
+}
+
+/// The two schemas of a case, each with the key that the file of the case has it under.
+fn schemas_of(case: &Path) -> [(&'static str, Value); 2] {
+    let text = std::fs::read_to_string(case).unwrap();
+    let mut case: Value = serde_json::from_str(&text).unwrap();
+    ["a", "b"].map(|key| (key, case[key].take()))
 }
 
 #[test]
 #[ignore = "needs the corpus in benchmark/, which `make corpus` downloads"]
 fn referencing_finds_the_same_targets_in_the_corpus() {
     let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("benchmark");
-    let schemas = corpus_schemas(&corpus);
-    assert!(schemas.len() > 20_000, "{} schemas", schemas.len());
+    let cases = corpus_cases(&corpus);
+    assert!(cases.len() > 10_000, "{} cases", cases.len());
     let mut total = Comparison::default();
     let mut refused = BTreeMap::new();
-    for path in &schemas {
-        let text = std::fs::read_to_string(path).unwrap();
-        let schema: Value = serde_json::from_str(&text).unwrap();
-        let name = path.strip_prefix(&corpus).unwrap().to_owned();
-        match compared(&schema) {
-            Ok(mut comparison) => {
-                for difference in &mut comparison.differences {
-                    *difference = format!("{}: {difference}", name.display());
+    for case in &cases {
+        for (key, schema) in schemas_of(case) {
+            // The schema `a` of `rb-testset/s87.json` is `rb-testset/s87.json#/a`.
+            let name = format!("{}#/{key}", case.strip_prefix(&corpus).unwrap().display());
+            match compared(&schema) {
+                Ok(mut comparison) => {
+                    for difference in &mut comparison.differences {
+                        *difference = format!("{name}: {difference}");
+                    }
+                    total.add(comparison);
                 }
-                total.add(comparison);
-            }
-            Err(error) => {
-                refused.insert(name, error);
+                Err(error) => {
+                    refused.insert(name, error);
+                }
             }
         }
     }
     println!(
         "{} schemas, {} references with the same target, {} of them placed by this library",
-        schemas.len(),
+        2 * cases.len(),
         total.same,
         total.placed_by_the_library
     );

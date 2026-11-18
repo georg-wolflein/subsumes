@@ -520,8 +520,8 @@ mod tests {
         assert!(comment.contains("A validator confirms 1 of 3 counterexamples."));
         assert!(comment.contains(
             "### :x: 2 wrong verdicts\n\n\
-             - `one/b` a_subsumes_b: No, and `b.json` rejects the counterexample `0`\n\
-             - `one/c` a_subsumes_b: No, and `a.json` accepts the counterexample `0`"
+             - `one/b` a_subsumes_b: No, and `b` rejects the counterexample `0`\n\
+             - `one/c` a_subsumes_b: No, and `a` accepts the counterexample `0`"
         ));
         assert!(comment.contains("| **total** | 3 | 0 | 3 | 0 | 2 | 0 |"));
     }
