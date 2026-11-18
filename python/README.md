@@ -4,7 +4,8 @@ JSON Schema inclusion for Python: **does schema A accept every instance valid un
 
 If it does, A _subsumes_ B. Use it to check whether a new schema still accepts everything the old schema allowed, such as before you change the schema of stored records or of an API.
 
-> **Unstable:** `subsumes` is still in beta. Until version 1.0, the API may change from one minor version to the next.
+> [!WARNING]
+> `subsumes` is still in beta. Until version 1.0, the API may change from one minor version to the next.
 
 ```
 pip install subsumes
