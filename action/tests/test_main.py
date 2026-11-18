@@ -79,6 +79,7 @@ def run(
     compatibility: str = "backward",
     unknown: str = "fail",
     budget: str = "",
+    regex_dialect: str = "ecma262",
 ) -> int:
     return main(
         [
@@ -87,6 +88,7 @@ def run(
             *("--compatibility", compatibility),
             *("--unknown", unknown),
             *("--budget", budget),
+            *("--regex-dialect", regex_dialect),
             *("--report", str(files["report"])),
             *("--directory", str(checkout)),
         ]
@@ -179,6 +181,21 @@ class TestMain:
             "::warning file=schemas/number.json,title=Schema compatibility::Whether the schema "
             "accepts everything it did is not decided: the check ran out of its budget"
         )
+
+    def test_a_pattern_is_read_in_the_dialect_that_the_input_names(
+        self, checkout: Path, files: dict[str, Path]
+    ) -> None:
+        write(checkout, "schemas/number.json", {"pattern": r"^\d+$"})
+        commit(checkout)
+        write(checkout, "schemas/number.json", {"pattern": "^[0-9]+$"})
+
+        assert run(checkout, files) == 0
+        assert outputs(files)["failed"] == "false"
+
+        files["outputs"].unlink()
+        assert run(checkout, files, regex_dialect="rust") == 0
+        assert outputs(files)["failed"] == "true"
+        assert '"\\u0660"' in files["report"].read_text(encoding="utf-8")
 
     def test_a_file_that_is_no_schema_fails(
         self, checkout: Path, files: dict[str, Path], capsys: pytest.CaptureFixture[str]
@@ -287,11 +304,15 @@ class TestWhatTheStepCannotWorkWith:
         assert message in capsys.readouterr().out
         assert not files["outputs"].exists()
 
+    @pytest.mark.parametrize(
+        ("option", "value"),
+        [("compatibility", "sideways"), ("unknown", "pass"), ("regex_dialect", "pcre")],
+    )
     def test_a_value_that_is_none_of_the_choices_ends_it(
-        self, checkout: Path, files: dict[str, Path]
+        self, checkout: Path, files: dict[str, Path], option: str, value: str
     ) -> None:
         with pytest.raises(SystemExit) as exit:
-            run(checkout, files, compatibility="sideways")
+            run(checkout, files, **{option: value})
         assert exit.value.code == 2
 
 

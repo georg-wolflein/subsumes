@@ -21,6 +21,7 @@ from subsumes_action.compare import (
     Entry,
     Holds,
     Invalid,
+    Settings,
     Undecided,
     compare,
 )
@@ -47,6 +48,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--unknown", required=True, choices=["fail", "warn"])
     parser.add_argument("--budget", default="", help="the steps of a check; empty for the default")
+    parser.add_argument("--regex-dialect", required=True, choices=["ecma262", "rust"])
     parser.add_argument(
         "--report", required=True, type=Path, help="the file to write the report to"
     )
@@ -54,9 +56,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
     options = parser.parse_args(arguments)
     policy = Policy(options.compatibility, options.unknown)
     try:
-        entries = changes(
-            options.directory, patterns(options.files), options.base, budget(options.budget)
-        )
+        settings = Settings(budget(options.budget), options.regex_dialect)
+        entries = changes(options.directory, patterns(options.files), options.base, settings)
     except (InputError, GitError) as error:
         print(command("error", str(error)))
         return 2
@@ -108,7 +109,7 @@ def budget(text: str) -> int | None:
 
 
 def changes(
-    directory: Path, patterns: Sequence[str], ref: str, budget: int | None
+    directory: Path, patterns: Sequence[str], ref: str, settings: Settings
 ) -> Sequence[Entry]:
     """What happened to each file that matches a pattern, between ``ref`` and the checkout.
 
@@ -137,7 +138,7 @@ def changes(
             path,
             old=base.read(path) if path in before else None,
             new=(directory / path).read_bytes() if path in now else None,
-            budget=budget,
+            settings=settings,
         )
         for path in sorted(before | now)
     ]

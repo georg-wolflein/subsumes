@@ -43,6 +43,12 @@ inputs:
       The commit to compare with, as anything that git can fetch from `origin`. By default the
       commit that the pull request or the merge group is based on, or the commit before a push.
     default: ""
+  regex-dialect:
+    description: >-
+      The dialect of regular expressions that every `pattern` is read in: `ecma262`, which
+      JSON Schema recommends, or `rust`, that of the Rust `regex` crate, which Pydantic
+      validates a `pattern` with by default. The two read some patterns differently.
+    default: ecma262
   budget:
     description: >-
       The work that one check may take, in steps. By default that of the library, with which
@@ -85,6 +91,7 @@ runs:
         FILES: ${{ inputs.files }}
         COMPATIBILITY: ${{ inputs.compatibility }}
         UNKNOWN: ${{ inputs.unknown }}
+        REGEX_DIALECT: ${{ inputs.regex-dialect }}
         BUDGET: ${{ inputs.budget }}
         BASE: >-
           ${{ inputs.base || github.event.pull_request.base.sha
@@ -101,6 +108,7 @@ runs:
           --base "$BASE" \
           --compatibility "$COMPATIBILITY" \
           --unknown "$UNKNOWN" \
+          --regex-dialect "$REGEX_DIALECT" \
           --budget "$BUDGET" \
           --report "$RUNNER_TEMP/subsumes-report.md"
 

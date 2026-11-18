@@ -173,6 +173,7 @@ jobs:
           files: action/tests/schemas/*.json
           base: HEAD
           compatibility: forward
+          regex-dialect: rust
       - name: Require nothing
         uses: ./
         with:

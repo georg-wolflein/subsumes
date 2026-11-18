@@ -16,6 +16,7 @@ from subsumes import (
     Json,
     No,
     Reason,
+    RegexDialect,
     SchemaError,
     Side,
     Unknown,
@@ -65,6 +66,17 @@ class Undecided:
 
 type Outcome = Holds | Broken | Undecided
 """What one check of a change says."""
+
+
+@dataclass(frozen=True, slots=True)
+class Settings:
+    """How the library is to check, which the workflow may say. The defaults are its own."""
+
+    budget: int | None = None
+    """The work that each check may take, in steps, or ``None`` for the default."""
+
+    regex_dialect: RegexDialect = "ecma262"
+    """The dialect that every ``pattern`` is read in, in both versions of a schema."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,7 +190,7 @@ def version(direction: Direction, side: Side) -> Version:
             assert_never(never)
 
 
-def check(direction: Direction, old: Schema, new: Schema, budget: int | None) -> Outcome:
+def check(direction: Direction, old: Schema, new: Schema, settings: Settings) -> Outcome:
     """Asks the library the question of ``direction`` about a change from ``old`` to ``new``."""
     match direction:
         case "backward":
@@ -187,7 +199,10 @@ def check(direction: Direction, old: Schema, new: Schema, budget: int | None) ->
             a, b = old, new
         case _ as never:
             assert_never(never)
-    match subsumes(a.value, b.value, budget=budget):
+    verdict = subsumes(
+        a.value, b.value, budget=settings.budget, regex_dialect=settings.regex_dialect
+    )
+    match verdict:
         case Yes():
             return Holds()
         case No(counterexample):
@@ -213,14 +228,14 @@ def unknown(direction: Direction, reason: Reason) -> Outcome:
             assert_never(never)
 
 
-def compare(path: str, old: bytes | None, new: bytes | None, budget: int | None) -> Entry | None:
+def compare(path: str, old: bytes | None, new: bytes | None, settings: Settings) -> Entry | None:
     """What happened to the file at ``path``, or ``None`` if it holds the schema that it did.
 
     Args:
         path: The path of the file.
         old: Its text in the old commit, or ``None`` if the commit does not have it.
         new: Its text in the checkout, or ``None`` if it is not there.
-        budget: The work that each check may take, in steps, or ``None`` for the default.
+        settings: How the library is to check.
     """
     if old == new:
         return None
@@ -240,6 +255,6 @@ def compare(path: str, old: bytes | None, new: bytes | None, budget: int | None)
         return None
     return Changed(
         path,
-        backward=check("backward", old_schema, new_schema, budget),
-        forward=check("forward", old_schema, new_schema, budget),
+        backward=check("backward", old_schema, new_schema, settings),
+        forward=check("forward", old_schema, new_schema, settings),
     )
