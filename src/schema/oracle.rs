@@ -19,7 +19,7 @@
 //! pointer into an unknown keyword, does it take the place from this library.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use referencing::{Draft, Registry, Resolver, ResourceRef, Retrieve, Uri};
@@ -27,7 +27,7 @@ use serde_json::{Map, Value, json};
 
 use super::parse::{Builder, ROOT, Reference, parse};
 use super::{NodeId, Origin, push_token};
-use crate::testing::Random;
+use crate::testing::{Random, corpus_cases, schemas_of};
 use crate::{Error, Side, meta_schemas};
 
 /// How this library and `referencing` resolved the references of one schema.
@@ -333,48 +333,11 @@ pub(super) fn compared(schema: &Value) -> Result<Comparison, String> {
     Ok(comparison)
 }
 
-/// The file of every case of the corpus: every JSON file below the folder of a collection,
-/// which is a folder that holds a `collection.json`, except that file.
-fn corpus_cases(corpus: &Path) -> Vec<PathBuf> {
-    let entries = |folder: &Path| {
-        let entries = std::fs::read_dir(folder).unwrap();
-        entries
-            .map(|entry| entry.unwrap().path())
-            .collect::<Vec<_>>()
-    };
-    let mut cases = Vec::new();
-    for collection in entries(corpus) {
-        let described = collection.join("collection.json");
-        if !described.is_file() {
-            continue;
-        }
-        let mut pending = vec![collection];
-        while let Some(folder) = pending.pop() {
-            for path in entries(&folder) {
-                if path.is_dir() {
-                    pending.push(path);
-                } else if path.extension().is_some_and(|it| it == "json") && path != described {
-                    cases.push(path);
-                }
-            }
-        }
-    }
-    cases.sort();
-    cases
-}
-
-/// The two schemas of a case, each with the key that the file of the case has it under.
-fn schemas_of(case: &Path) -> [(&'static str, Value); 2] {
-    let text = std::fs::read_to_string(case).unwrap();
-    let mut case: Value = serde_json::from_str(&text).unwrap();
-    ["a", "b"].map(|key| (key, case[key].take()))
-}
-
 #[test]
 #[ignore = "needs the corpus in benchmark/, which `make corpus` downloads"]
 fn referencing_finds_the_same_targets_in_the_corpus() {
     let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("benchmark");
-    let cases = corpus_cases(&corpus);
+    let cases = corpus_cases();
     assert!(cases.len() > 10_000, "{} cases", cases.len());
     let mut total = Comparison::default();
     let mut refused = BTreeMap::new();

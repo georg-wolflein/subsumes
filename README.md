@@ -36,13 +36,7 @@ Each check returns one of three verdicts:
 
 ## Regular expressions
 
-JSON Schema recommends ECMA-262 regular expressions for `pattern` and `patternProperties`, but in practice a schema carries the dialect of whatever produced it. `subsumes` reads patterns in the dialect of the Rust [`regex`](https://docs.rs/regex/latest/regex/#syntax) crate, which is the engine that [Pydantic](https://docs.pydantic.dev/) uses by default to validate `pattern` constraints.
-
-The dialect changes answers. In ECMA-262, `\d` matches only `0` to `9`; in the `regex` crate it matches every Unicode decimal digit. So `^\d+$` accepts `"٣"` here and `^[0-9]+$` does not subsume it, although the two patterns are equivalent under ECMA-262. A pattern matches a string when it matches anywhere in it, as the draft says, so `a` accepts `"banana"`.
-
-The keys of `patternProperties` are read the same way, and so is a `pattern` under `propertyNames`.
-
-Other dialects may be supported later. For now this is the only one.
+`pattern` and `patternProperties` are read as ECMA-262 regular expressions with the `u` flag by default, which is what JSON Schema [recommends](https://json-schema.org/draft/2020-12/json-schema-core#section-6.4). To read them in the dialect of the Rust [`regex`](https://docs.rs/regex/latest/regex/#syntax) crate instead, use `Checker::new().regex_dialect(RegexDialect::Rust)`.
 
 ## Numbers
 
@@ -87,5 +81,5 @@ A few JSON schema constructs are not modelled. A check whose answer depends on o
 - `uniqueItems: true`.
 - `maxContains`, and a `minContains` of two or more.
 - `unevaluatedProperties` and `unevaluatedItems` in a schema that leads back to itself without a property or an item in between, through `allOf`, `anyOf`, `$ref` and the like.
-- Patterns with lookaround or backreferences, which the `regex` crate does not accept either, and patterns with word boundaries (`\b`, `\B`).
+- Patterns with lookaround, backreferences or word boundaries (`\b`, `\B`), and in ECMA-262 patterns with group modifiers such as `(?i:a)`.
 - Formats that are not ticked under [Format annotations](#format-annotations), and formats that the draft does not define.

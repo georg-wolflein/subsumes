@@ -6,7 +6,7 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use serde_json::{Map, Number, Value};
-use subsumes::{Checker, Error, Reason, Side, Verdict};
+use subsumes::{Checker, Error, Reason, RegexDialect, Side, Verdict};
 
 /// How many arrays and objects a schema may hold inside one another. `serde_json` reads no
 /// text that is deeper, so a schema is taken here exactly when the library can be given it
@@ -26,17 +26,27 @@ mod _native {
     /// `("invalid", message, side, location)` for a schema that cannot be checked at all,
     /// where the location is `None` when the schema as a whole is at fault.
     ///
-    /// Raises `TypeError` or `ValueError` for an argument that is no JSON value.
+    /// Raises `TypeError` or `ValueError` for an argument that is no JSON value, and
+    /// `ValueError` for a dialect that is none.
     #[pyfunction]
     fn check<'py>(
         py: Python<'py>,
         a: &Bound<'py, PyAny>,
         b: &Bound<'py, PyAny>,
         budget: Option<u64>,
+        regex_dialect: &str,
     ) -> PyResult<Bound<'py, PyTuple>> {
         let a = schema(a, Side::A)?;
         let b = schema(b, Side::B)?;
-        let mut checker = Checker::new();
+        let regex_dialect = match regex_dialect {
+            "ecma262" => RegexDialect::Ecma262,
+            "rust" => RegexDialect::Rust,
+            other => {
+                let message = format!("regex_dialect is {other:?}, not \"ecma262\" or \"rust\"");
+                return Err(PyValueError::new_err(message));
+            }
+        };
+        let mut checker = Checker::new().regex_dialect(regex_dialect);
         if let Some(steps) = budget {
             checker = checker.budget(steps);
         }

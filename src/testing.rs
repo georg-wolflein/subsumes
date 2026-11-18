@@ -1,5 +1,9 @@
 //! What several tests share.
 
+use std::path::{Path, PathBuf};
+
+use serde_json::Value;
+
 /// A source of numbers that is the same on every run.
 pub(crate) struct Random(pub u64);
 
@@ -24,4 +28,43 @@ impl Random {
     pub fn pick<T: Copy>(&mut self, items: &[T]) -> T {
         items[self.below(items.len())]
     }
+}
+
+/// The file of every case of the corpus in `benchmark/`, which `make corpus` downloads: every
+/// JSON file below the folder of a collection, which is a folder that holds a
+/// `collection.json`, except that file.
+pub(crate) fn corpus_cases() -> Vec<PathBuf> {
+    let entries = |folder: &Path| {
+        let entries = std::fs::read_dir(folder).unwrap();
+        entries
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>()
+    };
+    let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("benchmark");
+    let mut cases = Vec::new();
+    for collection in entries(&corpus) {
+        let described = collection.join("collection.json");
+        if !described.is_file() {
+            continue;
+        }
+        let mut pending = vec![collection];
+        while let Some(folder) = pending.pop() {
+            for path in entries(&folder) {
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|it| it == "json") && path != described {
+                    cases.push(path);
+                }
+            }
+        }
+    }
+    cases.sort();
+    cases
+}
+
+/// The two schemas of a case, each with the key that the file of the case has it under.
+pub(crate) fn schemas_of(case: &Path) -> [(&'static str, Value); 2] {
+    let text = std::fs::read_to_string(case).unwrap();
+    let mut case: Value = serde_json::from_str(&text).unwrap();
+    ["a", "b"].map(|key| (key, case[key].take()))
 }

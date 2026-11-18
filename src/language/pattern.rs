@@ -1,9 +1,11 @@
 //! From a pattern to a DFA.
 //!
-//! A pattern is parsed by `regex-syntax`, the parser of the `regex` crate, so it means here
-//! what it means there. It matches a string when it matches anywhere in the string: the
-//! language of a pattern is every string that holds a match. `^` and `$` hold only at the two
-//! ends of the string.
+//! A pattern is read in one of two dialects. One of ECMA-262 is parsed by the [`ecma`]
+//! module. One of the `regex` crate is parsed by `regex-syntax`, the parser of that crate, so
+//! it means here what it means there. Either way the pattern is the `Hir` of `regex-syntax`
+//! from then on. It matches a string when it matches anywhere in the string: the language of
+//! a pattern is every string that holds a match. `^` and `$` hold only at the two ends of
+//! the string.
 //!
 //! The way is the usual one. The pattern becomes an NFA, a nondeterministic finite automaton,
 //! which may be in several states at once. It is built in the manner of Thompson's
@@ -17,9 +19,21 @@ use std::collections::hash_map::Entry;
 
 use regex_syntax::hir::{Class, Hir, HirKind, Look};
 
-use super::Unsupported;
 use super::dfa::{Classes, Dfa, LAST, Place, cost, place};
+use super::{RegexDialect, Unsupported, ecma};
 use crate::context::{Budget, Exhausted};
+
+/// Parses a pattern in a dialect.
+///
+/// # Errors
+///
+/// When the pattern is none of the dialect, or asks for something that is not modelled.
+pub(super) fn read(pattern: &str, dialect: RegexDialect) -> Result<Hir, Unsupported> {
+    match dialect {
+        RegexDialect::Ecma262 => ecma::read(pattern).map_err(|_| Unsupported),
+        RegexDialect::Rust => read_rust(pattern),
+    }
+}
 
 /// Parses a pattern as the `regex` crate does.
 ///
@@ -27,7 +41,7 @@ use crate::context::{Budget, Exhausted};
 ///
 /// When that crate does not take the pattern, or the pattern asks for something that is
 /// not modelled: where a word begins or ends, or a line.
-pub(super) fn read(pattern: &str) -> Result<Hir, Unsupported> {
+pub(super) fn read_rust(pattern: &str) -> Result<Hir, Unsupported> {
     let read = regex_syntax::Parser::new().parse(pattern);
     let read = read.map_err(|_| Unsupported)?;
     let mut pending = vec![&read];
@@ -429,7 +443,7 @@ mod tests {
     use super::*;
 
     fn of(pattern: &str) -> Dfa {
-        let read = read(pattern).unwrap_or_else(|_| panic!("{pattern:?} is not supported"));
+        let read = read_rust(pattern).unwrap_or_else(|_| panic!("{pattern:?} is not supported"));
         dfa(&read, &mut Budget::new(u64::MAX)).unwrap()
     }
 
@@ -565,12 +579,12 @@ mod tests {
             r"\b{start}a",
             r"a\b{end}",
         ] {
-            assert!(read(pattern).is_err(), "{pattern:?}");
+            assert!(read_rust(pattern).is_err(), "{pattern:?}");
             assert!(regex::Regex::new(pattern).is_ok(), "{pattern:?}");
         }
         // What the `regex` crate does not take either.
         for pattern in ["a(?=b)", r"(a)\1", "(", "a{2,1}", r"(?-u:\xff)", r"\cC"] {
-            assert!(read(pattern).is_err(), "{pattern:?}");
+            assert!(read_rust(pattern).is_err(), "{pattern:?}");
             assert!(regex::Regex::new(pattern).is_err(), "{pattern:?}");
         }
         // `\A` and `\z` are the two ends under other names.
@@ -605,7 +619,7 @@ mod tests {
     #[test]
     fn the_states_cost_steps() {
         let within = |pattern: &str, budget: u64| {
-            dfa(&read(pattern).unwrap(), &mut Budget::new(budget)).is_ok()
+            dfa(&read_rust(pattern).unwrap(), &mut Budget::new(budget)).is_ok()
         };
         // A thousand characters are a thousand states of the NFA and as many of the DFA.
         assert!(!within("^a{1000}$", 100));
@@ -624,7 +638,7 @@ mod tests {
             let unlimited = &mut Budget::new(u64::MAX);
             let mut nfa = Nfa::default();
             let matched = nfa.add(State::Match, unlimited).unwrap();
-            nfa.build(&read(&word).unwrap(), matched, unlimited)
+            nfa.build(&read_rust(&word).unwrap(), matched, unlimited)
                 .unwrap();
             let classes = nfa.classes(&mut Budget::new(steps));
             classes.map(|(classes, _)| classes.count())

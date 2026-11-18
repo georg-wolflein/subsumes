@@ -23,8 +23,13 @@ regex-syntax = "0.8"
 serde_json = "1"
 
 [dev-dependencies]
-# The DFAs are held against it: which strings a pattern matches.
+# The DFAs are held against it: which strings a pattern of the `regex` crate matches.
 regex = "1"
+# And against this one: which strings a pattern of ECMA-262 matches.
+regress = "0.12"
+# The parser of ECMA-262 is held against it: which patterns are valid.
+oxc_allocator = "0.159"
+oxc_regular_expression = "0.159"
 # And against this one: intersection, complement and inclusion.
 regexsolver = { version = "1", default-features = false }
 # Resolves references too, and the tests hold the library against it.

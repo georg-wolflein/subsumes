@@ -13,6 +13,7 @@ from subsumes import (
     BudgetError,
     Json,
     No,
+    RegexDialect,
     SchemaError,
     UndecidedError,
     UnrepresentableError,
@@ -23,6 +24,8 @@ from subsumes import (
 
 INTEGER: Json = {"type": "integer"}
 NATURAL: Json = {"type": "integer", "minimum": 0}
+DIGITS: Json = {"pattern": r"^\d+$"}
+ASCII_DIGITS: Json = {"pattern": "^[0-9]+$"}
 
 
 def nested(depth: int) -> Json:
@@ -220,6 +223,28 @@ class TestNoJsonValue:
     def test_a_schema_far_deeper_raises_and_does_not_crash(self) -> None:
         with pytest.raises(ValueError, match="is nested more than 127 deep"):
             subsumes(True, nested(200_000))
+
+
+class TestRegexDialect:
+    def test_a_pattern_is_one_of_ecma_262_unless_another_dialect_is_named(self) -> None:
+        assert subsumes(ASCII_DIGITS, DIGITS)
+        assert subsumes(ASCII_DIGITS, DIGITS, regex_dialect="ecma262")
+
+    def test_the_rust_dialect_reads_a_digit_of_unicode(self) -> None:
+        verdict = subsumes(ASCII_DIGITS, DIGITS, regex_dialect="rust")
+        assert verdict == No("٠")
+
+    @pytest.mark.parametrize(("dialect", "pattern"), [("ecma262", "(?i)^a$"), ("rust", r"^\cJ$")])
+    def test_a_pattern_of_the_other_dialect_is_unsupported(
+        self, dialect: RegexDialect, pattern: str
+    ) -> None:
+        with pytest.raises(UnsupportedError) as raised:
+            subsumes({"pattern": pattern}, {"type": "string"}, regex_dialect=dialect)
+        assert (raised.value.side, raised.value.location) == ("a", "#/pattern")
+
+    def test_a_dialect_that_is_none_is_a_value_error(self) -> None:
+        with pytest.raises(ValueError, match='regex_dialect is "pcre"'):
+            subsumes(True, True, regex_dialect="pcre")  # ty: ignore[invalid-argument-type]
 
 
 def test_checks_run_in_threads() -> None:
