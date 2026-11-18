@@ -57,3 +57,6 @@ This is thrashing, as constraint solvers call it, and the remedies are theirs: s
 | `Unknown` | 1,686 | 1,492 |
 | at the budget | 274 | 80 |
 | steps | 3,096 million | 1,173 million |
+| the whole run, one job | 382 s to 423 s | 130 s |
+
+**Kept.** A run takes 34% of the time it took.
