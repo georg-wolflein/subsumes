@@ -232,15 +232,16 @@ impl Witness {
 ///
 /// "A subsumes B" asks whether a value satisfies the c-reference of B and the negation of A,
 /// and "B subsumes A" asks it of A and the negation of B: two questions about the same
-/// terms. Whether a value satisfies a c-reference is a fact about the schemas and not about
-/// the question that led to it, so the second question of a load begins with the answers of
-/// the first, as a task begins with those of the tasks before it. So it is with the
-/// language of the strings that a schema accepts, the partitions of the names of objects,
-/// and which schemas are definite.
+/// terms. The second question of a load begins with what the first worked out about the
+/// schemas alone: the language of the strings that a schema accepts, the partitions of the
+/// names of objects, and which schemas are definite.
 ///
-/// The state of a search is not kept: what holds only as long as a task is at work, how
-/// often a disjunction left no alternative, and what the tests have spent. Each question
-/// begins without them.
+/// The answers about c-references are not kept from one question to the next, although
+/// whether a value satisfies a c-reference does not depend on the question: an answer found
+/// ready changes the way a search goes, and the review of this found schemas for which the
+/// second question then lost a verdict that a check of its own decides. Nor is the state of
+/// a search kept: what holds only as long as a task is at work, how often a disjunction
+/// left no alternative, and what the tests have spent.
 #[derive(Debug, Default)]
 pub(crate) struct Facts {
     /// What is known of a c-reference for good.
@@ -253,9 +254,9 @@ pub(crate) struct Facts {
     /// nothing definite. Worked out when it is first asked.
     indefinite: Option<Vec<bool>>,
     /// Whether an instance among the answers may be deeper than the one that a task of the
-    /// question at hand would have found: it was handed on, or an earlier question found
-    /// it. And whether an object or an array was passed over because it would be too deep
-    /// to give, which an answer may rest on.
+    /// question at hand would have found, because it was handed on. And whether an object or
+    /// an array was passed over because it would be too deep to give, which an answer may
+    /// rest on.
     handed_on: bool,
     too_deep: bool,
 }
@@ -263,7 +264,7 @@ pub(crate) struct Facts {
 /// Decides whether the schema of `a` accepts every instance that the schema of `b` accepts.
 ///
 /// The context may have been asked before, the other way round. Then this question begins
-/// with what that one found out for good; see [`Facts`].
+/// with what that one worked out about the schemas; see [`Facts`].
 ///
 /// # Errors
 ///
@@ -272,10 +273,15 @@ pub(crate) fn decide(context: &mut Context, a: VarId, b: VarId) -> Result<Outcom
     let terms = &mut context.terms;
     let (accepted, rejected) = (terms.literal(b, false), terms.literal(a, true));
     let both = terms.both(accepted, rejected);
-    // The answers of an earlier question were found by another search. An instance among
-    // them may be deeper than the one that this question would find, as one that is handed
-    // on may be.
-    context.facts.handed_on |= !context.facts.found.is_empty();
+    // The answers of an earlier question are not taken over. An instance among them may be
+    // deeper than the one that this question would find, and where one is too deep this
+    // question would have to be asked again without them, at the cost of the two; and an
+    // answer found ready changes which alternative a search goes on with, which can lead it
+    // where its own search would not have gone. Without them, this question decides what a
+    // check of its own decides, but for the order of the ids.
+    let facts = &mut context.facts;
+    facts.found.clear();
+    (facts.handed_on, facts.too_deep) = (false, false);
     let mut hands_on = true;
     loop {
         let spent_before = context.budget.spent();
@@ -299,11 +305,10 @@ pub(crate) fn decide(context: &mut Context, a: VarId, b: VarId) -> Result<Outcom
             Found::Nothing => Outcome::Yes,
             // The counterexample is the one instance that is written out.
             Found::Instance(witness) => Outcome::No(witness.written(&mut context.budget)?),
-            // An instance that was handed on, or that an earlier question found, may be
-            // deeper than the one that a task of its own gives. So where a value was
-            // passed over for its depth, the check is made again with nothing found and
-            // without handing instances on: the answer is then the one that it was before
-            // instances were handed on.
+            // An instance that was handed on may be deeper than the one that a task of its
+            // own gives. So where a value was passed over for its depth, the check is made
+            // again with nothing found and without handing instances on: the answer is then
+            // the one that it was before instances were handed on.
             Found::Unknown(_) if context.facts.handed_on && context.facts.too_deep => {
                 context.facts = Facts::default();
                 hands_on = false;

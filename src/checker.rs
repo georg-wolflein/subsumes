@@ -86,7 +86,7 @@ impl Checker {
     /// instances when both verdicts are [`Verdict::Yes`].
     ///
     /// The two schemas are loaded once for both: parsed, their references resolved, and
-    /// lowered to terms. The converse goes on with what the first check found out about
+    /// lowered to terms. The converse goes on with what the first check worked out about
     /// them, and pays for none of it again; see [`Converse`].
     ///
     /// ```
@@ -167,17 +167,20 @@ pub struct Check {
 ///
 /// - **It has a budget of its own,** the whole budget of the checker, whatever the first
 ///   check spent.
-/// - **Its steps are those of its own search.** What the first check built and found out
-///   was paid for there, and is not paid for again: the terms of the two schemas, the
-///   DFAs of their patterns, how the names of their objects are cut, and for each
-///   c-reference that the first check decided, whether a value satisfies it. So it mostly
-///   takes fewer steps than a check of `b` and `a` by themselves. Where the budget did not
-///   cover the terms, there is nothing to go on with, and it ends at the budget too.
-/// - **Its search may go another way.** It finds answers ready that it would have
-///   searched for, and where it is free to choose, it goes by the order in which the load
-///   met the schemas, which begins with `a` here and with `b` in a check of its own. So it
-///   may also take more steps, a counterexample may be another instance, and where both
-///   schemas hold the same unsupported keyword, the reason may name it in the other one.
+/// - **Its steps are those of its own search.** What the first check built was paid for
+///   there, and is not paid for again: the terms of the two schemas, the DFAs of their
+///   patterns, how the names of their objects are cut, the languages of their
+///   `propertyNames`, and which of them are definite. So it mostly takes fewer steps than a
+///   check of `b` and `a` by themselves. Where the budget did not cover the terms, there is
+///   nothing to go on with, and it ends at the budget too. What the first check found out
+///   about values, whether a value satisfies a c-reference, is not taken over: an answer
+///   found ready changes the way a search goes, and can cost it a verdict.
+/// - **Its search may go another way.** Where it is free to choose, it goes by the order
+///   in which the load met the schemas, which begins with `a` here and with `b` in a check
+///   of its own, and the allowances of its tests are counted in the steps of its own
+///   search. So it may also take more steps, a counterexample may be another instance, and
+///   where both schemas hold the same unsupported keyword, the reason may name it in the
+///   other one. Near the budget it may end on the other side of it from a check of its own.
 ///
 /// Its steps depend only on the two schemas, their order and the settings.
 pub struct Converse<'s> {
@@ -251,7 +254,7 @@ impl fmt::Debug for Converse<'_> {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Map, json};
 
     use super::*;
 
@@ -431,6 +434,51 @@ mod tests {
             location: "#/uniqueItems".to_owned(),
         };
         assert_eq!(converse.check().verdict, Verdict::Unknown { reason });
+    }
+
+    #[test]
+    fn the_converse_decides_what_a_check_of_its_own_decides_where_an_instance_is_deep() {
+        // `y` is a chain of 119 objects or `null`. The first check finds the chain for it,
+        // which is too deep to be put ten objects down in the second alternative of A. A
+        // check of B subsumes A by itself hands `null` on to `y` from the first alternative
+        // and gives an instance of the second. The converse does not take over the answers
+        // of the first check, so it does the same.
+        let mut definitions = Map::new();
+        definitions.insert("d0".to_owned(), json!({"type": "object"}));
+        for depth in 1..119 {
+            let next = json!({"$ref": format!("#/$defs/d{}", depth - 1)});
+            let link = json!({"type": "object", "required": ["n"], "properties": {"n": next}});
+            definitions.insert(format!("d{depth}"), link);
+        }
+        let chain = json!({"$ref": "#/$defs/d118"});
+        definitions.insert("y".to_owned(), json!({"anyOf": [chain, {"type": "null"}]}));
+        let nothing = json!({"allOf": [{"type": "string"}, {"type": "number"}]});
+        let y = json!({"$ref": "#/$defs/y"});
+        let first = json!({
+            "type": "object",
+            "required": ["p", "r"],
+            "properties": {"p": y, "r": nothing},
+            "allOf": [{"not": {"properties": {"p": {"not": {"type": "null"}}}}}],
+        });
+        let mut down = json!({"type": "object", "required": ["v"], "properties": {"v": y}});
+        for _ in 0..10 {
+            down = json!({"type": "object", "required": ["w"], "properties": {"w": down}});
+        }
+        let second = json!({"type": "object", "required": ["m"], "properties": {"m": down}});
+        let a = json!({"$defs": definitions, "anyOf": [first, second]});
+        let b = json!({
+            "$defs": definitions,
+            "type": "object",
+            "required": ["q"],
+            "properties": {"q": y},
+        });
+        let checker = Checker::new();
+        assert!(matches!(
+            checker.subsumes(&b, &a).unwrap(),
+            Verdict::No { .. }
+        ));
+        let (_, converse) = checker.check_with_converse(&a, &b).unwrap();
+        assert!(matches!(converse.check().verdict, Verdict::No { .. }));
     }
 
     #[test]
