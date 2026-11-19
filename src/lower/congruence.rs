@@ -741,10 +741,25 @@ fn classes(terms: &Terms, languages: &Languages, recursive: bool) -> Result<Vec<
             rank[index] = u32::try_from(at).expect("fewer than 2^32 variables");
         }
     }
+    // But a variable whose term is `true` or `false` itself stands for the class of `true` or
+    // `false` where there is one. Another member may be a large term that comes to the same,
+    // and the engine knows `true` and `false` at once where it would unfold that one, which
+    // may lead to leaves and to schemas of which nothing definite is said.
+    let plain = |index: usize, canonical: u32| {
+        (canonical == TRUE || canonical == FALSE)
+            && matches!(
+                terms.term(terms.variable(VarId::at(index)).body),
+                Term::True | Term::False
+            )
+    };
     let mut stands = vec![NONE; pass.table.canonical.len()];
     for (index, canonical) in pass.of.iter().enumerate() {
         let first = &mut stands[*canonical as usize];
-        if *first == NONE || rank[index] < rank[*first as usize] {
+        let before = *first == NONE || {
+            let (this, that) = (plain(index, *canonical), plain(*first as usize, *canonical));
+            (this && !that) || (this == that && rank[index] < rank[*first as usize])
+        };
+        if before {
             *first = u32::try_from(index).expect("fewer than 2^32 variables");
         }
     }
@@ -763,6 +778,7 @@ mod tests {
     use crate::context::Context;
     use crate::lower::lower;
     use crate::schema::parse;
+    use crate::term::CRefId;
     use crate::{Checker, RegexDialect, Verdict};
 
     /// Whether the engine takes A and B for one variable.
@@ -803,6 +819,64 @@ mod tests {
         assert!(!one_variable(&either, &less));
         let more = json!({"allOf": [open, beside, {"minProperties": 1}]});
         assert!(!one_variable(&closed, &more));
+    }
+
+    /// The literals of A and B, as the engine takes them.
+    fn literals(a: &Value, b: &Value) -> (CRefId, CRefId) {
+        let graph = parse(a, b).unwrap().link().unwrap();
+        let mut context = Context::new(u64::MAX, RegexDialect::default());
+        let (a, b) = lower(&graph, &mut context).unwrap();
+        let terms = &mut context.terms;
+        (terms.literal(a, false), terms.literal(b, false))
+    }
+
+    #[test]
+    fn true_and_false_are_stood_for_by_themselves() {
+        // Schemas that come to `false` or to `true` with many keywords are of one class with
+        // `false` or `true`, and whichever comes first, the engine takes the class for
+        // `false` or `true` itself, which it knows without unfolding anything.
+        let never = json!({
+            "type": "string",
+            "allOf": [{"type": "number"}],
+            "properties": {"x": {"contains": {"type": "string"}, "minContains": 2}},
+        });
+        let always = json!({"properties": {"x": true}, "anyOf": [{}, {"type": "string"}]});
+        for (a, b, both) in [
+            (&never, &json!(false), Terms::NOTHING),
+            (&json!(false), &never, Terms::NOTHING),
+            (&always, &json!({}), Terms::ANYTHING),
+            (&json!(true), &always, Terms::ANYTHING),
+        ] {
+            assert_eq!(literals(a, b), (both, both));
+        }
+    }
+
+    #[test]
+    fn an_object_closed_beside_its_properties_is_closed_to_the_names_that_it_lists() {
+        // The names that are left open are every name but a few words, however those words
+        // are written down. One word more is another language.
+        let closed = json!({
+            "type": "object",
+            "properties": {"a": {}, "b": {}},
+            "additionalProperties": false,
+        });
+        let named = |names: &[&str]| {
+            let named: Map<String, Value> = names
+                .iter()
+                .map(|name| (format!("^{name}$"), json!(true)))
+                .collect();
+            json!({"type": "object", "patternProperties": named, "additionalProperties": false})
+        };
+        assert!(one_variable(&closed, &named(&["a", "b"])));
+        assert!(one_variable(&closed, &named(&["b", "a"])));
+        let more = named(&["a", "b", "c"]);
+        assert!(!one_variable(&closed, &more));
+        let checker = Checker::new();
+        assert!(matches!(
+            checker.subsumes(&closed, &more).unwrap(),
+            Verdict::No { .. }
+        ));
+        assert_eq!(checker.subsumes(&more, &closed).unwrap(), Verdict::Yes);
     }
 
     #[test]
