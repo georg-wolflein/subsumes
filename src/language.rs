@@ -537,10 +537,44 @@ impl Languages {
             dfas.push(self.dfa(*language, budget)?);
         }
         let dfas: Vec<&Dfa> = dfas.iter().map(Rc::as_ref).collect();
-        let parts = Dfa::cut(&dfas, budget)?;
+        let Some(parts) = Dfa::cut(&dfas, budget)? else {
+            return self.cut_one_by_one(by, budget);
+        };
         let parts = parts.into_iter();
         Ok(parts
             .map(|(part, within)| (self.keep(part), within))
+            .collect())
+    }
+
+    /// Every string, cut by one language of a list after the other: each part so far by
+    /// the language and by its complement. The parts and their order are those of
+    /// [`cut`](Self::cut), which does this where one product of all the DFAs would be too
+    /// large.
+    fn cut_one_by_one(
+        &mut self,
+        by: &[LanguageId],
+        budget: &mut Budget,
+    ) -> Result<Parts<LanguageId>, Exhausted> {
+        let mut parts: Vec<(LanguageId, Vec<bool>)> = vec![(Self::EVERYTHING, Vec::new())];
+        for language in by {
+            let other = self.complement(*language, budget)?;
+            let mut cut = Vec::with_capacity(parts.len() + 1);
+            for (names, within) in parts {
+                budget.charge(1)?;
+                for (side, inside) in [(*language, true), (other, false)] {
+                    let both = self.intersection(names, side, budget)?;
+                    if !self.is_empty(both, Lengths::ANY, budget)? {
+                        let mut within = within.clone();
+                        within.push(inside);
+                        cut.push((both, within));
+                    }
+                }
+            }
+            parts = cut;
+        }
+        let parts = parts.into_iter();
+        Ok(parts
+            .map(|(names, within)| (names, within.into()))
             .collect())
     }
 

@@ -371,10 +371,17 @@ impl Dfa {
     /// other instead makes two products for every part and DFA, which for a hundred
     /// patterns that share no string is ten thousand products where this is one.
     ///
+    /// The product is small where the DFAs share few strings. It may be far larger than
+    /// every part where each DFA keeps track of something of its own, as counters of
+    /// different lengths do: then it has a state for every combination. DFAs that share no
+    /// string have a product of no more states than they have together. So the product is
+    /// given up when it has more states than that, and the answer is `None`: the list is
+    /// then cut by one DFA after the other.
+    ///
     /// # Errors
     ///
     /// When the budget does not cover the states of the product and of the parts.
-    pub fn cut(all: &[&Self], budget: &mut Budget) -> Result<Parts<Self>, Exhausted> {
+    pub fn cut(all: &[&Self], budget: &mut Budget) -> Result<Option<Parts<Self>>, Exhausted> {
         let narrow = |index: usize| u32::try_from(index).expect("fewer than 2^32 states");
         let of_all: Vec<&Classes> = all.iter().map(|dfa| &dfa.classes).collect();
         let (classes, columns) = Classes::common_of(&of_all, budget)?;
@@ -387,6 +394,7 @@ impl Dfa {
         let first: Rc<[(u32, u32)]> = live.map(|which| (narrow(which), 0)).collect();
         budget.charge(cost(0, first.len() * width))?;
         let mut ids: HashMap<Rc<[(u32, u32)]>, u32> = HashMap::from([(Rc::clone(&first), 0)]);
+        let most: usize = all.iter().map(|dfa| dfa.accepts.len()).sum();
         let mut states = vec![first];
         let mut next: Vec<u32> = Vec::new();
         let mut to: Vec<(u32, u32)> = Vec::new();
@@ -408,6 +416,9 @@ impl Dfa {
                     None => {
                         // A new state costs what it takes to say where each class leads
                         // from it: a look at each of its DFAs for every class.
+                        if states.len() >= most {
+                            return Ok(None);
+                        }
                         budget.charge(cost(0, to.len() * width))?;
                         let new: Rc<[(u32, u32)]> = to.as_slice().into();
                         let id = narrow(states.len());
@@ -518,7 +529,7 @@ impl Dfa {
             cut.push((part, within.into_boxed_slice()));
         }
         cut.sort_by(|one, other| other.1.cmp(&one.1));
-        Ok(cut)
+        Ok(Some(cut))
     }
 
     pub fn accepts(&self, word: &str) -> bool {
@@ -1011,7 +1022,7 @@ mod tests {
 
     #[test]
     fn a_list_of_dfas_cuts_every_string_into_parts() {
-        let cut = |all: &[&Dfa]| Dfa::cut(all, &mut unlimited()).unwrap();
+        let cut = |all: &[&Dfa]| Dfa::cut(all, &mut unlimited()).unwrap().unwrap();
         // A part for each way of being accepted by some that a string has, and the part
         // that the first DFA accepts first.
         let (ab, bc) = (of(&["a", "b"]), of(&["b", "c"]));
