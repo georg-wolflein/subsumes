@@ -227,11 +227,7 @@ impl Table {
     fn id(&mut self, canonical: Canonical) -> u32 {
         let hash = match &canonical {
             Canonical::Connective(connective, parts) => connective_hash(*connective, parts),
-            other => {
-                let mut hasher = Keyed::default().build_hasher();
-                other.hash(&mut hasher);
-                hasher.finish()
-            }
+            other => Keyed::default().hash_one(other),
         };
         let is = |other: &Canonical| *other == canonical;
         self.find(hash, is, || canonical.clone())
