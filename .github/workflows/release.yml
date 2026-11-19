@@ -122,3 +122,26 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.release-please.outputs.tag }}
         run: gh release edit "$TAG" --draft=false
+
+  # Tells the benchmark that the release can be installed, with the event `subsumes-released`.
+  # Its workflow subsumes-release.yml then pins the adapters of subsumes to the release.
+  notify:
+    needs: [release-please, release]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: app
+        with:
+          client-id: ${{ vars.PR_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.PR_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: subsumes-benchmark
+          permission-contents: write # to send the event
+      - name: Tell the benchmark about the release
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          TAG: ${{ needs.release-please.outputs.tag }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY_OWNER/subsumes-benchmark/dispatches" \
+            -f event_type=subsumes-released -f "client_payload[version]=${TAG#v}"
