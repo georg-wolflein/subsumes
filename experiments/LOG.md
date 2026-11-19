@@ -19,7 +19,7 @@ A run takes 27 s where it took 386 s: 7% of the time, with 270 more checks decid
 
 - **Two changes are nearly all of it.** E1 and E2 are one idea, about a hundred lines together: in which order a branch splits its disjunctions. They take a run from 386 s to 36 s, 91% of the time, and decide 238 checks. The checks that ended at the budget thrashed, and the remedy is the one that constraint solvers have for it.
 - **The second round is worth more in verdicts and steps than in time.** E4 to E8 decide 32 more checks and take the steps of a run from 572 million to 152 million, and the time from 36 s to 27 s. E6 alone halves the steps and makes a run 2.5 s slower: what it saves were the cheapest steps, and the four checks that are left at the budget spend theirs on dearer work.
-- **What is left.** Of the 24 s that the checks of a run take, 5 s are those four checks, of one schema. E9 decides them and is not kept; see there. About 7 s are the 33,500 checks that take less than 3 ms each, and 3 s of a run are outside the checks: reading the cases, validating the counterexamples and writing the results.
+- **What is left.** Of the 24 s that the checks of a run take, 5 s are those four checks, of one schema. E9 decides them and takes a run from 24 s to 13 s. It is sound, and it is not kept, because schemas can be written for which it loses a verdict; whether to keep it is for the owner to decide, and its entry has what there is to weigh. About 7 s are the 33,500 checks that take less than 3 ms each, and 3 s of a run are outside the checks: reading the cases, validating the counterexamples and writing the results.
 - **E3 and E9** are experiments that were not kept, and each has its entry below.
 
 The time of a run is the median of three or four runs with one job. A run on a machine with nothing else at work takes about a tenth less: 24 s for E8 and 32 s for E2.
@@ -30,7 +30,7 @@ The time of a run is the median of three or four runs with one job. A run on a m
 - **The machine.** An Apple M3 Pro with 11 cores. Other programs were at work on it during the runs, among them a virtual machine that used four to five cores, so a time is good to a few percent and no better. The load before each run is in `timings.csv`.
 - **Verdicts first.** An experiment is kept only if no check loses its verdict, none is wrong and no counterexample is refused by the validator. That is seen with `make benchmark JOBS=8`, whose times are no more than a hint. The time of an experiment is then measured with one job.
 - **The tests.** `cargo test --workspace` passes for every experiment that is kept.
-- **`timings.csv`** has one line for each timed run. The runs were made in three sessions: the first with the baseline, E1 and E2 as they were made, the second with every experiment in turn three times, and the third on the machine with nothing else at work.
+- **`timings.csv`** has one line for each timed run. The runs were made in four sessions: the first with the baseline, E1 and E2 as they were made, the second with every experiment in turn three times, and the third and the fourth on the machine with nothing else at work.
 
 ## Where the time goes
 
@@ -223,7 +223,41 @@ Each of the four decides the same 30 checks.
 - `perf/exp-o98xx-oneof` (`367d17a`): a run takes 142 million steps where it took 572 million, and 2 checks end at the budget where 36 did. **It is wrong.** The reviewer wrote a schema that holds itself in a property, for which it answers `No` with a counterexample that B rejects. It took an answer that holds only while a task is at work for one that holds for good, where the copy waits for another task in between.
 - `perf/exp-o17072-o358` (`d8c01b1`): 138 million steps, and 1 check at the budget. It makes the test only for schemas that lead to no cycle and to no leaf that holds a schema. The reviewer found no wrong verdict in 50,000 checks made at random and by hand, and the first one's counterexample does not break it. But nothing bounds what the test costs: a check that took 9 steps ended at the budget. And every split pays for it, which is a third more steps for the checks under 1,000 steps.
 
-**Not kept.** It is the largest gain that is left: the four checks of o18949 are 5 s of the 24 s that the checks of a run take, and o17072 another second. It is also 300 lines with a second kind of task, in the part of the engine where a mistake is a wrong verdict, as the first of the two shows. It needs an allowance for the test before it can be kept, and a decision whether it is worth what it adds.
+**A third version, on the engine as it is now.** `perf/exp-entailment` (`e023b4f`) is the second one carried over to `perf/trunk`, by an agent that was given both reports and both reviews, with what the reviewer of the second had asked for.
+
+- It has no second kind of task: what the copy asks is decided by tasks like any other. Those were needed while an instance was copied into what holds it, which E4 ended.
+- A test has an allowance of steps: what the check has spent on its search, less what its tests have spent. So the tests of a check never take more steps than the rest of it, a check that searches little tests little, and a search that goes on for long earns the tests that may end it. The check of 9 steps takes 9 steps again.
+- A test is made only where the branch has another disjunction to split on, which is what takes the cost off the small checks: those under 1,000 steps take 1.015 times the steps, where they took 1.35 times.
+- 430 lines in the engine.
+
+| | `perf/trunk` (E8) | E9 | E9 without the allowance |
+| --- | ---: | ---: | ---: |
+| a run, on the machine with nothing else at work | 23.7 s | 13.1 s | 11.7 s |
+| steps | 152 million | 73 million | 64 million |
+| at the budget | 4 | 0 | 0 |
+| `Unknown` | 1,416 | 1,412 | 1,412 |
+
+**Two reviews.** One for soundness, which found no flaw: 240,000 checks made at random and by hand give no wrong verdict, no counterexample that the validator refuses, and no verdict lost, and it showed that its cases catch the mistake of the first version when the guard against it is taken out. One for cost, which found what no version can be rid of:
+
+- **A disjunction that is dropped no longer steers the search.** Its first alternative may be what kept the engine out of a part of the search that costs much. The reviewer built such checks: next to a schema that is costly to refute for objects, a disjunction that the branch entails and whose first alternative is "no object". `perf/trunk` answers `No` in 44 steps, and E9 ends at the budget. So does a schema that may be `null` or an object and says so twice. Of 3,000 checks made at random around this, E9 loses 6 verdicts and gains 26.
+- The allowance does not bound it: the tests take no more than the rest of the check, and the rest of the check is the search that the drop made longer.
+- To test a disjunction only once the check has split on it brings every simple case back to the steps of before and keeps the gain on the corpus, 74 million steps, and it is no guarantee either.
+- The one rule that never sends the search where it did not go before, that an alternative which the branch entails ends its split, keeps none of the gain: the disjunctions in question are entailed only as a whole.
+
+**Not kept, and for the owner to decide.** On the corpus, on the 144,000 checks of the earlier reviewers and on the 71,000 that the review for soundness made it loses no verdict, decides the last four checks that ended at the budget, and takes a run from 24 s to 13 s. It can be made to lose a verdict by a schema that is written for it, which is true of every rule that changes the order of the search, E1 and E2 among them; here there are such schemas.
+
+### Outside the corpus
+
+The corpus is what the experiments were made on, so it says little about what they do elsewhere. The reviewers left the schemas that they made at random and by hand to break the changes: 181,000 checks in twelve folders, among them those that were written to cost a verdict. The baseline, `perf/trunk` and E9 were run over all of them.
+
+| | verdicts gained | verdicts lost | verdicts changed | steps |
+| --- | ---: | ---: | ---: | ---: |
+| from the baseline to `perf/trunk` (E8) | 595 | 1 | 0 | 0.30 times |
+| from `perf/trunk` to E9 | 30 | 6 | 0 | 0.94 times |
+
+- The one check that `perf/trunk` loses is one that a reviewer made to sit just below the budget: `Yes` in 7.2 million steps on the baseline. E1 splits it in another order and takes 9.8 million, and the charge that E6 adds takes it past ten. A check that is near the budget may end on either side of it after any change to the search.
+- The six that E9 loses and the 26 of the 30 that it gains are in the one folder that was made to show what a drop costs.
+- No counterexample is refused by the validator, in any folder and by any of the three.
 
 ### Also tried and dropped
 

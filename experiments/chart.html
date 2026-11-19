@@ -54,9 +54,10 @@
   <figure>
     <figcaption>
       <div class="title">The second round, on its own scale</div>
-      <div class="sub">The same runs from E2 on. E6 decides 30 checks and halves the steps, and a run takes longer: steps are not time.</div>
+      <div class="sub">The same runs from E2 on. E6 decides 30 checks and halves the steps, and a run takes longer: steps are not time. E9 is not merged; it was timed on the idle machine, as E2 and E8 were a second time.</div>
     </figcaption>
-    <svg id="zoom" height="240" role="img" aria-label="Time of a whole benchmark run from experiment 2 on"></svg>
+    <div class="legend" id="zoom-legend"></div>
+    <svg id="zoom" height="260" role="img" aria-label="Time of a whole benchmark run from experiment 2 on"></svg>
   </figure>
 
   <figure>
@@ -85,6 +86,12 @@ const DATA = {
   ],
   labelled: ["Baseline", "E1", "E2", "E8"],
   zoomFrom: 2,
+  // The same binaries on the machine with nothing else at work, and E9, which is not merged.
+  idle: [
+    { name: "E2", runs: [31.98, 32.04] },
+    { name: "E8", runs: [24.41, 24.05, 24.46, 23.62, 23.66] },
+    { name: "E9", id: "e023b4f", note: "a disjunction that the branch entails is not split (not merged)", runs: [13.08, 13.07, 13.78], candidate: true, budget: 0, unknown: 1412, steps: 72544068 },
+  ],
   scaling: {
     kinds: [4, 5, 6, 7, 8],
     series: [
@@ -210,9 +217,62 @@ function drawRuns(id, commits, options) {
   });
 }
 
+// The second round: the medians of the runs with other programs at work, and the runs on
+// the idle machine, which E9 has only.
+function drawZoom() {
+  const svg = document.getElementById("zoom");
+  svg.replaceChildren();
+  const commits = DATA.commits.slice(DATA.zoomFrom);
+  const names = [...commits.map(commit => commit.name), "E9"];
+  const width = svg.clientWidth, height = 260, top = 40;
+  const margin = { top: 26, right: 28, bottom: 54, left: 40 };
+  const inner = width - margin.left - margin.right - 40;
+  const x = index => margin.left + 20 + index / (names.length - 1) * inner;
+  const y = value => margin.top + (1 - value / top) * (height - margin.top - margin.bottom);
+  const colors = ["var(--chart-1, #2a78d6)", "var(--chart-2, #eb6834)"];
+  for (let tick = 0; tick <= top; tick += 10) {
+    svg.append(el("line", { class: "grid", x1: margin.left, x2: width - margin.right, y1: y(tick), y2: y(tick) }));
+    svg.append(el("text", { x: margin.left - 6, y: y(tick) + 4, "text-anchor": "end" }, tick));
+  }
+  svg.append(el("text", { x: margin.left - 6, y: margin.top - 12, "text-anchor": "end" }, "s"));
+  const medians = commits.map(commit => median(commit.runs));
+  svg.append(el("path", { d: medians.map((value, index) => `${index ? "L" : "M"}${x(index)},${y(value)}`).join(" "), fill: "none", stroke: colors[0], "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+  const idle = DATA.idle.map(one => ({ ...one, at: names.indexOf(one.name), median: median(one.runs) }));
+  const last = idle.slice(-2);
+  svg.append(el("path", { d: `M${x(last[0].at)},${y(last[0].median)} L${x(last[1].at)},${y(last[1].median)}`, fill: "none", stroke: colors[1], "stroke-width": 2, "stroke-linecap": "round" }));
+  commits.forEach((commit, index) => {
+    for (const run of commit.runs) svg.append(el("circle", { cx: x(index), cy: y(run), r: 2.5, fill: "var(--muted-foreground, #6b6a66)", opacity: 0.75 }));
+    svg.append(el("circle", { class: "ring", cx: x(index), cy: y(medians[index]), r: 5, fill: colors[0] }));
+    svg.append(el("text", { class: "value", x: x(index), y: y(Math.max(...commit.runs)) - 10, "text-anchor": "middle" }, `${seconds(medians[index])} s`));
+    hit(svg, x(index), y(medians[index]), [[`${commit.name} (${commit.id}): ${commit.note}`], ["median of " + commit.runs.length + " runs, other programs at work", `${seconds(medians[index])} s`], ["checks at the budget", count(commit.budget)], ["steps", count(commit.steps)]]);
+  });
+  for (const one of idle) {
+    const attrs = { cx: x(one.at), cy: y(one.median), r: 5 };
+    if (one.candidate) svg.append(el("circle", { ...attrs, fill: "var(--background, #fff)", stroke: colors[1], "stroke-width": 2 }));
+    else svg.append(el("circle", { class: "ring", ...attrs, fill: colors[1] }));
+    svg.append(el("text", { class: "value", x: x(one.at), y: y(one.median) + 20, "text-anchor": "middle" }, `${seconds(one.median)} s`));
+    const rows = [[one.candidate ? `${one.name} (${one.id}): ${one.note}` : `${one.name} on the idle machine`], ["median of " + one.runs.length + " runs on the idle machine", `${seconds(one.median)} s`]];
+    if (one.candidate) rows.push(["checks at the budget", count(one.budget)], ["steps", count(one.steps)]);
+    hit(svg, x(one.at), y(one.median), rows);
+  }
+  const wide = inner / (names.length - 1) >= 56;
+  names.forEach((name, index) => {
+    svg.append(el("text", { class: "name", x: x(index), y: height - margin.bottom + 18, "text-anchor": "middle" }, name));
+    const below = index < commits.length ? commits[index].id : "not merged";
+    if (wide || index === names.length - 1) svg.append(el("text", { x: x(index), y: height - margin.bottom + 33, "text-anchor": "middle" }, below));
+  });
+  const legend = document.getElementById("zoom-legend");
+  legend.replaceChildren();
+  [["other programs at work, median of three or four runs", colors[0]], ["on the idle machine", colors[1]]].forEach(([label, color]) => {
+    const item = document.createElement("span");
+    const key = document.createElement("i"); key.style.borderTopColor = color;
+    item.append(key, label); legend.append(item);
+  });
+}
+
 function drawTime() {
   drawRuns("time", DATA.commits, { height: 300, tick: 100, goal: true, labelled: DATA.labelled });
-  drawRuns("zoom", DATA.commits.slice(DATA.zoomFrom), { height: 240, tick: 10, top: 40 });
+  drawZoom();
   const commits = DATA.commits;
   const medians = commits.map(commit => median(commit.runs));
   const table = document.createElement("table");
