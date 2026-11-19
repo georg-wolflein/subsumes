@@ -36,11 +36,30 @@
 //! below is at work, unless it is an instance, which nothing can take back. So it is kept
 //! apart, and becomes an answer for good when the task below ends without an instance
 //! either.
+//!
+//! # Disjunctions that say nothing new
+//!
+//! A branch may entail one of its disjunctions: an object of one kind is not an object of
+//! another kind, whatever the other kind is taken apart to. Split on, such a disjunction
+//! gives the branch again under each alternative that stands, and a branch with many of
+//! them is searched once for each way of choosing among them. So before a branch splits
+//! on a disjunction, the engine takes the opposite of every alternative into a copy of the
+//! branch. If the copy is refuted without a split, the branch entails the disjunction, and
+//! drops it.
+//!
+//! What the copy asks of the values inside it is decided by tasks like any other. The copy
+//! shows something only by what holds for good: one that was given an answer which holds as
+//! long as a task is at work shows nothing.
+//!
+//! Such a test has an allowance of steps: what the check has spent on its search so far,
+//! less what its tests have spent. A test that runs out of it is given up, and the branch
+//! splits as it would have without the test. So the tests never spend more than the search
+//! that they are to shorten.
 
 #[cfg(test)]
 mod exhaustive;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use serde_json::Value;
@@ -53,7 +72,7 @@ use crate::canonical::{Left, Solver};
 use crate::context::{Budget, Context, Exhausted};
 use crate::generate;
 use crate::language::{LanguageId, Languages};
-use crate::term::{CRefId, InstanceType, LeafId, Term, TermId, Terms, TypeSet, VarId};
+use crate::term::{CRefId, InstanceType, Leaf, LeafId, Term, TermId, Terms, TypeSet, VarId};
 
 /// What the engine makes of two schemas.
 #[derive(Debug, PartialEq)]
@@ -208,6 +227,7 @@ pub(crate) fn decide(context: &mut Context, a: VarId, b: VarId) -> Result<Outcom
     let both = terms.both(accepted, rejected);
     let mut hands_on = true;
     loop {
+        let spent_before = context.budget.spent();
         let mut engine = Engine {
             context: &mut *context,
             unfoldings: Vec::new(),
@@ -222,6 +242,12 @@ pub(crate) fn decide(context: &mut Context, a: VarId, b: VarId) -> Result<Outcom
             hands_on,
             handed_on: false,
             too_deep: false,
+            indefinite: None,
+            testing: None,
+            relied: false,
+            spent_before,
+            spent_on_tests: 0,
+            ran_out: HashMap::new(),
         };
         return Ok(match engine.decide(both)? {
             Found::Nothing => Outcome::Yes,
@@ -331,6 +357,9 @@ struct Branch {
     todo: VecDeque<Item>,
     /// The disjunctions that were met and not split yet.
     choices: VecDeque<Item>,
+    /// How many of them, the first ones, the branch has from the split that it is an
+    /// alternative of. The others it brought itself.
+    inherited: usize,
     /// A disjunction that the branch splits on before any other, as soon as it stands: the
     /// second half of an alternative of "two hold".
     and: Option<Later>,
@@ -358,6 +387,7 @@ impl Default for Branch {
             met: BTreeSet::new(),
             todo: VecDeque::new(),
             choices: VecDeque::new(),
+            inherited: 0,
             and: None,
         }
     }
@@ -465,6 +495,48 @@ struct Task {
     began: u64,
 }
 
+/// The disjunction that a branch splits on next.
+#[derive(Debug, Clone, Copy)]
+enum Next {
+    /// One that it met, and whether it brought it.
+    Met(Item, bool),
+    /// The second half of an alternative of "two hold", which the branch brought.
+    Later(Later),
+}
+
+impl Next {
+    /// The disjunction by what it says, if it is one that the branch met.
+    fn disjunction(self) -> Option<Disjunction> {
+        match self {
+            Self::Met(choice, _) => Some((choice.term, choice.negated)),
+            Self::Later(_) => None,
+        }
+    }
+}
+
+/// A test of whether a branch entails the disjunction that it splits on next, while the
+/// copy of the branch that holds the opposite waits for c-references to be decided.
+struct Testing {
+    /// Where on the stack the task of the branch is. The tasks above it are those that the
+    /// copy waits for.
+    at: usize,
+    branch: Branch,
+    next: Next,
+    test: Test,
+}
+
+/// What a test may spend, and how things stood when it began.
+#[derive(Debug, Clone, Copy)]
+struct Test {
+    /// How many steps had been spent when the test began, and how many it may spend.
+    spent_before: u64,
+    allowance: u64,
+    /// How many steps the budget allowed before the test.
+    allowed: u64,
+    /// How many answers had been found when the test began.
+    began: u64,
+}
+
 /// A branch that was split on one of its disjunctions.
 struct Split {
     branch: Branch,
@@ -539,6 +611,23 @@ struct Engine<'c> {
     hands_on: bool,
     handed_on: bool,
     too_deep: bool,
+    /// For each variable, whether its schema may be one of which the definitions say
+    /// nothing definite. Worked out when it is first asked.
+    indefinite: Option<Vec<bool>>,
+    /// The test of whether a branch entails a disjunction that is being made, while its
+    /// copy of the branch waits. One test is made at a time.
+    testing: Option<Testing>,
+    /// Whether the search for an object or an array was given an answer that holds only as
+    /// long as tasks at work accept nothing, since this was last set to `false`.
+    relied: bool,
+    /// How many steps had been spent when the engine began, and how many the tests have
+    /// spent since.
+    spent_before: u64,
+    spent_on_tests: u64,
+    /// The allowance of the last test of a disjunction, if the test ran out of it. The
+    /// next test of that disjunction is made only with twice as much, so that the tests
+    /// which run out spend no more together than twice what the last of them does.
+    ran_out: HashMap<Disjunction, u64>,
 }
 
 impl Engine<'_> {
@@ -549,26 +638,38 @@ impl Engine<'_> {
         }
         self.begin(of)?;
         loop {
-            // What the task at work asked for comes first.
-            let task = self.tasks.last_mut().expect("a task is at work");
-            if let Some(wanted) = task.wanted.pop() {
-                if self.known(wanted).is_none() {
-                    self.begin(wanted)?;
-                }
-                continue;
-            }
-            let Some(found) = self.step()? else {
-                continue;
-            };
-            let ended = self.tasks.last().expect("a task is at work").of;
-            self.end(&found);
-            if self.tasks.is_empty() {
-                return Ok(found);
-            }
-            if self.hands_on && matches!(found, Found::Instance(_)) {
-                self.share(ended, &found)?;
+            match self.advance() {
+                Ok(Some(found)) => return Ok(found),
+                Ok(None) => {}
+                // The steps ran out: those of the budget, or those that a test may spend.
+                Err(Exhausted) => self.give_up_the_test()?,
             }
         }
+    }
+
+    /// Does the next piece of work of the task at work. Returns what the first task found,
+    /// if that ended it.
+    fn advance(&mut self) -> Result<Option<Found>, Exhausted> {
+        // What the task at work asked for comes first.
+        let task = self.tasks.last_mut().expect("a task is at work");
+        if let Some(wanted) = task.wanted.pop() {
+            if self.known(wanted).is_none() {
+                self.begin(wanted)?;
+            }
+            return Ok(None);
+        }
+        let Some(found) = self.step()? else {
+            return Ok(None);
+        };
+        let ended = self.tasks.last().expect("a task is at work").of;
+        self.end(&found);
+        if self.tasks.is_empty() {
+            return Ok(Some(found));
+        }
+        if self.hands_on && matches!(found, Found::Instance(_)) {
+            self.share(ended, &found)?;
+        }
+        Ok(None)
     }
 
     /// Gives the instance of a c-reference to every other c-reference that the task at work
@@ -704,6 +805,9 @@ impl Engine<'_> {
     /// Follows one alternative of the task at work as far as it goes without a split.
     /// Returns what the task found, if that ended it.
     fn step(&mut self) -> Result<Option<Found>, Exhausted> {
+        // The branch that waited may be the copy of a test that this task makes.
+        let at = self.tasks.len() - 1;
+        let mut testing = self.testing.take_if(|testing| testing.at == at);
         let task = self.tasks.last_mut().expect("a task is at work");
         let mut branch = match task.waiting.take() {
             Some(branch) => branch,
@@ -734,50 +838,70 @@ impl Engine<'_> {
                 };
                 self.context.budget.charge(1 + split.branch.weight() / 32)?;
                 let mut branch = split.branch.clone();
+                branch.inherited = branch.choices.len();
                 branch.todo.extend(alternative.holds);
                 branch.and = alternative.and;
                 branch
             }
         };
-        match self.settle(&mut branch)? {
-            Settled::Refuted => return Ok(None),
-            Settled::Needs(wanted) => {
-                self.wait(branch, wanted);
+        if testing.is_none() {
+            match self.settle(&mut branch)? {
+                Settled::Refuted => return Ok(None),
+                Settled::Needs(wanted) => {
+                    self.wait(branch, wanted);
+                    return Ok(None);
+                }
+                Settled::Stands => {}
+            }
+            if self.is_hopeless(&branch) {
+                self.stood();
                 return Ok(None);
             }
-            Settled::Stands => {}
         }
-        if self.is_hopeless(&branch) {
-            self.stood();
-            return Ok(None);
-        }
-        if let Some(later) = branch.and.take() {
-            // The first of two terms holds as far as it goes. Which of the terms after it
-            // holds with it is the other half of the same alternative, so the branch
-            // splits on that before any other disjunction. The alternative has brought
-            // this split: if no term after the first stands with it, it did not stand.
-            let still_to_come = one_later(&self.context.terms, later);
-            let task = self.tasks.last_mut().expect("a task is at work");
-            task.splits.push(Split {
-                branch,
-                still_to_come,
-                choice: None,
-                brought: true,
-                stood: false,
-            });
-            return Ok(None);
-        }
-        if let Some((choice, brought)) = self.choose(&mut branch) {
-            let still_to_come = alternatives(&self.context.terms, &choice);
-            let task = self.tasks.last_mut().expect("a task is at work");
-            task.splits.push(Split {
-                branch,
-                still_to_come,
-                choice: Some((choice.term, choice.negated)),
-                brought,
-                stood: false,
-            });
-            return Ok(None);
+        // The branch stands, and splits on one of its disjunctions. One that it entails
+        // says nothing of its instances that the branch does not say, so it is dropped:
+        // split on, each alternative that stands would be searched as the branch itself
+        // is, with more to copy and to ask. The branch entails a disjunction when no
+        // instance is left once the opposite of every alternative is taken in, which is
+        // seen without a split or not at all.
+        loop {
+            let (next, mut against, test) = match testing.take() {
+                // The branch that waited is the one that holds the opposite.
+                Some(testing) => {
+                    let against = std::mem::replace(&mut branch, testing.branch);
+                    (testing.next, against, testing.test)
+                }
+                None => {
+                    let Some(next) = self.choose(&mut branch) else {
+                        break;
+                    };
+                    let Some((against, test)) = self.begin_the_test(&branch, next)? else {
+                        self.split(branch, next);
+                        return Ok(None);
+                    };
+                    (next, against, test)
+                }
+            };
+            match self.refutes(&mut against) {
+                Ok(Some(Settled::Refuted)) => self.end_the_test(test, next, false),
+                Ok(Some(Settled::Needs(wanted))) => {
+                    self.wait(against, wanted);
+                    self.testing = Some(Testing {
+                        at,
+                        branch,
+                        next,
+                        test,
+                    });
+                    return Ok(None);
+                }
+                // The opposite stands, or nothing is known of it, or the allowance of the
+                // test does not cover it.
+                other => {
+                    self.end_the_test(test, next, other.is_err());
+                    self.split(branch, next);
+                    return Ok(None);
+                }
+            }
         }
         self.stood();
         // Nothing is left to take in, and the branch stands.
@@ -800,14 +924,214 @@ impl Engine<'_> {
         }
     }
 
-    /// Takes the disjunction that the branch splits on next, and says whether the branch
-    /// brought it: whether it was not yet met when the split at work was made. It is the
-    /// disjunction that most often left a branch with no alternative, and of several the
-    /// one that was met first.
-    fn choose(&self, branch: &mut Branch) -> Option<(Item, bool)> {
-        let task = self.tasks.last().expect("a task is at work");
-        let split = task.splits.last().expect("a branch is of a split");
-        let met = split.branch.choices.len();
+    /// Splits a branch of the task at work on one of its disjunctions.
+    fn split(&mut self, branch: Branch, next: Next) {
+        let terms = &self.context.terms;
+        let (still_to_come, choice, brought) = match next {
+            Next::Met(choice, brought) => {
+                let disjunction = (choice.term, choice.negated);
+                (alternatives(terms, &choice), Some(disjunction), brought)
+            }
+            // The first of two terms holds as far as it goes. Which of the terms after it
+            // holds with it is the other half of the same alternative. The alternative
+            // has brought this split: if no term after the first stands with it, it did
+            // not stand.
+            Next::Later(later) => (one_later(terms, later), None, true),
+        };
+        let task = self.tasks.last_mut().expect("a task is at work");
+        task.splits.push(Split {
+            branch,
+            still_to_come,
+            choice,
+            brought,
+            stood: false,
+        });
+    }
+
+    /// Begins the test of whether a branch entails the disjunction that it splits on next:
+    /// gives a copy of the branch that is to take in what holds of an instance which
+    /// satisfies no alternative, the opposite of each. `None` if no test is made.
+    ///
+    /// None is made while another is, so the tasks that a test waits for make none. None
+    /// is made where the branch has no other disjunction to split on: what a disjunction
+    /// that is dropped saves is the search of the others under each of its alternatives,
+    /// and the split itself costs about what the test does. And none is made of a `oneOf`,
+    /// whose opposite is a disjunction again, or of a disjunction of one alternative.
+    ///
+    /// None is made where the opposite may not be the exact opposite. A branch reads a
+    /// schema that it takes for true as what the schema surely accepts, and one that it
+    /// takes for false as what the schema does not even possibly accept. The two differ
+    /// for a schema that is negated inside itself, so there the opposite of a disjunction
+    /// leaves out instances that do not satisfy the disjunction, and a branch that is
+    /// refuted with it may still not entail the disjunction. The disjunction is a part of
+    /// the schema of the variable whose unfolding it stands in, so it is enough that this
+    /// schema is definite.
+    ///
+    /// The disjunction is also a part of what the variables say that led to it. So none of
+    /// them may be held against its opposite as a variable that the branch has taken:
+    /// without the disjunction, the branch does not say what they say. The opposite is put
+    /// in an unfolding of its own inside the one of the disjunction, which the search for a
+    /// way back finds, and which counts as negated, so that no way back by variables that
+    /// are taken for true passes it.
+    ///
+    /// And none is made that the allowance does not cover: as far as the copy and a step
+    /// for each alternative, and as far as twice what the last test of the disjunction had
+    /// if it ran out. The test may spend what there is of the allowance.
+    ///
+    /// # Errors
+    ///
+    /// When the budget does not cover the copy.
+    fn begin_the_test(
+        &mut self,
+        branch: &Branch,
+        next: Next,
+    ) -> Result<Option<(Branch, Test)>, Exhausted> {
+        if self.testing.is_some() || branch.choices.is_empty() {
+            return Ok(None);
+        }
+        let terms = &self.context.terms;
+        let (parts, negated, within) = match next {
+            Next::Met(choice, _) => match (terms.term(choice.term), choice.negated) {
+                (Term::AnyOf(parts), false) => (&parts[..], true, choice.within),
+                (Term::AllOf(parts), true) => (&parts[..], false, choice.within),
+                _ => return Ok(None),
+            },
+            Next::Later(later) => {
+                let Term::OneOf(parts) = terms.term(later.one_of) else {
+                    unreachable!("the terms after a place are those of a `OneOf`");
+                };
+                (&parts[later.after + 1..], true, later.within)
+            }
+        };
+        let Some(stands_in) = within else {
+            return Ok(None);
+        };
+        let copy = 1 + branch.weight() / 32;
+        let allowance = self.allowance();
+        let mut least = copy + parts.len() as u64;
+        if let Some(had) = next.disjunction().and_then(|met| self.ran_out.get(&met)) {
+            least = least.max(had.saturating_mul(2));
+        }
+        if parts.len() < 2 || allowance < least {
+            return Ok(None);
+        }
+        let variable = self.unfoldings[stands_in].variable;
+        let indefinite = self.indefinite.get_or_insert_with(|| indefinite(terms));
+        if indefinite[variable.index()] {
+            return Ok(None);
+        }
+        let within = Some(self.unfoldings.len());
+        let opposite = parts.iter().map(|part| Item {
+            term: *part,
+            negated,
+            within,
+        });
+        let opposite: Vec<Item> = opposite.collect();
+        self.unfoldings.push(Unfolding {
+            variable,
+            negated: true,
+            within: Some(stands_in),
+        });
+        let budget = &mut self.context.budget;
+        let spent_before = budget.spent();
+        budget.charge(copy)?;
+        let mut against = branch.clone();
+        against.todo.extend(opposite);
+        let test = Test {
+            spent_before,
+            allowance,
+            allowed: budget.allow(allowance - copy),
+            began: self.answers,
+        };
+        Ok(Some((against, test)))
+    }
+
+    /// How many steps a test may spend: as many as the check has spent on its search, less
+    /// those that its tests have spent. So the tests never spend more than the search that
+    /// they are to shorten, and a check that searches little tests little. A search that
+    /// goes on for long without them earns the tests that may end it.
+    fn allowance(&self) -> u64 {
+        let spent = self.context.budget.spent() - self.spent_before;
+        let on_the_search = spent - self.spent_on_tests;
+        on_the_search.saturating_sub(self.spent_on_tests)
+    }
+
+    /// Whether a branch is refuted when it has taken in what needs no split, by what holds
+    /// for good. `None` if an answer was given on the way that holds only as long as tasks
+    /// at work accept nothing: then nothing is known of the branch, also where it is to
+    /// wait and to be asked again, since it keeps what it made of that answer.
+    ///
+    /// What the branch made of such an answer before it was copied is another matter, and
+    /// the copy may share it. The branch gives no instance that the copy did not begin
+    /// with, and of those this shows for good that they satisfy the disjunction. So an
+    /// instance of the branch satisfies what was dropped, whatever becomes of the tasks at
+    /// work.
+    ///
+    /// The branch is a copy that is looked at and dropped. So what the task at work took
+    /// to accept nothing for it is not held against the task, and a value that it passed
+    /// over for its depth is none that the check has missed.
+    fn refutes(&mut self, branch: &mut Branch) -> Result<Option<Settled>, Exhausted> {
+        let lowest = self.tasks.last().map(|task| task.lowest);
+        let too_deep = self.too_deep;
+        self.relied = false;
+        let settled = self.settle(branch);
+        if let (Some(task), Some(lowest)) = (self.tasks.last_mut(), lowest) {
+            task.lowest = lowest;
+        }
+        self.too_deep = too_deep;
+        Ok((!self.relied).then_some(settled?))
+    }
+
+    /// Ends a test: the steps since it began are steps of a test, and the budget allows
+    /// again what it allowed before. A test that ran out of its allowance is noted with
+    /// its disjunction.
+    fn end_the_test(&mut self, test: Test, of: Next, ran_out: bool) {
+        let budget = &mut self.context.budget;
+        budget.restore(test.allowed);
+        self.spent_on_tests += budget.spent() - test.spent_before;
+        if let Some(met) = of.disjunction() {
+            if ran_out {
+                self.ran_out.insert(met, test.allowance);
+            } else {
+                self.ran_out.remove(&met);
+            }
+        }
+    }
+
+    /// Gives up the test that is being made, because the steps ran out: those of its
+    /// allowance, or those of the budget, which the next step then finds out. The tasks
+    /// that were to decide what the copy asked for are taken off the stack with nothing
+    /// found, and the branch splits.
+    ///
+    /// # Errors
+    ///
+    /// When no test is being made: then it is the budget that does not cover the work.
+    fn give_up_the_test(&mut self) -> Result<(), Exhausted> {
+        let testing = self.testing.take().ok_or(Exhausted)?;
+        for task in self.tasks.drain(testing.at + 1..) {
+            self.at_work.remove(&task.of);
+        }
+        let task = &mut self.tasks[testing.at];
+        task.waiting = None;
+        task.wanted.clear();
+        // What was found since the test began may have taken one of those tasks to accept
+        // nothing, which is not known of it.
+        let began = testing.test.began;
+        self.assumed.retain(|_, assumed| assumed.since <= began);
+        self.end_the_test(testing.test, testing.next, true);
+        self.split(testing.branch, testing.next);
+        Ok(())
+    }
+
+    /// Takes the disjunction that the branch splits on next. The second half of an
+    /// alternative of "two hold" comes before any other. Of the others it is the one that
+    /// most often left a branch with no alternative, and of several the one that was met
+    /// first, with whether the branch brought it: whether the branch does not have it from
+    /// the split that it is an alternative of.
+    fn choose(&self, branch: &mut Branch) -> Option<Next> {
+        if let Some(later) = branch.and.take() {
+            return Some(Next::Later(later));
+        }
         let mut most = (0, 0);
         if !self.dead_ends.is_empty() {
             let dead_ends = |choice: &Item| {
@@ -822,7 +1146,11 @@ impl Engine<'_> {
             }
         }
         let choice = branch.choices.remove(most.0)?;
-        Some((choice, most.0 >= met))
+        let brought = most.0 >= branch.inherited;
+        if !brought {
+            branch.inherited -= 1;
+        }
+        Some(Next::Met(choice, brought))
     }
 
     /// Lets a branch of the task at work wait for c-references to be decided.
@@ -912,6 +1240,7 @@ impl Engine<'_> {
             at_work,
             partitions,
             too_deep,
+            relied,
             ..
         } = self;
         let Context {
@@ -933,10 +1262,12 @@ impl Engine<'_> {
                 }
                 if let Some(at) = at_work.get(&of) {
                     lowest = lowest.min(*at);
+                    *relied = true;
                     return Some(Found::Nothing);
                 }
                 let assumed = assumed.get(&of)?;
                 lowest = lowest.min(assumed.lowest);
+                *relied = true;
                 Some(assumed.found.clone())
             }
         };
@@ -1287,6 +1618,105 @@ impl Engine<'_> {
         branch.holds.insert(leaf);
         branch.covered = TypeSet::ALL;
     }
+}
+
+/// For each variable, whether its schema may be one of which the definitions say nothing
+/// definite: of some instance they say neither that the schema accepts it nor that it does
+/// not, as for a schema that is its own negation.
+///
+/// A schema is definite if it leads to none that refers to itself with nothing in between,
+/// by a reference or by the schema of a value inside. Then what it says of an instance
+/// comes down to what schemas say that are reached before it and to what schemas say of
+/// smaller values. A leaf that holds a schema is not opened, so a schema that leads to one
+/// is taken to be indefinite too.
+///
+/// This is one pass over the terms of the variables, which the lowering made, and costs no
+/// step.
+fn indefinite(terms: &Terms) -> Vec<bool> {
+    let count = terms.variables().count();
+    // For each variable, the variables that refer to it: with nothing in between, and in
+    // any way. And how many it refers to with nothing in between.
+    let mut in_place: Vec<Vec<usize>> = vec![Vec::new(); count];
+    let mut at_all: Vec<Vec<usize>> = vec![Vec::new(); count];
+    let mut refers_to = vec![0_usize; count];
+    let mut indefinite = vec![false; count];
+    let (mut seen, mut pending) = (HashSet::new(), Vec::new());
+    for (id, variable) in terms.variables() {
+        let from = id.index();
+        seen.clear();
+        pending.push(variable.body);
+        while let Some(term) = pending.pop() {
+            if !seen.insert(term) {
+                continue;
+            }
+            match terms.term(term) {
+                Term::AllOf(parts) | Term::AnyOf(parts) | Term::OneOf(parts) => {
+                    pending.extend(parts.iter().copied());
+                }
+                Term::Not(inner) => pending.push(*inner),
+                Term::Ref(other) => {
+                    in_place[other.index()].push(from);
+                    at_all[other.index()].push(from);
+                    refers_to[from] += 1;
+                }
+                Term::PProp(_, other)
+                | Term::PNames(other)
+                | Term::Item(_, other)
+                | Term::AddIts(_, other)
+                | Term::Contains(other) => at_all[other.index()].push(from),
+                Term::Unknown(leaf) => indefinite[from] |= holds_a_schema(terms.leaf(*leaf)),
+                _ => {}
+            }
+        }
+    }
+    // A variable that refers to no other with nothing in between is on no cycle of such
+    // references, and neither is one that refers only to such variables. Those that are
+    // left lead to a cycle.
+    let mut free: Vec<usize> = (0..count).filter(|at| refers_to[*at] == 0).collect();
+    while let Some(to) = free.pop() {
+        for from in &in_place[to] {
+            refers_to[*from] -= 1;
+            if refers_to[*from] == 0 {
+                free.push(*from);
+            }
+        }
+    }
+    let mut found: Vec<usize> = (0..count)
+        .filter(|at| refers_to[*at] > 0 || indefinite[*at])
+        .collect();
+    for at in &found {
+        indefinite[*at] = true;
+    }
+    // And so does every variable that leads to one of those in any way.
+    while let Some(to) = found.pop() {
+        for from in &at_all[to] {
+            if !std::mem::replace(&mut indefinite[*from], true) {
+                found.push(*from);
+            }
+        }
+    }
+    indefinite
+}
+
+/// Whether a leaf may hold a schema, which may be one that is not definite. It holds none
+/// if its keyword holds a count, a pattern, a format or a value. A leaf without a keyword
+/// is about a schema as a whole.
+fn holds_a_schema(leaf: &Leaf) -> bool {
+    const WITHOUT_A_SCHEMA: [&str; 11] = [
+        "const",
+        "enum",
+        "format",
+        "maxItems",
+        "maxLength",
+        "maxProperties",
+        "minItems",
+        "minLength",
+        "minProperties",
+        "pattern",
+        "uniqueItems",
+    ];
+    leaf.keyword
+        .is_none_or(|keyword| !WITHOUT_A_SCHEMA.contains(&keyword))
 }
 
 /// The alternatives of a disjunction, each made when it is asked for.
@@ -4130,6 +4560,191 @@ mod tests {
         assert_eq!(
             counterexample(&overlap, &json!({"type": "number"})),
             json!(0)
+        );
+    }
+
+    /// Exactly one of some kinds of object. A property that need not be there tells the
+    /// kinds apart, and another holds an object of the kind's own. A kind takes no other
+    /// property, which it says in its schema or, with `in_two`, in a second schema beside
+    /// the first.
+    fn one_of_kinds(count: usize, in_two: bool) -> Value {
+        let kind = |kind: usize| {
+            let own = json!({
+                "level": {"enum": ["low", "high"]},
+                format!("option{kind}"): {"type": "boolean"},
+            });
+            let mut schema = json!({
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": [format!("k{kind}")]},
+                    "options": {
+                        "type": "object",
+                        "properties": own,
+                        "additionalProperties": false,
+                    },
+                },
+            });
+            if in_two {
+                let named = json!({"^kind$": true, "^options$": true});
+                let closed = json!({"patternProperties": named, "additionalProperties": false});
+                return json!({"allOf": [schema, closed]});
+            }
+            schema["additionalProperties"] = json!(false);
+            schema
+        };
+        json!({"oneOf": (0..count).map(kind).collect::<Vec<_>>()})
+    }
+
+    #[test]
+    fn a_disjunction_that_the_branch_entails_is_not_split_on() {
+        // 32 kinds of object, written in two ways. A branch that has taken one kind holds
+        // the negation of every other kind, in either way of writing: some sixty
+        // disjunctions. Once one of them is split to an object that has the property which
+        // tells the kinds apart, the branch entails every other but the negation of its own
+        // kind. Split one inside the other they take two and three million steps. They are
+        // dropped instead, one after the other.
+        let (plain, in_two) = (one_of_kinds(32, false), one_of_kinds(32, true));
+        let enough = Checker::new().budget(1_000_000);
+        assert_eq!(enough.subsumes(&in_two, &plain).unwrap(), Verdict::Yes);
+        assert_eq!(enough.subsumes(&plain, &in_two).unwrap(), Verdict::Yes);
+        // A disjunction that the branch does not entail is split on as before: an object of
+        // the kind that is left out is of no other.
+        let fewer = one_of_kinds(31, true);
+        assert_eq!(
+            enough.subsumes(&fewer, &plain).unwrap(),
+            Verdict::No {
+                counterexample: json!({"kind": "k31"})
+            }
+        );
+    }
+
+    /// A schema that accepts nothing, which the engine sees only by a search that doubles
+    /// with each pair: an object with one of two properties for each of some pairs, and
+    /// with fewer properties than there are pairs.
+    fn pigeonhole(pairs: usize) -> Value {
+        let pair = |pair: usize| {
+            let (one, other) = (format!("a{pair}"), format!("b{pair}"));
+            json!({"anyOf": [{"required": [one]}, {"required": [other]}]})
+        };
+        json!({
+            "type": "object",
+            "allOf": (0..pairs).map(pair).collect::<Vec<_>>(),
+            "maxProperties": pairs - 1,
+        })
+    }
+
+    #[test]
+    fn a_test_that_would_take_long_is_given_up() {
+        // The first alternative of the disjunction gives `null` at once. Whether the
+        // branch entails the disjunction depends on whether the value of `p` can be what
+        // no value is, which takes two to the power of 24 branches to see. The test of it
+        // may spend what the search has spent, which is a few steps, and is given up.
+        let hard =
+            json!({"type": "object", "required": ["p"], "properties": {"p": pigeonhole(24)}});
+        let either = json!({"anyOf": [{"type": "null"}, {"not": hard}]});
+        let string = json!({"type": "string"});
+        let small = Checker::new().budget(1_000);
+        let null = || Verdict::No {
+            counterexample: json!(null),
+        };
+        assert_eq!(small.subsumes(&string, &either).unwrap(), null());
+        // And so it is next to another disjunction, where the test is begun.
+        let other = json!({"anyOf": [{"type": ["null", "object"]}, {"type": "number"}]});
+        let both = json!({"allOf": [either, other]});
+        assert_eq!(small.subsumes(&string, &both).unwrap(), null());
+    }
+
+    #[test]
+    fn a_test_gives_no_value_that_is_costly_to_give() {
+        // Whether the branch entails that `x` is no string of a hundred thousand
+        // characters depends on whether `x` can be one. It can, and to give one takes a
+        // step for each character. The allowance of the test does not cover that, so the
+        // test is given up, and the check gives a string that is shorter.
+        let long = json!({
+            "type": "object",
+            "properties": {"x": {"type": "string", "minLength": 100_000}},
+        });
+        let any = json!({
+            "type": "object",
+            "required": ["x"],
+            "properties": {"x": {"type": "string"}},
+            "anyOf": [{"maxProperties": 3}, {"minProperties": 2}],
+        });
+        let small = Checker::new().budget(1_000);
+        assert_eq!(
+            small.subsumes(&long, &any).unwrap(),
+            Verdict::No {
+                counterexample: json!({"x": ""})
+            }
+        );
+    }
+
+    #[test]
+    fn a_disjunction_of_a_schema_that_is_negated_inside_itself_is_split_on() {
+        // `e` is what it is not, for a string, so nothing definite is said of a string.
+        // "If `e` then `e`" is a disjunction of `e` and what `e` is not. The two are not
+        // each other's opposite here, so the disjunction is not taken to hold for every
+        // string, and the check depends on the leaf. The two other disjunctions are there
+        // so that the branch has more than one to split on.
+        let paradox = json!({
+            "type": "string",
+            "if": {"$ref": "#/$defs/e"},
+            "then": {"$ref": "#/$defs/e"},
+            "allOf": [
+                {"anyOf": [{"minLength": 1}, {"maxLength": 5}]},
+                {"anyOf": [{"minLength": 2}, {"maxLength": 6}]},
+            ],
+            "$defs": {"e": {"maximum": 1, "not": {"$ref": "#/$defs/e"}}},
+        });
+        let no_string = json!({"not": {"type": "string"}});
+        assert_eq!(
+            depends_on(&no_string, &paradox),
+            (Side::B, "#/$defs/e".to_owned())
+        );
+    }
+
+    #[test]
+    fn what_holds_while_a_task_is_at_work_shows_no_disjunction_to_be_entailed() {
+        // `v` is `null`, or an object whose `p` is `null`, and not both of two things. The
+        // first of the two asks for a `p` that is a `v` again. While `v` is being decided,
+        // such a `p` is taken to have no value, so the opposite of "not both" leaves no
+        // object. It leaves no array either, which is seen once the task for `w` has
+        // found that an item has no value. That is no reason to drop "not both": the
+        // object `{"p": null}` is both, and so no `v`.
+        //
+        // The numbers that the schema is none of say nothing of an object. Taking them in
+        // costs the search steps, which is what the test may spend: with fewer, the test
+        // would be given up before the task for `w` has ended.
+        let b = json!({
+            "not": {"enum": (0..200).collect::<Vec<u32>>()},
+            "$defs": {
+                "v": {
+                    "not": {"allOf": [{"$ref": "#/$defs/P1"}, {"$ref": "#/$defs/P2"}]},
+                    "allOf": [{"allOf": [{"allOf": [{"anyOf": [
+                        {
+                            "type": "object",
+                            "required": ["p"],
+                            "properties": {"p": {"type": "null"}},
+                        },
+                        {"type": "null"},
+                    ]}]}]}],
+                },
+                "P1": {
+                    "type": ["object", "array"],
+                    "required": ["p"],
+                    "properties": {"p": {"$ref": "#/$defs/v"}},
+                },
+                "P2": {"minItems": 1, "items": {"$ref": "#/$defs/w"}},
+                "w": {"type": "string", "minLength": 2, "maxLength": 1},
+            },
+            "type": "object",
+            "required": ["q"],
+            "properties": {"q": {"$ref": "#/$defs/v"}},
+        });
+        assert_eq!(counterexample(&json!(false), &b), json!({"q": null}));
+        assert_eq!(
+            counterexample(&json!({"required": ["zzz"]}), &b),
+            json!({"q": null})
         );
     }
 
