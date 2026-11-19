@@ -113,3 +113,97 @@ Steps of the check that A subsumes B:
 
 - The baseline takes seven to eight times the steps for each kind that is added, and E1 five times: both are exponential, and E1 only has the smaller base.
 - E2 takes less than twice the steps for each kind that is added, and less with each one, 1.9 times for the fifth and 1.5 times for the eighth: the steps grow with about the third power of the number of kinds.
+
+## The second round
+
+After E2 a run takes 36 s, and what is left is of another kind. So the second round began with a look at where the time goes, by eight agents at once, each in a checkout of its own: one for each group of checks that were still slow, and one with a profiler. Each was to find the cause, propose a remedy that follows from how the search works and not from one schema, build it, and hold it against the tests and the whole corpus. A reviewer then took each change that was built and tried to break it: by reading it, by schemas written to expose a flaw, and by thousands of pairs made at random, held against the version before.
+
+What the reviewers found is why this is worth its cost. Of eight changes, four were sound as they stood, two lost verdicts on inputs outside the corpus and were mended before they were kept, one was sound but slower, and one gave a wrong `No`.
+
+What the agents found:
+
+- **The search for an object thrashes as the splits did.** Four agents came to this from four groups of checks. A property that there has to be is tried at every fragment of its language, and the one that has no place is tried late, under every placement of those before it. In an object that takes no property but those that it names, 96% to 98% of the places tried are fragments in which no property can have a value. Of the 572 million steps of a run, 336 million were places tried.
+- **The names of an object are cut by one pattern after the other.** A schema with 122 names that hold a dot, written as patterns, took 15,000 products of DFAs to cut its names into 123 parts: 6.85 of the 6.93 million steps of each of its checks.
+- **An instance is copied into everything that holds it.** A counterexample of 3.5 million values was built for each c-reference that it is one of, and copied once for each level around it.
+- **A branch waits for a chain of c-references,** each of which names every variable of the one before, and each was a task.
+- **The negation of a `oneOf` takes its first schema in anew for each pair.**
+- **Most disjunctions that are split say nothing in their branch.** This is the largest cause that is left; see E9.
+
+The time of each experiment below is the median of three runs with one job, made one after the other on the same evening, with the experiments taken in turn so that a change in the load meets all of them.
+
+### E4. An instance is kept as what it is made of
+
+**Hypothesis.** `rb-testset/s189` and `s199` end at the budget in 30 ms to 70 ms: the steps are not spent on search. An instance was built as a JSON value as soon as a task found it, and every object or array that holds it copied it, at a step for each value inside. The counterexample of s189 has 3.5 million values, and 99.96% of the steps of the check were copies.
+
+**Change.** `e3e7ccb`. An instance holds its values by reference, and an array holds the one value of all positions after its first ones once, with their count. Only the counterexample of the check is written out, at a step for each value inside it.
+
+**Review.** Sound. Nothing in the search reads what an instance holds, so every check takes the path it took, and no check takes more steps. On 8,000 checks made at random no verdict is lost and every counterexample is the same.
+
+**Result.** The two checks are decided, `No` with a counterexample that the validator confirms. The collection takes 14.4 million steps where it took 54.0 million, and a run 532 million where it took 572 million. In time it is nothing: the steps that are saved were the cheapest there are.
+
+### E5. The names of an object are cut by all patterns in one product
+
+**Hypothesis.** `additional-as-uneval/o19184` takes 6.9 million steps in each of its four checks, also in the two that end in `No`, with 75 splits. One call that cuts the names by 122 patterns takes 98.9% of them. Cut by one pattern after the other, each part so far is intersected with the pattern and with its complement: two products for every part and pattern, which for patterns that share no name is the square of their number.
+
+**Change.** `426945a`, `700c107`. One product of the DFAs of all the patterns, as a lexer has for its tokens: which of them accept in a state says which part a string is of. The DFA of a part is the product with the states of the part accepting, written down as far as its states lead to one of them.
+
+**Review.** Sound, and not better on every input. Two lists of patterns outside the corpus lose verdicts. Counters of different lengths have a product with a state for every combination, where each part stays small: a check that took 26,000 steps ended at the budget. And many patterns that share strings make many parts, each of which is read off the whole product. So the product is given up when it has more states than the DFAs have together, which patterns that share no string never exceed, and the list is then cut as before. With that, 8,000 checks made at random by the reviewer's generator, whose patterns all share strings, lose no verdict and take 2.0% to 2.5% more steps, which is what the products cost that are given up.
+
+**Result.** No verdict changes. o19184 takes 184,000 steps where it took 6.9 million, and a run 495 million where it took 532 million. The eight checks of the two schemas that were looked at take 0.1 s together where they took 2.7 s.
+
+### E6. A property is looked for only where its value can be one
+
+**Hypothesis.** The 34 checks that are left at the budget spend 87% to 99% of their steps on places tried by the search for an object. With `additionalProperties: false`, the names of every other schema of the branch are fragments in which no property can have a value, and each negated schema of the other side asks for a property that is outside its names, which may be in any of them. Such a property has two or three fragments that take it, and one of them has none.
+
+**Change.** `02af4f1`, `2db7cec`. A fragment whose properties satisfy nothing is no place for a property that there has to be. A property that is left with no fragment leaves no object, which is seen before the search begins. 22 lines.
+
+**Three other remedies for the same cause** were built by other agents and are not kept, since this one is the simplest and takes the fewest steps:
+
+| remedy | branch | steps of a run, on E2 | review |
+| --- | --- | ---: | --- |
+| leave out the fragments that take no value (kept) | `perf/exp-profile` | 302.0 million | sound |
+| the same, and those that clash with what the property is asked | `perf/exp-o18949` | 302.0 million | sound |
+| where a property runs out of places, look at it alone | `perf/exp-o99xx` | 324.8 million | sound |
+| conflict-directed backjumping | `perf/exp-o2137x` | 320.3 million | sound, and slower: what it keeps for each level takes more time than the steps say |
+
+Each of the four decides the same 30 checks.
+
+**Review.** Sound: 78,000 checks made at random and 42 written by hand give the same verdicts. The change had also placed the properties with the fewest fragments left first. The reviewer found that this decides nothing more and takes more steps in a few checks, so the order is the one of before.
+
+**Result.** 30 checks are decided, all `Yes`. A run takes 225 million steps where it took 495 million, and 4 checks still end at the budget. **And a run takes 2.5 s longer.** The 30 checks ended at the budget in 0.2 s to 0.4 s each, because a place tried is the cheapest step there is, so deciding them saves little. The four that are left, of the schema o18949, now spend their ten million steps on the work of the engine, which takes four to five times as long: 1.3 s to 1.6 s each where they took 0.3 s, 5.6 s together where they took 1.2 s. Steps are not time.
+
+### E7. An instance is one of every c-reference that asks no more
+
+**Hypothesis.** With E6 in, 63% of the steps of the checks that it decided are in tasks for a c-reference that names only variables of one that already has an instance. The search for an object asks what the values at one place are asked together each time one more shares the place, so a branch waits for `[M, not M1]`, `[M, not M1, not M2]` and so on.
+
+**Change.** `fc470ea`, `11d937e`. The c-reference that names the most is decided first. When it has an instance, every other one that the branch waits for and that names only variables of it has that instance too, and gets no task.
+
+**Review.** Not sound as it stood, in that it loses a verdict: the instance that is handed on may be nested far deeper than the one that a task of its own gives, here 127 levels where `null` would do, and an object that holds it is then too deep to give. The check answered `Unknown` where it had answered `No`. To hand on only values that hold no other keeps none of the gain, since the values in question are objects. So where a value was passed over for its depth and an instance had been handed on, the check is now made again without handing any on. The reviewer's case is a test.
+
+**Result.** No verdict changes. A run takes 185 million steps where it took 225 million.
+
+### E8. Two of a `oneOf` share their first
+
+**Hypothesis.** The negation of a `oneOf` of n schemas is "none holds, or two do", and "two do" was an alternative for each pair. Under each alternative of the other side, the first schema of nearly every pair is refuted by itself, and was taken in again for each schema that it is paired with: 22,680 alternatives in one check of `oneof-as-anyof/o39722`, every one of them refuted. The steps grow with the cube of the length.
+
+**Change.** `f79889b`. "Two do" is one alternative for each schema but the last: that schema holds, and one of those after it. It is the same pairs in the same order, and a schema that is refuted is refuted once.
+
+**Review.** Sound: it says the same as before.
+
+**Result.** No verdict changes. A run takes 152 million steps where it took 185 million.
+
+### E9. A disjunction that the branch entails is not split (not kept)
+
+**Hypothesis.** Under one alternative of a `oneOf` whose kinds a property tells apart, the negation of every other kind is entailed. It is split all the same, and its alternative that stands asks one thing more of the same property, so the c-reference of the value grows by one variable at each level and is decided anew: 17,078 tasks in one check of o17072. The counts of E1 do not help where the dead end is another disjunction under each alternative, which is why the four checks of o18949 still end at the budget.
+
+**Change.** Before a split, take in the opposite of every alternative of the disjunction in a copy of the branch. If the copy is refuted, the branch entails the disjunction, which is dropped. This is the dual of unit propagation, and what the plan of the design calls a c-reference that says no more than a smaller one. Two agents built it.
+
+- `perf/exp-o98xx-oneof` (`367d17a`): a run takes 142 million steps where it took 572 million, and 2 checks end at the budget where 36 did. **It is wrong.** The reviewer wrote a schema that holds itself in a property, for which it answers `No` with a counterexample that B rejects. It took an answer that holds only while a task is at work for one that holds for good, where the copy waits for another task in between.
+- `perf/exp-o17072-o358` (`d8c01b1`): 138 million steps, and 1 check at the budget. It makes the test only for schemas that lead to no cycle and to no leaf that holds a schema. The reviewer found no wrong verdict in 50,000 checks made at random and by hand, and the first one's counterexample does not break it. But nothing bounds what the test costs: a check that took 9 steps ended at the budget. And every split pays for it, which is a third more steps for the checks under 1,000 steps.
+
+**Not kept.** It is the largest gain that is left: the four checks of o18949 are 5 s of the 24 s that the checks of a run take, and o17072 another second. It is also 300 lines with a second kind of task, in the part of the engine where a mistake is a wrong verdict, as the first of the two shows. It needs an allowance for the test before it can be kept, and a decision whether it is worth what it adds.
+
+### Also tried and dropped
+
+- **Unit propagation by looking ahead** (the agent of o18949): after a branch has taken in what needs no split, try the alternatives of every disjunction in a copy until two stand. It decides the four checks of o18949, and in every variant it costs more elsewhere than it saves or loses a verdict: the copy and the search for an object are paid for every disjunction at every node.
+- **A smaller budget.** With E8 in, no check that is decided takes more than 3.6 million steps, so a budget of 4 million would lose no verdict of the corpus and save 3 s of a run. The budget is not changed here: it is a setting of the library and not a part of these experiments.
