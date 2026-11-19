@@ -1,8 +1,12 @@
+use std::fmt;
+
 use serde_json::Value;
 
-use crate::context::Context;
+use crate::context::{Budget, Context, Exhausted};
 use crate::normalize::{self, Cause, Outcome};
-use crate::{Error, Reason, RegexDialect, Verdict, inspect, lower, schema};
+use crate::schema::Graph;
+use crate::term::VarId;
+use crate::{Error, Reason, RegexDialect, Side, Verdict, inspect, lower, schema};
 
 /// The work budget of a check, unless another is set. It is there so that a check ends: one
 /// that spends all of it takes a few seconds. How many steps a check takes is no measure of how
@@ -74,32 +78,48 @@ impl Checker {
     ///
     /// When `a` or `b` cannot be checked at all; see [`Error`].
     pub fn check(&self, a: &Value, b: &Value) -> Result<Check, Error> {
+        self.check_with_converse(a, b).map(|(check, _)| check)
+    }
+
+    /// The same check as [`check`](Self::check), together with its converse: whether `b`
+    /// subsumes `a`, which is checked when it is asked for. The two schemas accept the same
+    /// instances when both verdicts are [`Verdict::Yes`].
+    ///
+    /// The two schemas are loaded once for both: parsed, their references resolved, and
+    /// lowered to terms. The converse goes on with what the first check found out about
+    /// them, and pays for none of it again; see [`Converse`].
+    ///
+    /// ```
+    /// use serde_json::json;
+    /// use subsumes::{Checker, Verdict};
+    ///
+    /// let a = json!({"type": "integer", "minimum": 0});
+    /// let b = json!({"type": "integer", "exclusiveMinimum": -1});
+    /// let (a_subsumes_b, converse) = Checker::new().check_with_converse(&a, &b)?;
+    /// let b_subsumes_a = converse.check();
+    /// assert_eq!(a_subsumes_b.verdict, Verdict::Yes);
+    /// assert_eq!(b_subsumes_a.verdict, Verdict::Yes);
+    /// # Ok::<(), subsumes::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// When `a` or `b` cannot be checked at all; see [`Error`].
+    pub fn check_with_converse<'s>(
+        &self,
+        a: &'s Value,
+        b: &'s Value,
+    ) -> Result<(Check, Converse<'s>), Error> {
         let graph = schema::parse(a, b)?.link()?;
         let mut context = Context::new(self.budget, self.regex_dialect);
-        let outcome = lower::lower(&graph, &mut context)
-            .and_then(|(a, b)| normalize::decide(&mut context, a, b));
-        let verdict = match outcome {
-            Ok(Outcome::Yes) => Verdict::Yes,
-            Ok(Outcome::No(counterexample)) => Verdict::No { counterexample },
-            Ok(Outcome::Unknown(Cause::Number | Cause::Depth)) => Verdict::Unknown {
-                reason: Reason::Unrepresentable,
-            },
-            Ok(Outcome::Unknown(Cause::Leaf(leaf))) => {
-                let leaf = context.terms.leaf(leaf);
-                let reason = Reason::Unsupported {
-                    schema: graph.node(leaf.node).side,
-                    location: leaf.location(&graph),
-                };
-                Verdict::Unknown { reason }
-            }
-            Err(_) => Verdict::Unknown {
-                reason: Reason::Budget,
-            },
+        let roots = lower::lower(&graph, &mut context);
+        let mut converse = Converse {
+            graph,
+            context,
+            roots,
+            budget: self.budget,
         };
-        Ok(Check {
-            verdict,
-            steps: context.budget.spent(),
-        })
+        Ok((converse.decide(Side::A), converse))
     }
 
     /// What the library makes of the two schemas before it compares them, as JSON for a tool
@@ -138,12 +158,102 @@ pub struct Check {
     pub steps: u64,
 }
 
+/// The converse of a check: whether `b` subsumes `a`, after
+/// [`Checker::check_with_converse`] has checked whether `a` subsumes `b`.
+///
+/// It answers the question of [`Checker::check`] with `b` and `a`, and is held to the same
+/// standard: [`Verdict::Yes`] only where no instance of `a` is left that `b` does not
+/// accept, and [`Verdict::No`] only with such an instance. It is not the same computation:
+///
+/// - **It has a budget of its own,** the whole budget of the checker, whatever the first
+///   check spent.
+/// - **Its steps are those of its own search.** What the first check built and found out
+///   was paid for there, and is not paid for again: the terms of the two schemas, the
+///   DFAs of their patterns, how the names of their objects are cut, and for each
+///   c-reference that the first check decided, whether a value satisfies it. So it mostly
+///   takes fewer steps than a check of `b` and `a` by themselves. Where the budget did not
+///   cover the terms, there is nothing to go on with, and it ends at the budget too.
+/// - **Its search may go another way.** It finds answers ready that it would have
+///   searched for, and where it is free to choose, it goes by the order in which the load
+///   met the schemas, which begins with `a` here and with `b` in a check of its own. So it
+///   may also take more steps, a counterexample may be another instance, and where both
+///   schemas hold the same unsupported keyword, the reason may name it in the other one.
+///
+/// Its steps depend only on the two schemas, their order and the settings.
+pub struct Converse<'s> {
+    graph: Graph<'s>,
+    context: Context,
+    /// The variables of `a` and of `b`, unless the budget did not cover their terms.
+    roots: Result<(VarId, VarId), Exhausted>,
+    /// The work budget of a check.
+    budget: u64,
+}
+
+impl Converse<'_> {
+    /// Does `b` accept every instance that is valid under `a`?
+    ///
+    /// In the verdict `b` is the schema that should accept everything, as in a check of `b`
+    /// and `a`: a [`Reason::Unsupported`] in `b` names it as [`Side::A`].
+    #[must_use]
+    pub fn check(mut self) -> Check {
+        // The terms are made once and paid for once. Where the budget did not cover them,
+        // there is nothing to go on with.
+        if self.roots.is_ok() {
+            self.context.budget = Budget::new(self.budget);
+        }
+        self.decide(Side::B)
+    }
+
+    /// Checks whether one schema of the load accepts every instance of the other. `wide`
+    /// is the one that should accept everything.
+    fn decide(&mut self, wide: Side) -> Check {
+        let Self { graph, context, .. } = self;
+        let outcome = self.roots.and_then(|(a, b)| match wide {
+            Side::A => normalize::decide(context, a, b),
+            Side::B => normalize::decide(context, b, a),
+        });
+        let verdict = match outcome {
+            Ok(Outcome::Yes) => Verdict::Yes,
+            Ok(Outcome::No(counterexample)) => Verdict::No { counterexample },
+            Ok(Outcome::Unknown(Cause::Number | Cause::Depth)) => Verdict::Unknown {
+                reason: Reason::Unrepresentable,
+            },
+            Ok(Outcome::Unknown(Cause::Leaf(leaf))) => {
+                let leaf = context.terms.leaf(leaf);
+                // A reason names a schema by its place in the check: the first argument or
+                // the second.
+                let schema = match (graph.node(leaf.node).side, wide) {
+                    (side, Side::A) => side,
+                    (Side::A, Side::B) => Side::B,
+                    (Side::B, Side::B) => Side::A,
+                };
+                let location = leaf.location(graph);
+                Verdict::Unknown {
+                    reason: Reason::Unsupported { schema, location },
+                }
+            }
+            Err(Exhausted) => Verdict::Unknown {
+                reason: Reason::Budget,
+            },
+        };
+        Check {
+            verdict,
+            steps: context.budget.spent(),
+        }
+    }
+}
+
+impl fmt::Debug for Converse<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Converse").finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::Side;
 
     #[test]
     fn a_check_gives_one_of_three_verdicts_and_its_steps() {
@@ -252,5 +362,166 @@ mod tests {
         let bundled = json!({"$ref": uri, "$defs": {"name": {"$id": uri, "type": "string"}}});
         assert!(Checker::new().check(&bundled, &alone).is_err());
         assert!(Checker::new().check(&bundled, &bundled).is_ok());
+    }
+
+    /// Pairs of schemas with each verdict in each direction.
+    fn pairs() -> Vec<(Value, Value)> {
+        let (text, optional) = (
+            json!({"type": "string"}),
+            json!({"type": ["string", "null"]}),
+        );
+        let integer = json!({"type": "integer"});
+        let natural = json!({"type": "integer", "minimum": 0});
+        let required = json!({"type": "object", "properties": {"p": integer}, "required": ["p"]});
+        let one = json!({"type": "object", "properties": {"p": {"const": 1}}});
+        let list = json!({
+            "$defs": {
+                "list": {
+                    "type": ["object", "null"],
+                    "properties": {"next": {"$ref": "#/$defs/list"}},
+                },
+            },
+            "$ref": "#/$defs/list",
+        });
+        let short = json!({"type": "object", "properties": {"next": {"type": "null"}}});
+        vec![
+            (optional, text),
+            (json!({"minimum": 0}), json!({"exclusiveMinimum": -1})),
+            (integer, natural),
+            (json!({"type": "array"}), json!({"uniqueItems": true})),
+            (required, one),
+            (list, short),
+        ]
+    }
+
+    #[test]
+    fn the_first_check_of_a_pair_is_the_check_itself() {
+        let checker = Checker::new();
+        for (a, b) in pairs() {
+            let (check, _) = checker.check_with_converse(&a, &b).unwrap();
+            assert_eq!(check, checker.check(&a, &b).unwrap(), "{a} {b}");
+        }
+    }
+
+    #[test]
+    fn the_converse_is_whether_b_subsumes_a() {
+        let checker = Checker::new();
+        for (a, b) in pairs() {
+            let (_, converse) = checker.check_with_converse(&a, &b).unwrap();
+            let converse = converse.check();
+            assert_eq!(
+                converse.verdict,
+                checker.subsumes(&b, &a).unwrap(),
+                "{a} {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reason_of_the_converse_names_the_schemas_as_its_arguments() {
+        // Only `b` has the keyword, and it is the first argument of the converse.
+        let (a, b) = (
+            json!({"type": "array"}),
+            json!({"type": "array", "uniqueItems": true}),
+        );
+        let (check, converse) = Checker::new().check_with_converse(&a, &b).unwrap();
+        assert_eq!(check.verdict, Verdict::Yes);
+        let reason = Reason::Unsupported {
+            schema: Side::A,
+            location: "#/uniqueItems".to_owned(),
+        };
+        assert_eq!(converse.check().verdict, Verdict::Unknown { reason });
+    }
+
+    #[test]
+    fn the_converse_has_a_budget_of_its_own() {
+        // A string that the pattern does not match is found by way of its DFA, which this
+        // budget does not cover. That everything accepts what the pattern matches takes no
+        // DFA, and the converse is decided with the budget that the first check spent.
+        let (a, b) = (json!({"pattern": "^(a|b)*a(a|b){10}$"}), json!({}));
+        let small = Checker::new().budget(1_000);
+        let (check, converse) = small.check_with_converse(&a, &b).unwrap();
+        assert_eq!(
+            check.verdict,
+            Verdict::Unknown {
+                reason: Reason::Budget
+            }
+        );
+        assert_eq!(converse.check().verdict, Verdict::Yes);
+    }
+
+    #[test]
+    fn the_converse_pays_for_no_dfa_that_the_first_check_built() {
+        // Each direction needs the DFA of the pattern, of some 8,000 states: the first
+        // looks for a string of twelve characters or more outside it, and the converse for
+        // a shorter one inside it, of which there is none. Most of the work of a check of
+        // the converse by itself is to build the DFA.
+        let a = json!({"type": "string", "pattern": "^(a|b)*a(a|b){12}$"});
+        let b = json!({"type": "string", "minLength": 12});
+        let checker = Checker::new();
+        let alone = checker.check(&b, &a).unwrap();
+        assert_eq!(alone.verdict, Verdict::Yes);
+        let (_, converse) = checker.check_with_converse(&a, &b).unwrap();
+        let converse = converse.check();
+        assert_eq!(converse.verdict, Verdict::Yes);
+        assert!(
+            converse.steps * 4 < alone.steps,
+            "{} {}",
+            converse.steps,
+            alone.steps
+        );
+    }
+
+    #[test]
+    fn an_instance_that_the_first_check_found_costs_the_converse_no_verdict_for_its_depth() {
+        // In the first check the value of `q` is a chain of 120 objects inside one another,
+        // which is handed on from the value of `p`. In the converse the same schema is asked
+        // of a value eight objects down, where the chain would make the object too deep to
+        // give, and `null` is what a task of its own finds.
+        let mut definitions = serde_json::Map::new();
+        definitions.insert("V".to_owned(), json!({"type": ["object", "null"]}));
+        definitions.insert("d0".to_owned(), json!({"type": "object"}));
+        for depth in 1..120 {
+            let inside = format!("#/$defs/d{}", depth - 1);
+            let chain = json!({
+                "type": "object",
+                "required": ["n"],
+                "properties": {"n": {"$ref": inside}},
+            });
+            definitions.insert(format!("d{depth}"), chain);
+        }
+        let b = json!({
+            "$defs": definitions,
+            "type": "object",
+            "properties": {"q": {"$ref": "#/$defs/V"}},
+            "anyOf": [
+                {
+                    "required": ["q", "p"],
+                    "allOf": [
+                        {"properties": {"p": {"$ref": "#/$defs/V"}}},
+                        {"properties": {"p": {"$ref": "#/$defs/d119"}}},
+                    ],
+                },
+                {"required": ["q"]},
+            ],
+        });
+        let mut a = json!({
+            "type": "object",
+            "required": ["v"],
+            "properties": {"v": {"type": ["object", "null"]}},
+        });
+        for _ in 0..8 {
+            a = json!({"type": "object", "required": ["m"], "properties": {"m": a}});
+        }
+        let (check, converse) = Checker::new().check_with_converse(&a, &b).unwrap();
+        let Verdict::No { counterexample } = check.verdict else {
+            panic!("{:?}", check.verdict);
+        };
+        assert!(counterexample["q"]["n"].is_object(), "{counterexample}");
+        let Verdict::No { counterexample } = converse.check().verdict else {
+            panic!("the converse is decided");
+        };
+        let inside = (0..8).fold(&counterexample, |value, _| &value["m"]);
+        assert_eq!(inside, &json!({"v": null}), "{counterexample}");
     }
 }

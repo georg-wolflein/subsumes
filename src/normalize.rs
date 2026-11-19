@@ -55,6 +55,15 @@
 //! less what its tests have spent. A test that runs out of it is given up, and the branch
 //! splits as it would have without the test. So the tests never spend more than the search
 //! that they are to shorten.
+//!
+//! # Both directions
+//!
+//! A check of both directions asks two questions of one load: whether a value satisfies the
+//! c-reference of B and the negation of A, and whether one satisfies the c-reference of A
+//! and the negation of B. What the engine finds out for good about a c-reference holds
+//! whichever question it came up in, so the second question goes on with the answers of the
+//! first. Each question is a search of its own: it begins with none of what held only while
+//! the other searched, and with a budget of its own.
 
 #[cfg(test)]
 mod exhaustive;
@@ -216,7 +225,43 @@ impl Witness {
     }
 }
 
+/// What the engine has found out for good about the terms of a load, whichever c-reference
+/// it was asked to decide.
+///
+/// "A subsumes B" asks whether a value satisfies the c-reference of B and the negation of A,
+/// and "B subsumes A" asks it of A and the negation of B: two questions about the same
+/// terms. Whether a value satisfies a c-reference is a fact about the schemas and not about
+/// the question that led to it, so the second question of a load begins with the answers of
+/// the first, as a task begins with those of the tasks before it. So it is with the
+/// language of the strings that a schema accepts, the partitions of the names of objects,
+/// and which schemas are definite.
+///
+/// The state of a search is not kept: what holds only as long as a task is at work, how
+/// often a disjunction left no alternative, and what the tests have spent. Each question
+/// begins without them.
+#[derive(Debug, Default)]
+pub(crate) struct Facts {
+    /// What is known of a c-reference for good.
+    found: HashMap<CRefId, Found>,
+    /// The language of the strings that the schema of a variable accepts, or `None` if no
+    /// language says it.
+    names: HashMap<VarId, Option<LanguageId>>,
+    partitions: Partitions,
+    /// For each variable, whether its schema may be one of which the definitions say
+    /// nothing definite. Worked out when it is first asked.
+    indefinite: Option<Vec<bool>>,
+    /// Whether an instance among the answers may be deeper than the one that a task of the
+    /// question at hand would have found: it was handed on, or an earlier question found
+    /// it. And whether an object or an array was passed over because it would be too deep
+    /// to give, which an answer may rest on.
+    handed_on: bool,
+    too_deep: bool,
+}
+
 /// Decides whether the schema of `a` accepts every instance that the schema of `b` accepts.
+///
+/// The context may have been asked before, the other way round. Then this question begins
+/// with what that one found out for good; see [`Facts`].
 ///
 /// # Errors
 ///
@@ -225,6 +270,10 @@ pub(crate) fn decide(context: &mut Context, a: VarId, b: VarId) -> Result<Outcom
     let terms = &mut context.terms;
     let (accepted, rejected) = (terms.literal(b, false), terms.literal(a, true));
     let both = terms.both(accepted, rejected);
+    // The answers of an earlier question were found by another search. An instance among
+    // them may be deeper than the one that this question would find, as one that is handed
+    // on may be.
+    context.facts.handed_on |= !context.facts.found.is_empty();
     let mut hands_on = true;
     loop {
         let spent_before = context.budget.spent();
@@ -232,17 +281,11 @@ pub(crate) fn decide(context: &mut Context, a: VarId, b: VarId) -> Result<Outcom
             context: &mut *context,
             unfoldings: Vec::new(),
             tasks: Vec::new(),
-            found: HashMap::new(),
             assumed: HashMap::new(),
             at_work: HashMap::new(),
             answers: 0,
-            names: HashMap::new(),
-            partitions: Partitions::default(),
             dead_ends: HashMap::new(),
             hands_on,
-            handed_on: false,
-            too_deep: false,
-            indefinite: None,
             testing: None,
             relied: false,
             spent_before,
@@ -252,12 +295,14 @@ pub(crate) fn decide(context: &mut Context, a: VarId, b: VarId) -> Result<Outcom
         return Ok(match engine.decide(both)? {
             Found::Nothing => Outcome::Yes,
             // The counterexample is the one instance that is written out.
-            Found::Instance(witness) => Outcome::No(witness.written(&mut engine.context.budget)?),
-            // An instance that was handed on may be deeper than the one that a task of
-            // its own gives. So where a value was passed over for its depth, the check is
-            // made again without handing instances on: the answer is then the one that
-            // it was before instances were handed on.
-            Found::Unknown(_) if engine.handed_on && engine.too_deep => {
+            Found::Instance(witness) => Outcome::No(witness.written(&mut context.budget)?),
+            // An instance that was handed on, or that an earlier question found, may be
+            // deeper than the one that a task of its own gives. So where a value was
+            // passed over for its depth, the check is made again with nothing found and
+            // without handing instances on: the answer is then the one that it was before
+            // instances were handed on.
+            Found::Unknown(_) if context.facts.handed_on && context.facts.too_deep => {
+                context.facts = Facts::default();
                 hands_on = false;
                 continue;
             }
@@ -583,37 +628,26 @@ enum Given {
     Needs(Vec<CRefId>),
 }
 
+/// The search that answers one question. What it finds out for good, it keeps with the
+/// context, in its [`Facts`].
 struct Engine<'c> {
     context: &'c mut Context,
     unfoldings: Vec<Unfolding>,
     /// The c-references that are being decided. The last is at work, and each of the
     /// others waits for the one after it.
     tasks: Vec<Task>,
-    /// What is known of a c-reference for good.
-    found: HashMap<CRefId, Found>,
-    /// What is known of one for as long as tasks that are at work accept nothing.
+    /// What is known of a c-reference for as long as tasks that are at work accept nothing.
     assumed: HashMap<CRefId, Assumed>,
     /// Where on the stack the task of a c-reference is.
     at_work: HashMap<CRefId, usize>,
     /// How many answers were found so far.
     answers: u64,
-    /// The language of the strings that the schema of a variable accepts, or `None` if no
-    /// language says it.
-    names: HashMap<VarId, Option<LanguageId>>,
-    partitions: Partitions,
     /// How often each disjunction left a branch with no alternative: every one of them was
     /// refuted before it came to a split. A branch splits on the one that did so most often
     /// first, since it is likely to do so again whatever the other disjunctions are split to.
     dead_ends: HashMap<Disjunction, u32>,
-    /// Whether an instance is handed on to the c-references that ask no more, whether one
-    /// was, and whether an object or an array was passed over because it would be too
-    /// deep to give.
+    /// Whether an instance is handed on to the c-references that ask no more.
     hands_on: bool,
-    handed_on: bool,
-    too_deep: bool,
-    /// For each variable, whether its schema may be one of which the definitions say
-    /// nothing definite. Worked out when it is first asked.
-    indefinite: Option<Vec<bool>>,
     /// The test of whether a branch entails a disjunction that is being made, while its
     /// copy of the branch waits. One test is made at a time.
     testing: Option<Testing>,
@@ -699,9 +733,10 @@ impl Engine<'_> {
                 served.push(*other);
             }
         }
+        let facts = &mut self.context.facts;
         for other in served {
-            self.handed_on = true;
-            self.found.insert(other, instance.clone());
+            facts.handed_on = true;
+            facts.found.insert(other, instance.clone());
         }
         Ok(())
     }
@@ -714,7 +749,7 @@ impl Engine<'_> {
             _ if self.at_work.contains_key(&of) => Some(Found::Nothing),
             _ => {
                 let assumed = self.assumed.get(&of).map(|assumed| &assumed.found);
-                self.found.get(&of).or(assumed).cloned()
+                self.context.facts.found.get(&of).or(assumed).cloned()
             }
         }
     }
@@ -769,6 +804,7 @@ impl Engine<'_> {
         // holds for good only if no task that is still at work was taken so.
         let for_good = matches!(found, Found::Instance(_)) || task.lowest >= at;
         if for_good {
+            let known = &mut self.context.facts.found;
             if nothing {
                 // And so does everything that only took this task so.
                 let settled = |assumed: &Assumed| assumed.lowest >= at;
@@ -780,10 +816,10 @@ impl Engine<'_> {
                     .collect();
                 for of in ids {
                     let assumed = self.assumed.remove(&of).expect("it was just found");
-                    self.found.insert(of, assumed.found);
+                    known.insert(of, assumed.found);
                 }
             }
-            self.found.insert(task.of, found.clone());
+            known.insert(task.of, found.clone());
             return;
         }
         if nothing {
@@ -1016,7 +1052,8 @@ impl Engine<'_> {
             return Ok(None);
         }
         let variable = self.unfoldings[stands_in].variable;
-        let indefinite = self.indefinite.get_or_insert_with(|| indefinite(terms));
+        let facts = &mut self.context.facts;
+        let indefinite = facts.indefinite.get_or_insert_with(|| indefinite(terms));
         if indefinite[variable.index()] {
             return Ok(None);
         }
@@ -1072,13 +1109,13 @@ impl Engine<'_> {
     /// over for its depth is none that the check has missed.
     fn refutes(&mut self, branch: &mut Branch) -> Result<Option<Settled>, Exhausted> {
         let lowest = self.tasks.last().map(|task| task.lowest);
-        let too_deep = self.too_deep;
+        let too_deep = self.context.facts.too_deep;
         self.relied = false;
         let settled = self.settle(branch);
         if let (Some(task), Some(lowest)) = (self.tasks.last_mut(), lowest) {
             task.lowest = lowest;
         }
-        self.too_deep = too_deep;
+        self.context.facts.too_deep = too_deep;
         Ok((!self.relied).then_some(settled?))
     }
 
@@ -1235,11 +1272,8 @@ impl Engine<'_> {
         let Self {
             context,
             tasks,
-            found,
             assumed,
             at_work,
-            partitions,
-            too_deep,
             relied,
             ..
         } = self;
@@ -1247,7 +1281,14 @@ impl Engine<'_> {
             terms,
             languages,
             budget,
+            facts,
         } = &mut **context;
+        let Facts {
+            found,
+            partitions,
+            too_deep,
+            ..
+        } = facts;
         // The task at work. The language of the names of an object is worked out with none.
         let mut lowest = tasks.last().map_or(usize::MAX, |task| task.lowest);
         // What the engine knows of a c-reference. One that a task is deciding, or that was
@@ -1476,7 +1517,7 @@ impl Engine<'_> {
     /// to its end: each gives the strings that it leaves, and those of all are the
     /// language. A branch about strings waits for nothing, so this is done at once.
     fn names(&mut self, variable: VarId) -> Result<Option<LanguageId>, Exhausted> {
-        if let Some(known) = self.names.get(&variable) {
+        if let Some(known) = self.context.facts.names.get(&variable) {
             return Ok(*known);
         }
         let terms = &mut self.context.terms;
@@ -1520,7 +1561,7 @@ impl Engine<'_> {
                 _ => None,
             };
         }
-        self.names.insert(variable, all);
+        self.context.facts.names.insert(variable, all);
         Ok(all)
     }
 

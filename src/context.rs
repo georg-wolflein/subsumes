@@ -1,15 +1,22 @@
-//! The state of one check. Nothing in it outlives the check or is shared with another.
+//! The state of a load of two schemas: of a check, and of its converse if that is asked for.
+//! Nothing in it outlives the two or is shared with another pair.
 
 use crate::language::{Languages, RegexDialect};
+use crate::normalize::Facts;
 use crate::term::Terms;
 
-/// Everything that a check builds on its way: the terms, the languages of strings, and the
-/// work it may still do.
+/// Everything that a check builds on its way: the terms, the languages of strings, what the
+/// engine has found out for good, and the work it may still do.
+///
+/// All but the budget is about the two schemas and not about which of them is to accept the
+/// instances of the other. So the converse goes on with the same context, and with a budget
+/// of its own.
 #[derive(Debug)]
 pub(crate) struct Context {
     pub budget: Budget,
     pub terms: Terms,
     pub languages: Languages,
+    pub facts: Facts,
 }
 
 impl Context {
@@ -19,6 +26,7 @@ impl Context {
             budget: Budget::new(budget),
             terms: Terms::default(),
             languages: Languages::new(dialect),
+            facts: Facts::default(),
         }
     }
 }
