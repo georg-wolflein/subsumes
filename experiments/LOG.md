@@ -112,4 +112,4 @@ Steps of the check that A subsumes B:
 | 8 | at the budget | 9,381,607 | 24,999 |
 
 - The baseline takes seven to eight times the steps for each kind that is added, and E1 five times: both are exponential, and E1 only has the smaller base.
-- E2 takes about one and a half times the steps for each kind, and less with each one: the steps grow with a power of the number of kinds, about the third.
+- E2 takes less than twice the steps for each kind that is added, and less with each one, 1.9 times for the fifth and 1.5 times for the eighth: the steps grow with about the third power of the number of kinds.
