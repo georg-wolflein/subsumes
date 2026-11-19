@@ -4,9 +4,9 @@
 //! alike have one id, so equal ids mean equal terms.
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
+use crate::hash::{Map, Set};
 use crate::language::{LanguageId, Languages};
 use crate::rational::{Rational, shown};
 use crate::schema::{Graph, NodeId};
@@ -239,7 +239,7 @@ pub(crate) struct Variable {
 struct Once {
     terms: Vec<TermId>,
     /// The terms as a set, once they are more than a few.
-    seen: HashSet<TermId>,
+    seen: Set<TermId>,
 }
 
 impl Once {
@@ -251,7 +251,7 @@ impl Once {
     fn of(terms: usize) -> Self {
         Self {
             terms: Vec::with_capacity(terms),
-            seen: HashSet::new(),
+            seen: Set::default(),
         }
     }
 
@@ -276,13 +276,18 @@ impl Once {
 #[derive(Debug, Default)]
 pub(crate) struct Terms {
     terms: Vec<Term>,
-    ids: HashMap<Term, TermId>,
+    ids: Map<Term, TermId>,
     leaves: Vec<Leaf>,
-    leaf_ids: HashMap<(TypeSet, String), LeafId>,
+    leaf_ids: Map<(TypeSet, String), LeafId>,
     variables: Vec<Variable>,
     /// The c-references of more than no variable, the first of them with the id 2.
     references: Vec<Box<[Literal]>>,
-    reference_ids: HashMap<Box<[Literal]>, CRefId>,
+    reference_ids: Map<Box<[Literal]>, CRefId>,
+    /// What two c-references say together, by the smaller of the two first. The engine asks
+    /// this of the same two far more often than it makes a new c-reference.
+    pairs: Map<(CRefId, CRefId), CRefId>,
+    /// The variables of a c-reference that is being put together, kept for their memory.
+    merged: Vec<Literal>,
 }
 
 impl Terms {
@@ -599,7 +604,7 @@ impl Terms {
                 _ => break,
             }
         }
-        self.reference_of(vec![(variable, negated)])
+        self.reference_of(&[(variable, negated)])
     }
 
     /// The variables of a c-reference, in order. The two that are of no variable have none.
@@ -619,9 +624,23 @@ impl Terms {
         if a == Self::ANYTHING || b == Self::NOTHING {
             return b;
         }
+        // The two lists are merged in order, so the order of the two does not matter.
+        let pair = (a.min(b), a.max(b));
+        if let Some(known) = self.pairs.get(&pair) {
+            return *known;
+        }
+        let both = self.merge(a, b);
+        self.pairs.insert(pair, both);
+        both
+    }
+
+    /// The c-reference of the variables of two, in order.
+    fn merge(&mut self, a: CRefId, b: CRefId) -> CRefId {
+        let mut all = std::mem::take(&mut self.merged);
+        all.clear();
         let (of_a, of_b) = (self.literals(a), self.literals(b));
-        let mut all = Vec::with_capacity(of_a.len() + of_b.len());
         let (mut at_a, mut at_b) = (0, 0);
+        let mut nothing = false;
         while at_a < of_a.len() || at_b < of_b.len() {
             let next = match (of_a.get(at_a), of_b.get(at_b)) {
                 (Some(first), Some(second)) => *first.min(second),
@@ -632,15 +651,22 @@ impl Terms {
             at_b += usize::from(of_b.get(at_b) == Some(&next));
             // A variable comes right before its negation.
             if all.last() == Some(&(next.0, !next.1)) {
-                return Self::NOTHING;
+                nothing = true;
+                break;
             }
             all.push(next);
         }
-        self.reference_of(all)
+        let both = if nothing {
+            Self::NOTHING
+        } else {
+            self.reference_of(&all)
+        };
+        self.merged = all;
+        both
     }
 
-    fn reference_of(&mut self, literals: Vec<Literal>) -> CRefId {
-        if let Some(known) = self.reference_ids.get(literals.as_slice()) {
+    fn reference_of(&mut self, literals: &[Literal]) -> CRefId {
+        if let Some(known) = self.reference_ids.get(literals) {
             return *known;
         }
         let literals: Box<[Literal]> = literals.into();
@@ -955,6 +981,38 @@ mod tests {
         assert_eq!(terms.both(xy, Terms::NOTHING), Terms::NOTHING);
         assert_eq!(terms.both(Terms::NOTHING, xy), Terms::NOTHING);
         assert!(terms.literals(Terms::ANYTHING).is_empty());
+    }
+
+    #[test]
+    fn two_c_references_that_are_asked_again_make_no_other() {
+        let mut terms = Terms::default();
+        let variables: Vec<VarId> = (0..3)
+            .map(|index| {
+                let variable = terms.new_variable(NodeId::new(0));
+                terms.variable_mut(variable).body = leaf(&mut terms, &format!("{index}"));
+                variable
+            })
+            .collect();
+        let [x, y, z] = [0, 1, 2].map(|index| terms.literal(variables[index], false));
+        let not_y = terms.literal(variables[1], true);
+        let (xy, x_not_y) = (terms.both(x, y), terms.both(x, not_y));
+        let nothing = terms.both(xy, not_y);
+        let made = terms.references.len();
+        // Asked again, in either order, the two give what they gave, also where that is
+        // nothing, and the conjunction of what was made is one of them.
+        for _ in 0..2 {
+            assert_eq!(terms.both(y, x), xy);
+            assert_eq!(terms.both(not_y, x), x_not_y);
+            assert_eq!(terms.both(not_y, xy), nothing);
+            assert_eq!(terms.both(xy, x_not_y), Terms::NOTHING);
+            assert_eq!(terms.literal(variables[0], false), x);
+        }
+        assert_eq!(nothing, Terms::NOTHING);
+        assert_eq!(terms.references.len(), made);
+        let xyz = terms.both(xy, z);
+        assert_eq!(terms.references.len(), made + 1);
+        assert_eq!(terms.both(z, xy), xyz);
+        assert_eq!(terms.references.len(), made + 1);
     }
 
     #[test]

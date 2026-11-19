@@ -59,7 +59,8 @@
 #[cfg(test)]
 mod exhaustive;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::iter::Peekable;
 use std::rc::Rc;
 
 use serde_json::Value;
@@ -68,9 +69,10 @@ use crate::canonical::array::Arrays;
 use crate::canonical::number::Numbers;
 use crate::canonical::object::{Objects, Partitions};
 use crate::canonical::string::Strings;
-use crate::canonical::{Left, Solver};
+use crate::canonical::{Left, Solver, add};
 use crate::context::{Budget, Context, Exhausted};
 use crate::generate;
+use crate::hash::{Map, Set};
 use crate::language::{LanguageId, Languages};
 use crate::term::{CRefId, InstanceType, Leaf, LeafId, Term, TermId, Terms, TypeSet, VarId};
 
@@ -230,15 +232,16 @@ pub(crate) fn decide(context: &mut Context, a: VarId, b: VarId) -> Result<Outcom
         let spent_before = context.budget.spent();
         let mut engine = Engine {
             context: &mut *context,
+            blank: Branch::default(),
             unfoldings: Vec::new(),
             tasks: Vec::new(),
-            found: HashMap::new(),
-            assumed: HashMap::new(),
-            at_work: HashMap::new(),
+            found: Map::default(),
+            assumed: Map::default(),
+            at_work: Map::default(),
             answers: 0,
-            names: HashMap::new(),
+            names: Map::default(),
             partitions: Partitions::default(),
-            dead_ends: HashMap::new(),
+            dead_ends: Map::default(),
             hands_on,
             handed_on: false,
             too_deep: false,
@@ -247,7 +250,7 @@ pub(crate) fn decide(context: &mut Context, a: VarId, b: VarId) -> Result<Outcom
             relied: false,
             spent_before,
             spent_on_tests: 0,
-            ran_out: HashMap::new(),
+            ran_out: Map::default(),
         };
         return Ok(match engine.decide(both)? {
             Found::Nothing => Outcome::Yes,
@@ -318,6 +321,13 @@ struct Unfolding {
     within: Option<usize>,
 }
 
+/// A conjunction in the making.
+///
+/// A split copies its branch for each alternative, and most alternatives are refuted when
+/// they have added to one part of it. So every part that grows with the schemas is held
+/// by a reference count: a copy shares it, and a branch that writes to a part which it
+/// shares copies that part first (copy on write). To copy a branch then allocates nothing,
+/// and what an alternative leaves alone is never copied for it.
 #[derive(Debug, Clone)]
 struct Branch {
     /// The types that an instance may still have.
@@ -326,37 +336,37 @@ struct Branch {
     booleans: [bool; 2],
     /// The numbers that an instance may still be, and whether anything was asked of them
     /// since it was last seen that there are some.
-    numbers: Numbers,
+    numbers: Rc<Numbers>,
     numbers_asked: bool,
     /// The same for the strings.
-    strings: Strings,
+    strings: Rc<Strings>,
     strings_asked: bool,
-    /// And for the objects. An object may be left only as far as the engine knows: then
-    /// this stands between the branch and an object.
+    /// And for the objects, which share their parts themselves. An object may be left only
+    /// as far as the engine knows: then this stands between the branch and an object.
     objects: Objects,
     objects_asked: bool,
     objects_depend: Option<Cause>,
     /// And the same for the arrays.
-    arrays: Arrays,
+    arrays: Rc<Arrays>,
     arrays_asked: bool,
     arrays_depend: Option<Cause>,
     /// The leaves that must hold, and the types that they are about.
-    holds: BTreeSet<LeafId>,
+    holds: Rc<BTreeSet<LeafId>>,
     covered: TypeSet,
     /// The leaves that must not hold.
-    fails: BTreeSet<LeafId>,
+    fails: Rc<BTreeSet<LeafId>>,
     /// The variables taken for true, with `false`, and those taken for false, with `true`.
     /// Each is unfolded once in a branch, and this is its unfolding.
-    taken: BTreeMap<(VarId, bool), usize>,
+    taken: Rc<BTreeMap<(VarId, bool), usize>>,
     /// The references to a variable that was taken before: the unfolding of the variable,
     /// and the unfolding in which the reference stands.
-    met: BTreeSet<(usize, usize)>,
+    met: Rc<BTreeSet<(usize, usize)>>,
     /// What is still to be taken in, in the order in which it came up. What a term unfolds
     /// to waits behind everything that was there before, so that a variable meets its own
     /// negation before either is opened.
     todo: VecDeque<Item>,
     /// The disjunctions that were met and not split yet.
-    choices: VecDeque<Item>,
+    choices: Rc<VecDeque<Item>>,
     /// How many of them, the first ones, the branch has from the split that it is an
     /// alternative of. The others it brought itself.
     inherited: usize,
@@ -370,23 +380,23 @@ impl Default for Branch {
         Self {
             types: TypeSet::ALL,
             booleans: [true; 2],
-            numbers: Numbers::default(),
+            numbers: Rc::default(),
             numbers_asked: false,
-            strings: Strings::default(),
+            strings: Rc::default(),
             strings_asked: false,
             objects: Objects::default(),
             objects_asked: false,
             objects_depend: None,
-            arrays: Arrays::default(),
+            arrays: Rc::default(),
             arrays_asked: false,
             arrays_depend: None,
-            holds: BTreeSet::new(),
+            holds: Rc::default(),
             covered: TypeSet::NONE,
-            fails: BTreeSet::new(),
-            taken: BTreeMap::new(),
-            met: BTreeSet::new(),
+            fails: Rc::default(),
+            taken: Rc::default(),
+            met: Rc::default(),
             todo: VecDeque::new(),
-            choices: VecDeque::new(),
+            choices: Rc::default(),
             inherited: 0,
             and: None,
         }
@@ -407,6 +417,18 @@ impl Branch {
         let copied = (leaves + variables + self.choices.len()) as u64;
         let values = self.objects.weight() + self.arrays.weight();
         copied + self.numbers.weight() + self.strings.weight() + values
+    }
+
+    /// Takes in what an alternative holds, after what is still to be taken in. A branch
+    /// that was split has nothing left to take in, so it takes the list of the alternative
+    /// as it is.
+    fn take_in(&mut self, alternative: Alternative) {
+        if self.todo.is_empty() {
+            self.todo = alternative.holds.into();
+        } else {
+            self.todo.extend(alternative.holds);
+        }
+        self.and = alternative.and;
     }
 
     /// Keeps only instances of these types. Returns whether any are left.
@@ -430,10 +452,10 @@ impl Branch {
         let about = terms.leaf(leaf).domain;
         if negated {
             // A leaf fails only for an instance that it is about.
-            self.fails.insert(leaf);
+            add(&mut self.fails, leaf);
             self.restrict(about) && !self.holds.contains(&leaf)
         } else {
-            self.holds.insert(leaf);
+            add(&mut self.holds, leaf);
             self.covered = self.covered.union(about);
             !self.fails.contains(&leaf)
         }
@@ -539,9 +561,13 @@ struct Test {
 
 /// A branch that was split on one of its disjunctions.
 struct Split {
-    branch: Branch,
+    /// The branch, until its last alternative is made: that one is the branch itself, and
+    /// not a copy of it.
+    branch: Option<Branch>,
+    /// The types of which the branch is known to accept an instance if it stands.
+    free: TypeSet,
     /// The alternatives of the disjunction that are still to come.
-    still_to_come: Box<dyn Iterator<Item = Alternative>>,
+    still_to_come: Peekable<Box<dyn Iterator<Item = Alternative>>>,
     /// The disjunction, unless this is the split in one that a task begins as.
     choice: Option<Disjunction>,
     /// Whether the disjunction came with the alternative that the split below was at: it
@@ -585,26 +611,29 @@ enum Given {
 
 struct Engine<'c> {
     context: &'c mut Context,
+    /// A branch of which nothing is asked yet. Every task begins as a copy of it, which
+    /// shares its parts, so to begin a task allocates none of them.
+    blank: Branch,
     unfoldings: Vec<Unfolding>,
     /// The c-references that are being decided. The last is at work, and each of the
     /// others waits for the one after it.
     tasks: Vec<Task>,
     /// What is known of a c-reference for good.
-    found: HashMap<CRefId, Found>,
+    found: Map<CRefId, Found>,
     /// What is known of one for as long as tasks that are at work accept nothing.
-    assumed: HashMap<CRefId, Assumed>,
+    assumed: Map<CRefId, Assumed>,
     /// Where on the stack the task of a c-reference is.
-    at_work: HashMap<CRefId, usize>,
+    at_work: Map<CRefId, usize>,
     /// How many answers were found so far.
     answers: u64,
     /// The language of the strings that the schema of a variable accepts, or `None` if no
     /// language says it.
-    names: HashMap<VarId, Option<LanguageId>>,
+    names: Map<VarId, Option<LanguageId>>,
     partitions: Partitions,
     /// How often each disjunction left a branch with no alternative: every one of them was
     /// refuted before it came to a split. A branch splits on the one that did so most often
     /// first, since it is likely to do so again whatever the other disjunctions are split to.
-    dead_ends: HashMap<Disjunction, u32>,
+    dead_ends: Map<Disjunction, u32>,
     /// Whether an instance is handed on to the c-references that ask no more, whether one
     /// was, and whether an object or an array was passed over because it would be too
     /// deep to give.
@@ -627,7 +656,7 @@ struct Engine<'c> {
     /// The allowance of the last test of a disjunction, if the test ran out of it. The
     /// next test of that disjunction is made only with twice as much, so that the tests
     /// which run out spend no more together than twice what the last of them does.
-    ran_out: HashMap<Disjunction, u64>,
+    ran_out: Map<Disjunction, u64>,
 }
 
 impl Engine<'_> {
@@ -691,8 +720,7 @@ impl Engine<'_> {
         for other in &task.wanted {
             let terms = &self.context.terms;
             let (named, literals) = (terms.literals(of), terms.literals(*other));
-            let within = |literal| named.binary_search(literal).is_ok();
-            let asks_no_more = literals.iter().all(within);
+            let asks_no_more = within(literals, named);
             let steps = 1 + (literals.len() / 8) as u64;
             self.context.budget.charge(steps)?;
             if asks_no_more && self.known(*other).is_none() {
@@ -734,11 +762,13 @@ impl Engine<'_> {
         }
         let whole: Box<dyn Iterator<Item = Alternative>> = Box::new(std::iter::once(whole.into()));
         self.at_work.insert(of, self.tasks.len());
+        let branch = self.blank.clone();
         self.tasks.push(Task {
             of,
             splits: vec![Split {
-                branch: Branch::default(),
-                still_to_come: whole,
+                free: branch.free(),
+                branch: Some(branch),
+                still_to_come: whole.peekable(),
                 choice: None,
                 brought: false,
                 stood: true,
@@ -817,7 +847,7 @@ impl Engine<'_> {
                     // Every alternative was followed to its end.
                     return Ok(Some(depends.map_or(Found::Nothing, Found::Unknown)));
                 };
-                if depends.is_some() && split.branch.free().is_empty() {
+                if depends.is_some() && split.free.is_empty() {
                     task.splits.pop();
                     self.stood();
                     return Ok(None);
@@ -836,11 +866,21 @@ impl Engine<'_> {
                     }
                     return Ok(None);
                 };
-                self.context.budget.charge(1 + split.branch.weight() / 32)?;
-                let mut branch = split.branch.clone();
+                let split_branch = split.branch.as_ref();
+                let split_branch = split_branch.expect("a split has its branch until the last");
+                self.context.budget.charge(1 + split_branch.weight() / 32)?;
+                // The last alternative takes the branch itself, which no other alternative
+                // needs any more, so what it changes is not copied first.
+                let mut branch = if split.still_to_come.peek().is_some() {
+                    split_branch.clone()
+                } else {
+                    split
+                        .branch
+                        .take()
+                        .expect("a split has its branch until the last")
+                };
                 branch.inherited = branch.choices.len();
-                branch.todo.extend(alternative.holds);
-                branch.and = alternative.and;
+                branch.take_in(alternative);
                 branch
             }
         };
@@ -940,8 +980,9 @@ impl Engine<'_> {
         };
         let task = self.tasks.last_mut().expect("a task is at work");
         task.splits.push(Split {
-            branch,
-            still_to_come,
+            free: branch.free(),
+            branch: Some(branch),
+            still_to_come: still_to_come.peekable(),
             choice,
             brought,
             stood: false,
@@ -1145,7 +1186,10 @@ impl Engine<'_> {
                 }
             }
         }
-        let choice = branch.choices.remove(most.0)?;
+        if branch.choices.is_empty() {
+            return None;
+        }
+        let choice = Rc::make_mut(&mut branch.choices).remove(most.0)?;
         let brought = most.0 >= branch.inherited;
         if !brought {
             branch.inherited -= 1;
@@ -1191,7 +1235,7 @@ impl Engine<'_> {
         } = &mut *self.context;
         if std::mem::take(&mut branch.strings_asked)
             && branch.types.contains(InstanceType::String)
-            && branch.strings.is_empty(languages, budget)?
+            && Rc::make_mut(&mut branch.strings).is_empty(languages, budget)?
             && !branch.restrict(STRING.complement())
         {
             return Ok(Settled::Refuted);
@@ -1358,7 +1402,7 @@ impl Engine<'_> {
                 let of_numbers_only = negated != matches!(found, Term::NumConst(_));
                 let stands = !of_numbers_only || branch.restrict(NUMBER);
                 if stands && branch.types.contains(InstanceType::Number) {
-                    branch.numbers.take(found, negated);
+                    Rc::make_mut(&mut branch.numbers).take(found, negated);
                     branch.numbers_asked = true;
                 }
                 stands
@@ -1370,7 +1414,7 @@ impl Engine<'_> {
                 let stands = !of_strings_only || branch.restrict(STRING);
                 if stands && branch.types.contains(InstanceType::String) {
                     let languages = &mut self.context.languages;
-                    branch.strings.take(found, negated, languages);
+                    Rc::make_mut(&mut branch.strings).take(found, negated, languages);
                     branch.strings_asked = true;
                 }
                 stands
@@ -1408,7 +1452,7 @@ impl Engine<'_> {
                     // What is asked of every item from a position on is taken in at each
                     // position that the branch tells apart.
                     budget.charge(branch.arrays.weight() / 8)?;
-                    branch.arrays.take(&found, negated, terms);
+                    Rc::make_mut(&mut branch.arrays).take(&found, negated, terms);
                     branch.arrays_asked = true;
                 }
                 stands
@@ -1424,7 +1468,7 @@ impl Engine<'_> {
                 true
             }
             (Term::AnyOf(_), false) | (Term::AllOf(_), true) | (Term::OneOf(_), _) => {
-                branch.choices.push_back(item);
+                Rc::make_mut(&mut branch.choices).push_back(item);
                 true
             }
             (Term::Not(inner), _) => {
@@ -1486,7 +1530,7 @@ impl Engine<'_> {
         ];
         let whole: Box<dyn Iterator<Item = Alternative>> = Box::new(std::iter::once(whole.into()));
         let mut splits: Vec<(Branch, Box<dyn Iterator<Item = Alternative>>)> =
-            vec![(Branch::default(), whole)];
+            vec![(self.blank.clone(), whole)];
         let mut all = Some(Languages::NOTHING);
         while let Some((split, still_to_come)) = splits.last_mut() {
             let (Some(alternative), Some(so_far)) = (still_to_come.next(), all) else {
@@ -1495,8 +1539,7 @@ impl Engine<'_> {
             };
             self.context.budget.charge(1 + split.weight() / 32)?;
             let mut branch = split.clone();
-            branch.todo.extend(alternative.holds);
-            branch.and = alternative.and;
+            branch.take_in(alternative);
             if !matches!(self.settle(&mut branch)?, Settled::Stands) {
                 continue;
             }
@@ -1505,7 +1548,8 @@ impl Engine<'_> {
                 splits.push((branch, alternatives));
                 continue;
             }
-            if let Some(choice) = branch.choices.pop_front() {
+            if let Some(choice) = branch.choices.front().copied() {
+                Rc::make_mut(&mut branch.choices).pop_front();
                 let alternatives = alternatives(&self.context.terms, &choice);
                 splits.push((branch, alternatives));
                 continue;
@@ -1562,7 +1606,7 @@ impl Engine<'_> {
             if self.leads_to(branch, open, from, false)? {
                 self.depend_on_recursion(branch, variable, from);
             } else {
-                branch.met.insert((open, from));
+                add(&mut branch.met, (open, from));
             }
             return Ok(true);
         }
@@ -1572,7 +1616,7 @@ impl Engine<'_> {
             negated,
             within,
         });
-        branch.taken.insert((variable, negated), unfolding);
+        Rc::make_mut(&mut branch.taken).insert((variable, negated), unfolding);
         branch.todo.push_back(Item {
             term: self.context.terms.variable(variable).body,
             negated,
@@ -1615,7 +1659,7 @@ impl Engine<'_> {
         let closes = self.unfoldings[from].variable;
         let closes = self.context.terms.variable(closes).node;
         let leaf = self.context.terms.recursion(variable, closes);
-        branch.holds.insert(leaf);
+        add(&mut branch.holds, leaf);
         branch.covered = TypeSet::ALL;
     }
 }
@@ -1640,7 +1684,7 @@ fn indefinite(terms: &Terms) -> Vec<bool> {
     let mut at_all: Vec<Vec<usize>> = vec![Vec::new(); count];
     let mut refers_to = vec![0_usize; count];
     let mut indefinite = vec![false; count];
-    let (mut seen, mut pending) = (HashSet::new(), Vec::new());
+    let (mut seen, mut pending) = (Set::default(), Vec::new());
     for (id, variable) in terms.variables() {
         let from = id.index();
         seen.clear();
@@ -1717,6 +1761,17 @@ fn holds_a_schema(leaf: &Leaf) -> bool {
     ];
     leaf.keyword
         .is_none_or(|keyword| !WITHOUT_A_SCHEMA.contains(&keyword))
+}
+
+/// Whether every element of a list in order is in another list in order. The two are gone
+/// through once, side by side.
+fn within<T: Ord>(some: &[T], all: &[T]) -> bool {
+    if some.len() > all.len() {
+        return false;
+    }
+    let mut all = all.iter();
+    some.iter()
+        .all(|wanted| all.by_ref().find(|had| *had >= wanted) == Some(wanted))
 }
 
 /// The alternatives of a disjunction, each made when it is asked for.
@@ -4522,6 +4577,42 @@ mod tests {
                 "is(false) and one of [type(null)]",
             ]
         );
+    }
+
+    #[test]
+    fn every_alternative_of_a_split_begins_with_the_branch_as_it_was() {
+        // The alternatives share what the branch holds, and the last one is the branch
+        // itself. Each of the first three asks something of the objects and is refuted,
+        // and none of that may be asked of the next.
+        let a = json!({"properties": {"a": {"type": "string"}}});
+        let b = json!({
+            "$defs": {"s": {"type": "string"}},
+            "anyOf": [
+                {"properties": {"a": {"type": "string"}}},
+                {"properties": {"a": {"$ref": "#/$defs/s"}}},
+                {"required": ["b"], "properties": {"b": false}},
+                {"required": ["a"]}
+            ]
+        });
+        assert_eq!(counterexample(&a, &b), json!({"a": null}));
+        // And a split on a disjunction of the branch of each alternative.
+        let b = json!({
+            "allOf": [
+                {"anyOf": [{"properties": {"a": {"type": "string"}}}, {"required": ["a"]}]},
+                {"anyOf": [{"properties": {"a": {"type": "string"}}}, {"minProperties": 1}]}
+            ]
+        });
+        assert_eq!(counterexample(&a, &b), json!({"a": null}));
+    }
+
+    #[test]
+    fn a_list_in_order_is_within_another_in_order() {
+        assert!(within(&[2, 5], &[1, 2, 3, 5]));
+        assert!(within::<u32>(&[], &[]));
+        assert!(within(&[1], &[1]));
+        assert!(!within(&[2, 4], &[1, 2, 3, 5]));
+        assert!(!within(&[6], &[1, 2, 3, 5]));
+        assert!(!within(&[1, 2], &[1]));
     }
 
     #[test]

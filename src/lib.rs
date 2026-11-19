@@ -46,6 +46,7 @@ mod context;
 mod error;
 mod formats;
 mod generate;
+mod hash;
 mod inspect;
 mod language;
 mod lower;
