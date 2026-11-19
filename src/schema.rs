@@ -21,6 +21,7 @@ mod link;
 mod oracle;
 mod parse;
 
+use std::convert::Infallible;
 use std::fmt::Write;
 
 use serde_json::{Number, Value};
@@ -194,10 +195,32 @@ pub(crate) enum Count {
 }
 
 impl<'a> Keywords<'a> {
-    /// Every subschema that a keyword applies, with the keyword and its place in it, in an
-    /// order that depends on nothing but the keywords. The targets of `$ref` and `$dynamicRef`
-    /// are not among them.
+    /// Every subschema that a keyword applies, with the keyword and its place in it, in the
+    /// order of [`Self::visit_subschemas`].
     pub fn subschemas(&self) -> Vec<(&'static str, Part<'a>, NodeId)> {
+        let mut all = Vec::new();
+        self.visit_subschemas(|keyword, part, schema| {
+            all.push((keyword, part, schema));
+            Ok::<_, Infallible>(())
+        })
+        .unwrap_or_else(|never| match never {});
+        all
+    }
+
+    /// Visits every subschema that a keyword applies, with the keyword and its place in it,
+    /// in an order that depends on nothing but the keywords, until a visit fails. The targets
+    /// of `$ref` and `$dynamicRef` are not among them.
+    ///
+    /// Every schema that is reached is visited so, by the dynamic scopes and by the classes,
+    /// and a visit is a call and no iterator that holds every keyword.
+    ///
+    /// # Errors
+    ///
+    /// The first error of a visit, after which no subschema is visited.
+    pub fn visit_subschemas<E>(
+        &self,
+        mut visit: impl FnMut(&'static str, Part<'a>, NodeId) -> Result<(), E>,
+    ) -> Result<(), E> {
         let one = [
             ("not", self.not),
             ("if", self.if_),
@@ -210,29 +233,33 @@ impl<'a> Keywords<'a> {
             ("propertyNames", self.property_names),
             ("unevaluatedProperties", self.unevaluated_properties),
         ];
+        for (keyword, schema) in one {
+            if let Some(schema) = schema {
+                visit(keyword, Part::Whole, schema)?;
+            }
+        }
         let listed = [
             ("allOf", &self.all_of),
             ("anyOf", &self.any_of),
             ("oneOf", &self.one_of),
             ("prefixItems", &self.prefix_items),
         ];
+        for (keyword, schemas) in listed {
+            for (position, schema) in schemas.iter().enumerate() {
+                visit(keyword, Part::Index(position), *schema)?;
+            }
+        }
         let named = [
             ("properties", &self.properties),
             ("patternProperties", &self.pattern_properties),
             ("dependentSchemas", &self.dependent_schemas),
         ];
-        let one = one
-            .into_iter()
-            .filter_map(|(keyword, schema)| Some((keyword, Part::Whole, schema?)));
-        let listed = listed.into_iter().flat_map(|(keyword, schemas)| {
-            let places = schemas.iter().enumerate();
-            places.map(move |(position, schema)| (keyword, Part::Index(position), *schema))
-        });
-        let named = named.into_iter().flat_map(|(keyword, schemas)| {
-            let places = schemas.iter();
-            places.map(move |(name, schema)| (keyword, Part::Name(name), *schema))
-        });
-        one.chain(listed).chain(named).collect()
+        for (keyword, schemas) in named {
+            for (name, schema) in schemas {
+                visit(keyword, Part::Name(name), *schema)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -296,6 +323,11 @@ pub(crate) struct Types(u8);
 impl Types {
     pub fn contains(self, kind: Type) -> bool {
         self.0 & (1 << kind as u8) != 0
+    }
+
+    /// The set as a number, which is equal for two sets exactly when they are one set.
+    pub fn bits(self) -> u8 {
+        self.0
     }
 
     /// Adds a type; `false` if it was there already.

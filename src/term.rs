@@ -3,6 +3,7 @@
 //! A term says which instances it accepts. Terms are kept once each: two that are written
 //! alike have one id, so equal ids mean equal terms.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
@@ -234,6 +235,43 @@ pub(crate) struct Variable {
     pub body: TermId,
 }
 
+/// The terms of a conjunction or a disjunction in the order in which they came, each once.
+struct Once {
+    terms: Vec<TermId>,
+    /// The terms as a set, once they are more than a few.
+    seen: HashSet<TermId>,
+}
+
+impl Once {
+    /// Up to so many terms, a term is looked for in the list itself. Most conjunctions are
+    /// shorter, and then nothing is hashed and no set is made.
+    const FEW: usize = 16;
+
+    /// No terms yet, with room for so many.
+    fn of(terms: usize) -> Self {
+        Self {
+            terms: Vec::with_capacity(terms),
+            seen: HashSet::new(),
+        }
+    }
+
+    /// Adds a term, unless it is there.
+    fn add(&mut self, term: TermId) {
+        if self.terms.len() < Self::FEW {
+            if !self.terms.contains(&term) {
+                self.terms.push(term);
+            }
+            return;
+        }
+        if self.seen.is_empty() {
+            self.seen.extend(&self.terms);
+        }
+        if self.seen.insert(term) {
+            self.terms.push(term);
+        }
+    }
+}
+
 /// Every term, leaf and variable of a check.
 #[derive(Debug, Default)]
 pub(crate) struct Terms {
@@ -252,6 +290,13 @@ impl Terms {
         &self.terms[id.0 as usize]
     }
 
+    /// Makes room for so many terms, so that the terms which are there need not be moved
+    /// and hashed anew as more come in.
+    pub fn reserve(&mut self, terms: usize) {
+        self.terms.reserve(terms);
+        self.ids.reserve(terms);
+    }
+
     pub fn leaf(&self, id: LeafId) -> &Leaf {
         &self.leaves[id.index()]
     }
@@ -266,14 +311,15 @@ impl Terms {
     }
 
     fn intern(&mut self, term: Term) -> TermId {
-        if let Some(&id) = self.ids.get(&term) {
-            return id;
+        match self.ids.entry(term) {
+            Entry::Occupied(known) => *known.get(),
+            Entry::Vacant(new) => {
+                let next = u32::try_from(self.terms.len());
+                let id = TermId(next.expect("a check has fewer than 2^32 terms"));
+                self.terms.push(new.key().clone());
+                *new.insert(id)
+            }
         }
-        let id =
-            TermId(u32::try_from(self.terms.len()).expect("a check has fewer than 2^32 terms"));
-        self.terms.push(term.clone());
-        self.ids.insert(term, id);
-        id
     }
 
     pub fn truth(&mut self) -> TermId {
@@ -447,39 +493,39 @@ impl Terms {
 
     /// The conjunction, without what says nothing in it.
     pub fn all_of(&mut self, terms: impl IntoIterator<Item = TermId>) -> TermId {
-        let (mut kept, mut seen) = (Vec::new(), HashSet::new());
+        let terms = terms.into_iter();
+        let mut kept = Once::of(terms.size_hint().0);
         for id in terms {
-            let flat = match self.term(id) {
-                Term::True => continue,
+            match self.term(id) {
+                Term::True => {}
                 Term::False => return id,
-                Term::AllOf(inner) => inner.to_vec(),
-                _ => vec![id],
-            };
-            kept.extend(flat.into_iter().filter(|id| seen.insert(*id)));
+                Term::AllOf(inner) => inner.iter().for_each(|part| kept.add(*part)),
+                _ => kept.add(id),
+            }
         }
-        match kept.as_slice() {
+        match kept.terms.as_slice() {
             [] => self.truth(),
             [only] => *only,
-            _ => self.intern(Term::AllOf(kept.into())),
+            _ => self.intern(Term::AllOf(kept.terms.into())),
         }
     }
 
     /// The disjunction, without what says nothing in it.
     pub fn any_of(&mut self, terms: impl IntoIterator<Item = TermId>) -> TermId {
-        let (mut kept, mut seen) = (Vec::new(), HashSet::new());
+        let terms = terms.into_iter();
+        let mut kept = Once::of(terms.size_hint().0);
         for id in terms {
-            let flat = match self.term(id) {
-                Term::False => continue,
+            match self.term(id) {
+                Term::False => {}
                 Term::True => return id,
-                Term::AnyOf(inner) => inner.to_vec(),
-                _ => vec![id],
-            };
-            kept.extend(flat.into_iter().filter(|id| seen.insert(*id)));
+                Term::AnyOf(inner) => inner.iter().for_each(|part| kept.add(*part)),
+                _ => kept.add(id),
+            }
         }
-        match kept.as_slice() {
+        match kept.terms.as_slice() {
             [] => self.falsity(),
             [only] => *only,
-            _ => self.intern(Term::AnyOf(kept.into())),
+            _ => self.intern(Term::AnyOf(kept.terms.into())),
         }
     }
 
@@ -834,6 +880,27 @@ mod tests {
         assert_eq!(terms.one_of(vec![a]), a);
         assert_eq!(terms.type_is(TypeSet::ALL), yes);
         assert_eq!(terms.type_is(TypeSet::NONE), no);
+    }
+
+    #[test]
+    fn a_long_connective_holds_each_term_once_in_the_order_in_which_they_came() {
+        // More terms than are looked for in the list itself, each of them three times: as
+        // it comes, in a conjunction that is part of the whole, and once more from the end.
+        let mut terms = Terms::default();
+        let many: Vec<TermId> = (1..=5 * Once::FEW as u64)
+            .map(|least| terms.min_len(least))
+            .collect();
+        let (first, rest) = many.split_at(Once::FEW / 2);
+        let thrice = |part: TermId| {
+            let again = many.iter().rev().copied();
+            first.iter().copied().chain([part]).chain(again)
+        };
+        let part = terms.all_of(rest.to_vec());
+        let all = terms.all_of(thrice(part));
+        assert_eq!(terms.term(all), &Term::AllOf(many.clone().into()));
+        let part = terms.any_of(rest.to_vec());
+        let any = terms.any_of(thrice(part));
+        assert_eq!(terms.term(any), &Term::AnyOf(many.clone().into()));
     }
 
     #[test]

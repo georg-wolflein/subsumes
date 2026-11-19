@@ -59,13 +59,67 @@ pub(super) struct Scopes<'g> {
     /// resource with an anchor to bind that has been entered.
     entered: HashMap<(ScopeId, NodeId), ScopeId>,
     reached: Vec<Reached>,
-    places: HashMap<Reached, usize>,
-    /// The schemas that have been reached, in whichever scope.
-    seen: HashSet<NodeId>,
+    /// For each node, the first scope that it was reached in, and which of the reached
+    /// schemas it is there. Without a `$dynamicRef` there is one scope, and this says where
+    /// every schema is.
+    first: Vec<Option<(ScopeId, usize)>>,
+    /// Which of the reached schemas a node is in each further scope.
+    further: HashMap<Reached, usize>,
     /// For each schema as it is reached, the schemas that it leads to, as they are reached
     /// from it: those of its keywords, the target of its `$ref`, and what its `$dynamicRef`
     /// leads to in its scope.
-    leads_to: Vec<Vec<usize>>,
+    leads_to: Lists,
+}
+
+/// A list of numbers for each of the numbers from zero on. The lists are kept in one array,
+/// each after the one before, so that a list is no allocation of its own.
+#[derive(Debug, Default)]
+pub(super) struct Lists {
+    numbers: Vec<usize>,
+    /// Where the list of each number ends.
+    ends: Vec<usize>,
+}
+
+impl Lists {
+    /// No lists yet, with room for so many, each of one number.
+    fn with_capacity(lists: usize) -> Self {
+        Self {
+            numbers: Vec::with_capacity(lists),
+            ends: Vec::with_capacity(lists),
+        }
+    }
+
+    /// How many lists there are.
+    pub fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    pub fn of(&self, index: usize) -> &[usize] {
+        let start = index.checked_sub(1).map_or(0, |before| self.ends[before]);
+        &self.numbers[start..self.ends[index]]
+    }
+
+    /// Adds a number to the list that is being made, which is the one after the last.
+    fn push(&mut self, number: usize) {
+        self.numbers.push(number);
+    }
+
+    /// Ends the list that is being made.
+    fn end(&mut self) {
+        self.ends.push(self.numbers.len());
+    }
+}
+
+#[cfg(test)]
+impl<const N: usize> From<[&[usize]; N]> for Lists {
+    fn from(lists: [&[usize]; N]) -> Self {
+        let mut all = Self::default();
+        for list in lists {
+            all.numbers.extend(list);
+            all.end();
+        }
+        all
+    }
 }
 
 fn keywords<'g>(graph: &'g Graph<'g>, id: NodeId) -> Option<&'g Keywords<'g>> {
@@ -89,7 +143,8 @@ impl<'g> Scopes<'g> {
             .filter_map(|id| keywords(graph, id)?.dynamic_reference?.anchor)
             .collect();
         let mut anchors: HashMap<NodeId, Vec<(&str, NodeId)>> = HashMap::new();
-        for id in nodes() {
+        // Where no `$dynamicRef` looks for an anchor, none is bound.
+        for id in nodes().filter(|_| !looked_for.is_empty()) {
             let name = keywords(graph, id).and_then(|keywords| keywords.dynamic_anchor);
             if let Some(name) = name.filter(|name| looked_for.contains(name)) {
                 let resource = graph.node(id).resource;
@@ -102,10 +157,10 @@ impl<'g> Scopes<'g> {
             bound: vec![Bound::new()],
             scope_ids: HashMap::from([(Bound::new(), ScopeId::NOTHING)]),
             entered: HashMap::new(),
-            reached: Vec::new(),
-            places: HashMap::new(),
-            seen: HashSet::new(),
-            leads_to: Vec::new(),
+            reached: Vec::with_capacity(graph.len()),
+            first: vec![None; graph.len()],
+            further: HashMap::new(),
+            leads_to: Lists::with_capacity(graph.len()),
         };
         for root in [graph.a, graph.b] {
             scopes.enter(root, ScopeId::NOTHING, budget)?;
@@ -113,11 +168,20 @@ impl<'g> Scopes<'g> {
         let mut next = 0;
         while let Some(&Reached { node, scope }) = scopes.reached.get(next) {
             next += 1;
-            let mut leads_to = Vec::new();
-            for to in scopes.applied(node, scope) {
-                leads_to.push(scopes.enter(to, scope, budget)?);
+            if let Some(keywords) = keywords(graph, node) {
+                let dynamic = keywords.dynamic_reference;
+                let dynamic = dynamic.map(|dynamic| scopes.resolved(dynamic, scope));
+                let mut lead_to = |to| {
+                    let place = scopes.enter(to, scope, budget)?;
+                    scopes.leads_to.push(place);
+                    Ok(())
+                };
+                keywords.visit_subschemas(|_, _, to| lead_to(to))?;
+                for to in keywords.reference.into_iter().chain(dynamic) {
+                    lead_to(to)?;
+                }
             }
-            scopes.leads_to.push(leads_to);
+            scopes.leads_to.end();
         }
         Ok(scopes)
     }
@@ -131,22 +195,34 @@ impl<'g> Scopes<'g> {
         self.reached[index]
     }
 
-    /// What each schema leads to, in the order in which [`applied`](Self::applied) names
-    /// it.
-    pub fn leads_to(&self) -> &[Vec<usize>] {
+    /// What each schema leads to: the subschemas of its keywords, in the order in which
+    /// [`Keywords::subschemas`] has them, then the target of its `$ref`, then what its
+    /// `$dynamicRef` leads to in its scope.
+    pub fn leads_to(&self) -> &Lists {
         &self.leads_to
     }
 
     /// A node as it is reached from a schema in this scope. The way to it has been
-    /// followed: it is one that [`applied`](Self::applied) names for that schema.
+    /// followed: the schema leads to the node.
     pub fn from(&self, node: NodeId, scope: ScopeId) -> usize {
+        let scope = self.entered(node, scope).expect("the way was followed");
+        match self.first[node.index()] {
+            Some((first, place)) if first == scope => place,
+            _ => self.further[&Reached { node, scope }],
+        }
+    }
+
+    /// The scope once the resource of a node is entered from a scope, if that was worked
+    /// out. A resource that has no anchor to bind leaves the scope as it is.
+    fn entered(&self, node: NodeId, from: ScopeId) -> Option<ScopeId> {
+        if self.anchors.is_empty() {
+            return Some(from);
+        }
         let resource = self.graph.node(node).resource;
-        let scope = if self.anchors.contains_key(&resource) {
-            self.entered[&(scope, resource)]
-        } else {
-            scope
-        };
-        self.places[&Reached { node, scope }]
+        if !self.anchors.contains_key(&resource) {
+            return Some(from);
+        }
+        self.entered.get(&(from, resource)).copied()
     }
 
     /// What a `$dynamicRef` leads to in a scope: the anchor that the scope binds its name
@@ -155,21 +231,6 @@ impl<'g> Scopes<'g> {
         let bound = &self.bound[scope.index()];
         let anchor = dynamic.anchor.and_then(|name| bound.get(name));
         anchor.copied().unwrap_or(dynamic.target)
-    }
-
-    /// The nodes that a schema leads to in a scope: the subschemas of its keywords, the
-    /// target of its `$ref`, and what its `$dynamicRef` leads to.
-    fn applied(&self, node: NodeId, scope: ScopeId) -> Vec<NodeId> {
-        let Some(keywords) = keywords(self.graph, node) else {
-            return Vec::new();
-        };
-        let dynamic = keywords.dynamic_reference;
-        let dynamic = dynamic.map(|dynamic| self.resolved(dynamic, scope));
-        let subschemas = keywords.subschemas().into_iter().map(|(_, _, to)| to);
-        subschemas
-            .chain(keywords.reference)
-            .chain(dynamic)
-            .collect()
     }
 
     /// The scope once the resource of a node is entered from a scope. A name that is bound
@@ -186,13 +247,11 @@ impl<'g> Scopes<'g> {
         from: ScopeId,
         budget: &mut Budget,
     ) -> Result<ScopeId, Exhausted> {
-        let resource = self.graph.node(node).resource;
-        let Some(anchors) = self.anchors.get(&resource) else {
-            return Ok(from);
-        };
-        if let Some(&scope) = self.entered.get(&(from, resource)) {
+        if let Some(scope) = self.entered(node, from) {
             return Ok(scope);
         }
+        let resource = self.graph.node(node).resource;
+        let anchors = &self.anchors[&resource];
         let before = &self.bound[from.index()];
         let new: Vec<(&str, NodeId)> = anchors
             .iter()
@@ -234,13 +293,21 @@ impl<'g> Scopes<'g> {
         let scope = self.entering(node, from, budget)?;
         let reached = Reached { node, scope };
         let next = self.reached.len();
-        let place = *self.places.entry(reached).or_insert(next);
-        if place == next {
-            self.reached.push(reached);
-            if !self.seen.insert(node) {
-                budget.charge(1)?;
+        match self.first[node.index()] {
+            None => {
+                self.first[node.index()] = Some((scope, next));
+                self.reached.push(reached);
+                Ok(next)
+            }
+            Some((first, place)) if first == scope => Ok(place),
+            Some(_) => {
+                let place = *self.further.entry(reached).or_insert(next);
+                if place == next {
+                    self.reached.push(reached);
+                    budget.charge(1)?;
+                }
+                Ok(place)
             }
         }
-        Ok(place)
     }
 }
