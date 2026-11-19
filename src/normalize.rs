@@ -59,7 +59,7 @@
 #[cfg(test)]
 mod exhaustive;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
 
 use serde_json::Value;
@@ -71,6 +71,7 @@ use crate::canonical::string::Strings;
 use crate::canonical::{Left, Solver};
 use crate::context::{Budget, Context, Exhausted};
 use crate::generate;
+use crate::hash::{Map, Set};
 use crate::language::{LanguageId, Languages};
 use crate::term::{CRefId, InstanceType, Leaf, LeafId, Term, TermId, Terms, TypeSet, VarId};
 
@@ -232,13 +233,13 @@ pub(crate) fn decide(context: &mut Context, a: VarId, b: VarId) -> Result<Outcom
             context: &mut *context,
             unfoldings: Vec::new(),
             tasks: Vec::new(),
-            found: HashMap::new(),
-            assumed: HashMap::new(),
-            at_work: HashMap::new(),
+            found: Map::default(),
+            assumed: Map::default(),
+            at_work: Map::default(),
             answers: 0,
-            names: HashMap::new(),
+            names: Map::default(),
             partitions: Partitions::default(),
-            dead_ends: HashMap::new(),
+            dead_ends: Map::default(),
             hands_on,
             handed_on: false,
             too_deep: false,
@@ -247,7 +248,7 @@ pub(crate) fn decide(context: &mut Context, a: VarId, b: VarId) -> Result<Outcom
             relied: false,
             spent_before,
             spent_on_tests: 0,
-            ran_out: HashMap::new(),
+            ran_out: Map::default(),
         };
         return Ok(match engine.decide(both)? {
             Found::Nothing => Outcome::Yes,
@@ -590,21 +591,21 @@ struct Engine<'c> {
     /// others waits for the one after it.
     tasks: Vec<Task>,
     /// What is known of a c-reference for good.
-    found: HashMap<CRefId, Found>,
+    found: Map<CRefId, Found>,
     /// What is known of one for as long as tasks that are at work accept nothing.
-    assumed: HashMap<CRefId, Assumed>,
+    assumed: Map<CRefId, Assumed>,
     /// Where on the stack the task of a c-reference is.
-    at_work: HashMap<CRefId, usize>,
+    at_work: Map<CRefId, usize>,
     /// How many answers were found so far.
     answers: u64,
     /// The language of the strings that the schema of a variable accepts, or `None` if no
     /// language says it.
-    names: HashMap<VarId, Option<LanguageId>>,
+    names: Map<VarId, Option<LanguageId>>,
     partitions: Partitions,
     /// How often each disjunction left a branch with no alternative: every one of them was
     /// refuted before it came to a split. A branch splits on the one that did so most often
     /// first, since it is likely to do so again whatever the other disjunctions are split to.
-    dead_ends: HashMap<Disjunction, u32>,
+    dead_ends: Map<Disjunction, u32>,
     /// Whether an instance is handed on to the c-references that ask no more, whether one
     /// was, and whether an object or an array was passed over because it would be too
     /// deep to give.
@@ -627,7 +628,7 @@ struct Engine<'c> {
     /// The allowance of the last test of a disjunction, if the test ran out of it. The
     /// next test of that disjunction is made only with twice as much, so that the tests
     /// which run out spend no more together than twice what the last of them does.
-    ran_out: HashMap<Disjunction, u64>,
+    ran_out: Map<Disjunction, u64>,
 }
 
 impl Engine<'_> {
@@ -1640,7 +1641,7 @@ fn indefinite(terms: &Terms) -> Vec<bool> {
     let mut at_all: Vec<Vec<usize>> = vec![Vec::new(); count];
     let mut refers_to = vec![0_usize; count];
     let mut indefinite = vec![false; count];
-    let (mut seen, mut pending) = (HashSet::new(), Vec::new());
+    let (mut seen, mut pending) = (Set::default(), Vec::new());
     for (id, variable) in terms.variables() {
         let from = id.index();
         seen.clear();
