@@ -173,7 +173,7 @@ impl Objects {
         // takes no property but those that it names leaves few of them, and a property
         // that is left with none leaves no object.
         let mut open: Vec<u32> = Vec::new();
-        let mut ends: Vec<(usize, CRefId)> = Vec::with_capacity(self.some.len());
+        let mut ends: Vec<(usize, usize, CRefId)> = Vec::with_capacity(self.some.len());
         for (names, of) in &self.some {
             let held = &partition.within[names];
             with.budget.charge((held.len() / 8) as u64)?;
@@ -183,16 +183,20 @@ impl Objects {
             if open.len() == before {
                 return Ok(Left::Nothing);
             }
-            ends.push((open.len(), *of));
+            ends.push((open.len(), held.len(), *of));
         }
-        // Those first that have the fewest fragments to be in.
-        let mut some: Vec<(&[u32], CRefId)> = Vec::with_capacity(ends.len());
+        // Those first whose language holds the fewest fragments.
+        let mut some: Vec<(usize, &[u32], CRefId)> = Vec::with_capacity(ends.len());
         let mut from = 0;
-        for (to, of) in ends {
-            some.push((&open[from..to], of));
+        for (to, held, of) in ends {
+            some.push((held, &open[from..to], of));
             from = to;
         }
-        some.sort_by_key(|(fragments, _)| fragments.len());
+        some.sort_by_key(|(held, _, _)| *held);
+        let some: Vec<(&[u32], CRefId)> = some
+            .into_iter()
+            .map(|(_, fragments, of)| (fragments, of))
+            .collect();
 
         let search = Search {
             objects: self,
