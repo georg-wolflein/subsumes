@@ -34,8 +34,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
-use serde_json::{Map, Value};
-
 use super::search::{self, Place, Placed, Places, Slot};
 use super::{Left, Solver, State, state};
 use crate::context::{Budget, Exhausted};
@@ -529,20 +527,24 @@ impl Places for Search<'_> {
         if !give {
             return Ok(Some(Left::Value(None)));
         }
-        let object = self.given(&placed.slots, with, &more, deepest + 1)?;
+        let object = self.given(&placed.slots, with, &more)?;
         Ok(Some(Left::Value(Some(object))))
     }
 }
 
 impl Search<'_> {
     /// The object: a name and a value for each slot, and for each property that was added
-    /// to have enough. `depth` is how deep it is.
+    /// to have enough.
+    ///
+    /// A value costs no step here: it is shared and not copied. A fragment of one name
+    /// gives one property at most, which cost a step when it was placed or when the
+    /// fragment was looked at, and every other name costs steps to make up. So the budget
+    /// covers each property that is added.
     fn given(
         &self,
         slots: &[Slot<u32>],
         with: &mut Solver,
         more: &[(usize, u64, Rc<Witness>)],
-        depth: u32,
     ) -> Result<Rc<Witness>, Exhausted> {
         let filled = slots.iter().map(|slot| {
             let value = slot.value.as_ref().expect("every slot has a value");
@@ -551,14 +553,11 @@ impl Search<'_> {
         let added = more
             .iter()
             .map(|(fragment, count, value)| (*fragment, *count, value));
-        let mut members = Map::new();
-        let mut size = 1_u64;
+        let mut properties = Vec::new();
         // The names that were made up for each fragment of more than one name.
         let mut made_up: HashMap<usize, Vec<String>> = HashMap::new();
         for (fragment, count, value) in filled.chain(added) {
             for _ in 0..count {
-                // A step for everything that is copied.
-                with.budget.charge(value.size)?;
                 let name = match &self.partition.fragments[fragment].names {
                     Names::One(name) => name.to_string(),
                     Names::Of { language, but } => {
@@ -568,15 +567,10 @@ impl Search<'_> {
                         name
                     }
                 };
-                size = size.saturating_add(value.size);
-                members.insert(name, value.value.clone());
+                properties.push((name, Rc::clone(value)));
             }
         }
-        Ok(Rc::new(Witness {
-            value: Value::Object(members),
-            size,
-            depth,
-        }))
+        Ok(Witness::object(properties))
     }
 }
 
@@ -605,7 +599,7 @@ fn new_name(
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::*;
     use crate::canonical::made_up::{Engine, given, none};

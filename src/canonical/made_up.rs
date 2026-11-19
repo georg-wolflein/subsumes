@@ -122,7 +122,7 @@ impl Engine {
 /// The object or the array that a search gives, or why it gives none.
 pub(super) fn given(left: Left) -> Result<Value, String> {
     match left {
-        Left::Value(Some(given)) => Ok(given.value.clone()),
+        Left::Value(Some(given)) => Ok(given.written(&mut Budget::new(u64::MAX)).unwrap()),
         Left::Nothing => Err("nothing".to_owned()),
         Left::Unknown(cause) => Err(format!("{cause:?}")),
         other => panic!("{other:?} is no answer"),
