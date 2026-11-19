@@ -2,7 +2,8 @@
 //!
 //! Every schema that the check can reach in place, through a connective or a reference, gets
 //! a variable, and the term of the variable says what its keywords say. Schemas that say the
-//! same share a variable, also between A and B.
+//! same share a variable, also between A and B. Variables whose terms say the same in other
+//! words are then found, and the engine takes one of them for all; see [`congruence`].
 //!
 //! A `$dynamicRef` is a reference to the schema that it leads to in the dynamic scope that
 //! it is reached in. A schema that is reached in two scopes has a variable for each, unless
@@ -25,6 +26,7 @@
 //! inside, whose term is that the instance is that value.
 
 mod classes;
+mod congruence;
 mod scopes;
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -51,7 +53,7 @@ pub(crate) fn lower<'g>(
     context: &mut Context,
 ) -> Result<(VarId, VarId), Exhausted> {
     let scopes = Scopes::of(graph, &mut context.budget)?;
-    let classes = classes::classes(graph, &scopes, &mut context.budget)?;
+    let (classes, recursive) = classes::classes(graph, &scopes, &mut context.budget)?;
     let mut lowering = Lowering {
         graph,
         scopes: &scopes,
@@ -77,6 +79,15 @@ pub(crate) fn lower<'g>(
             let side = graph.node(scopes.at(index).node).side as usize;
             lowering.context.terms.variable_mut(variable).sides[side] = true;
         }
+    }
+    // Schemas of other classes may say the same. Where A and B are of one class, there is
+    // nothing left to find.
+    if a != b {
+        let Context {
+            terms, languages, ..
+        } = context;
+        // A pass that gives up merges nothing, and the check goes on without it.
+        let _ = congruence::merge(terms, languages, recursive);
     }
     Ok((a, b))
 }

@@ -103,7 +103,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::testing::Random;
 use crate::{Checker, Reason, Verdict};
@@ -1974,4 +1974,185 @@ fn the_engine_agrees_on_unevaluated_items() {
         yes, no, arrays, ..
     } = tally;
     assert!(yes > 200 && no > 250 && arrays > 100, "{yes} {no} {arrays}");
+}
+
+/// Keywords that are read together, which a schema that is said in other words keeps in one
+/// schema.
+const READ_TOGETHER: [&[&str]; 4] = [
+    &["properties", "patternProperties", "additionalProperties"],
+    &["prefixItems", "items"],
+    &["if", "then", "else"],
+    &["contains", "minContains", "maxContains"],
+];
+
+/// A schema said in other words: its keywords split between it and a second schema beside it
+/// under an `allOf`, the schema inside an `allOf` or an `anyOf` of its own, with `true` or
+/// `false` beside it, or negated twice, and the schemas of a connective in another order. So
+/// throughout the schemas inside. With `in_place` the schema may be one that an
+/// `unevaluatedProperties` or an `unevaluatedItems` looks into, which sees nothing through a
+/// negation.
+fn in_other_words(random: &mut Random, schema: &Value, in_place: bool) -> Value {
+    let Value::Object(keywords) = schema else {
+        return schema.clone();
+    };
+    let mut keywords = keywords.clone();
+    for (keyword, value) in &mut keywords {
+        match (keyword.as_str(), value) {
+            ("allOf" | "anyOf" | "oneOf", Value::Array(schemas)) => {
+                for schema in schemas.iter_mut() {
+                    *schema = in_other_words(random, schema, in_place);
+                }
+                if random.chance(50) {
+                    schemas.reverse();
+                }
+            }
+            ("prefixItems", Value::Array(schemas)) => {
+                for schema in schemas.iter_mut() {
+                    *schema = in_other_words(random, schema, in_place);
+                }
+            }
+            ("properties" | "patternProperties" | "dependentSchemas", Value::Object(members)) => {
+                for schema in members.values_mut() {
+                    *schema = in_other_words(random, schema, in_place);
+                }
+            }
+            (
+                "not"
+                | "if"
+                | "then"
+                | "else"
+                | "items"
+                | "contains"
+                | "additionalProperties"
+                | "propertyNames"
+                | "unevaluatedProperties"
+                | "unevaluatedItems",
+                schema,
+            ) => *schema = in_other_words(random, schema, in_place),
+            _ => {}
+        }
+    }
+    // What `unevaluatedProperties` and `unevaluatedItems` see depends on every keyword
+    // beside them, so a schema with one is not split.
+    let unevaluated = ["unevaluatedProperties", "unevaluatedItems"];
+    let whole = unevaluated
+        .iter()
+        .any(|keyword| keywords.contains_key(*keyword));
+    let said = if !whole && keywords.len() > 1 && random.chance(40) {
+        let names: Vec<String> = keywords.keys().cloned().collect();
+        let chosen = names[random.below(names.len())].as_str();
+        let group = READ_TOGETHER
+            .iter()
+            .find(|group| group.contains(&chosen))
+            .map_or_else(|| vec![chosen], |group| group.to_vec());
+        let mut moved = Map::new();
+        for keyword in group {
+            if let Some(value) = keywords.remove(keyword) {
+                moved.insert(keyword.to_owned(), value);
+            }
+        }
+        let (kept, moved) = (Value::Object(keywords), Value::Object(moved));
+        if kept.as_object().is_some_and(Map::is_empty) {
+            moved
+        } else if random.chance(50) {
+            json!({"allOf": [kept, moved]})
+        } else {
+            json!({"allOf": [moved, kept]})
+        }
+    } else {
+        Value::Object(keywords)
+    };
+    match random.below(10) {
+        0 => json!({"allOf": [said]}),
+        1 => json!({"anyOf": [said]}),
+        2 => json!({"allOf": [true, said]}),
+        3 => json!({"anyOf": [said, false]}),
+        4 if !in_place => json!({"not": {"not": said}}),
+        _ => said,
+    }
+}
+
+/// The definitions of a document said in other words.
+fn definitions_in_other_words(random: &mut Random, definitions: &Value, in_place: bool) -> Value {
+    let Value::Object(definitions) = definitions else {
+        unreachable!("the definitions are an object");
+    };
+    let said = definitions
+        .iter()
+        .map(|(name, definition)| (name.clone(), in_other_words(random, definition, in_place)));
+    Value::Object(said.collect())
+}
+
+#[test]
+fn the_engine_agrees_on_schemas_that_say_the_same_in_other_words() {
+    // B says what A says in other words, alone or beside another schema, and so do the
+    // definitions that it refers to. Schemas that say the same are one variable before the
+    // search, also where definitions refer to each other and to themselves, with nothing in
+    // between and through properties, and the engine still has to agree on every instance.
+    let random = &mut Random(10);
+    let instances = mostly_plain();
+    let (mut plain, mut cycles) = (Tally::default(), Tally::default());
+    for pair in 0..1_800 {
+        let shape = Shape {
+            definitions: if pair % 3 == 0 { &[] } else { &["e", "f"] },
+            never_negated: pair % 2 == 0,
+            of_objects: pair % 3 == 2,
+            of_arrays: false,
+            unevaluated: false,
+        };
+        let (a, other) = (schema(random, 3, shape), schema(random, 2, shape));
+        let of_a = definitions(random, shape);
+        let said = in_other_words(random, &a, false);
+        let b = match pair % 4 {
+            0 | 1 => said,
+            2 => json!({"allOf": [said, other]}),
+            _ => json!({"anyOf": [other, said]}),
+        };
+        let of_b = definitions_in_other_words(random, &of_a, false);
+        let (a, b) = (document(a, &of_a), document(b, &of_b));
+        // The negation of a cycle is a leaf to the engine, and the evaluator knows it.
+        let (tally, unknown) = if pair % 3 == 0 {
+            (&mut plain, Unknown::Exact)
+        } else {
+            (&mut cycles, Unknown::Any)
+        };
+        tally.compare(&a, &b, &instances, unknown);
+        tally.compare(&b, &a, &instances, unknown);
+    }
+    println!("{plain}");
+    println!("{cycles}");
+    for Tally { yes, no, .. } in [plain, cycles] {
+        assert!(yes > 600 && no > 100, "{yes} {no}");
+    }
+}
+
+#[test]
+fn the_engine_agrees_on_unevaluated_properties_said_in_other_words() {
+    let random = &mut Random(11);
+    let shape = Shape {
+        definitions: &[],
+        never_negated: false,
+        of_objects: true,
+        of_arrays: false,
+        unevaluated: true,
+    };
+    let instances = mostly_objects();
+    let mut tally = Tally::default();
+    for pair in 0..600 {
+        let (a, other) = (schema(random, 2, shape), schema(random, 2, shape));
+        let of_a = definitions(random, shape);
+        let said = in_other_words(random, &a, true);
+        let b = match pair % 3 {
+            0 => said,
+            1 => json!({"allOf": [said, other]}),
+            _ => json!({"anyOf": [other, said]}),
+        };
+        let of_b = definitions_in_other_words(random, &of_a, true);
+        let (a, b) = (document(a, &of_a), document(b, &of_b));
+        tally.compare(&a, &b, &instances, Unknown::Exact);
+        tally.compare(&b, &a, &instances, Unknown::Exact);
+    }
+    println!("{tally}");
+    let Tally { yes, no, .. } = tally;
+    assert!(yes > 400 && no > 100, "{yes} {no}");
 }

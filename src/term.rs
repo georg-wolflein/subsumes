@@ -116,9 +116,20 @@ impl CRefId {
     pub const LAST: Self = Self(u32::MAX);
 }
 
+impl TermId {
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 impl VarId {
     pub fn index(self) -> usize {
         self.0 as usize
+    }
+
+    /// The variable with this index.
+    pub fn at(index: usize) -> Self {
+        Self(u32::try_from(index).expect("a check has fewer than 2^32 variables"))
     }
 }
 
@@ -232,6 +243,9 @@ pub(crate) struct Variable {
     /// Whether a schema of A and one of B is among them.
     pub sides: [bool; 2],
     pub body: TermId,
+    /// The variable that the engine takes wherever a term names this one: itself, or one
+    /// that was found to say the same.
+    pub same: VarId,
 }
 
 /// Every term, leaf and variable of a check.
@@ -258,6 +272,16 @@ impl Terms {
 
     pub fn variable(&self, id: VarId) -> &Variable {
         &self.variables[id.index()]
+    }
+
+    /// The variable that the engine takes wherever a term names this one.
+    pub fn same(&self, id: VarId) -> VarId {
+        self.variables[id.index()].same
+    }
+
+    /// How many terms there are.
+    pub fn len(&self) -> usize {
+        self.terms.len()
     }
 
     pub fn variables(&self) -> impl Iterator<Item = (VarId, &Variable)> {
@@ -533,21 +557,22 @@ impl Terms {
     ///
     /// Nor is a variable whose schema is another one, as that of `{"$ref": "#"}` is: the
     /// c-reference names that other one. So a schema that holds itself in a property asks
-    /// of the value what was asked of the instance, by the same name.
+    /// of the value what was asked of the instance, by the same name. And a variable that
+    /// was found to say what another one says is named as that one.
     pub fn literal(&mut self, variable: VarId, negated: bool) -> CRefId {
         /// How many times a variable is put in the place of another. Variables that are
         /// each other's schema all the way round have no end of that.
         const FAR: usize = 16;
-        let (mut variable, mut negated) = (variable, negated);
+        let (mut variable, mut negated) = (self.same(variable), negated);
         for _ in 0..FAR {
             match self.term(self.variable(variable).body) {
                 Term::True if negated => return Self::NOTHING,
                 Term::True => return Self::ANYTHING,
                 Term::False if negated => return Self::ANYTHING,
                 Term::False => return Self::NOTHING,
-                Term::Ref(other) => variable = *other,
+                Term::Ref(other) => variable = self.same(*other),
                 Term::Not(inner) => match self.term(*inner) {
-                    Term::Ref(other) => (variable, negated) = (*other, !negated),
+                    Term::Ref(other) => (variable, negated) = (self.same(*other), !negated),
                     _ => break,
                 },
                 _ => break,
@@ -613,6 +638,7 @@ impl Terms {
             node,
             sides: [false; 2],
             body,
+            same: id,
         });
         id
     }

@@ -31,7 +31,8 @@ macro_rules! written {
 }
 pub(super) use written;
 
-/// The class of every schema as it is reached, in the order in which `scopes` has them.
+/// The class of every schema as it is reached, in the order in which `scopes` has them, and
+/// whether a schema leads back to itself.
 ///
 /// # Errors
 ///
@@ -41,7 +42,7 @@ pub(super) fn classes(
     graph: &Graph,
     scopes: &Scopes,
     budget: &mut Budget,
-) -> Result<Vec<u32>, Exhausted> {
+) -> Result<(Vec<u32>, bool), Exhausted> {
     let count = scopes.len();
     // What each schema says by itself, as a number. What it leads to is in `scopes`.
     let mut texts: HashMap<String, u32> = HashMap::new();
@@ -83,7 +84,7 @@ pub(super) fn classes(
         let on_cycles = (0..count).filter(|&node| cyclic[node]);
         let told_apart: HashSet<u32> = on_cycles.map(|node| current[node]).collect();
         if told_apart.len() == blocks {
-            return Ok(current);
+            return Ok((current, blocks > 0));
         }
         blocks = told_apart.len();
         previous = current;
@@ -225,7 +226,7 @@ fn write_value(value: &Value, text: &mut String) {
 /// are on a cycle with it, and for every node whether it is on a cycle.
 ///
 /// This is Tarjan's algorithm for strongly connected components, without recursion.
-fn components(successors: &[Vec<usize>]) -> (Vec<usize>, Vec<bool>) {
+pub(super) fn components(successors: &[Vec<usize>]) -> (Vec<usize>, Vec<bool>) {
     const UNSEEN: usize = usize::MAX;
     let count = successors.len();
     let (mut found, mut lowest) = (vec![UNSEEN; count], vec![0; count]);
@@ -299,7 +300,7 @@ mod tests {
         budget: &mut Budget,
     ) -> Result<(Scopes<'g>, Vec<u32>), Exhausted> {
         let scopes = Scopes::of(graph, budget)?;
-        let classes = classes(graph, &scopes, budget)?;
+        let (classes, _) = classes(graph, &scopes, budget)?;
         Ok((scopes, classes))
     }
 
