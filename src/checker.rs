@@ -117,7 +117,9 @@ impl Checker {
             graph,
             context,
             roots,
-            budget: self.budget,
+            checker: self.clone(),
+            a,
+            b,
         };
         Ok((converse.decide(Side::A), converse))
     }
@@ -178,9 +180,12 @@ pub struct Check {
 /// - **Its search may go another way.** Where it is free to choose, it goes by the order
 ///   in which the load met the schemas, which begins with `a` here and with `b` in a check
 ///   of its own, and the allowances of its tests are counted in the steps of its own
-///   search. So it may also take more steps, a counterexample may be another instance, and
-///   where both schemas hold the same unsupported keyword, the reason may name it in the
-///   other one. Near the budget it may end on the other side of it from a check of its own.
+///   search. So it may also take more steps, and a counterexample may be another instance.
+/// - **It decides at least what a check of its own decides.** Its search may end at the
+///   budget or at a leaf where that of a check of `b` and `a` by themselves decides. So
+///   where it decides nothing, `b` and `a` are checked by themselves, with a load and a
+///   budget of their own, and the converse has the verdict of that check and the steps of
+///   the two.
 ///
 /// Its steps depend only on the two schemas, their order and the settings.
 pub struct Converse<'s> {
@@ -188,8 +193,11 @@ pub struct Converse<'s> {
     context: Context,
     /// The variables of `a` and of `b`, unless the budget did not cover their terms.
     roots: Result<(VarId, VarId), Exhausted>,
-    /// The work budget of a check.
-    budget: u64,
+    /// The checker of the first check, with the work budget of a check.
+    checker: Checker,
+    /// The two schemas, for a check of `b` and `a` by themselves.
+    a: &'s Value,
+    b: &'s Value,
 }
 
 impl Converse<'_> {
@@ -202,9 +210,26 @@ impl Converse<'_> {
         // The terms are made once and paid for once. Where the budget did not cover them,
         // there is nothing to go on with.
         if self.roots.is_ok() {
-            self.context.budget = Budget::new(self.budget);
+            self.context.budget = Budget::new(self.checker.budget);
         }
-        self.decide(Side::B)
+        let converse = self.decide(Side::B);
+        if !matches!(converse.verdict, Verdict::Unknown { .. }) {
+            return converse;
+        }
+        // The search of the converse may go another way than that of a check of its own,
+        // and end at the budget or at a leaf where that one decides. So where it decides
+        // nothing, `b` and `a` are checked by themselves, and the converse decides at least
+        // what that check decides. Its steps are those of the two.
+        let Self { checker, a, b, .. } = self;
+        drop(self.graph);
+        drop(self.context);
+        match checker.check(b, a) {
+            Ok(alone) => Check {
+                verdict: alone.verdict,
+                steps: converse.steps + alone.steps,
+            },
+            Err(_) => converse,
+        }
     }
 
     /// Checks whether one schema of the load accepts every instance of the other. `wide`
@@ -479,6 +504,22 @@ mod tests {
         ));
         let (_, converse) = checker.check_with_converse(&a, &b).unwrap();
         assert!(matches!(converse.check().verdict, Verdict::No { .. }));
+    }
+
+    #[test]
+    fn a_converse_that_decides_nothing_is_checked_by_itself() {
+        // `b` holds a keyword that is not supported, on which the converse depends. It is
+        // checked again by itself, and has the reason of that check and the steps of both.
+        let (a, b) = (
+            json!({"type": "array"}),
+            json!({"type": "array", "uniqueItems": true}),
+        );
+        let checker = Checker::new();
+        let alone = checker.check(&b, &a).unwrap();
+        let (_, converse) = checker.check_with_converse(&a, &b).unwrap();
+        let converse = converse.check();
+        assert_eq!(converse.verdict, alone.verdict);
+        assert!(converse.steps > alone.steps);
     }
 
     #[test]
