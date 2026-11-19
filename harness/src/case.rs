@@ -21,7 +21,6 @@ use std::rc::Rc;
 
 use serde::Deserialize;
 use serde::de::IgnoredAny;
-use serde_json::Value;
 
 use crate::counterexample::Schema;
 
@@ -34,14 +33,22 @@ pub struct Case {
     pub b: Rc<Schema>,
 }
 
-/// A case as `serde_json` reads it from the whole text of a file.
-#[derive(Deserialize)]
-struct Whole {
-    a_subsumes_b: Option<bool>,
-    b_subsumes_a: Option<bool>,
-    a: Value,
-    b: Value,
+/// A case as `serde_json` reads it from the whole text of a file. It is called `Case` in a
+/// module of its own, since the errors of `serde` name a type by its name, and a file that
+/// is no case is named as it was when this was the type of a case.
+mod whole {
+    use serde::Deserialize;
+    use serde_json::Value;
+
+    #[derive(Deserialize)]
+    pub(super) struct Case {
+        pub a_subsumes_b: Option<bool>,
+        pub b_subsumes_a: Option<bool>,
+        pub a: Value,
+        pub b: Value,
+    }
 }
+use whole::Case as Whole;
 
 /// A schema of a case with where its text stands in the text of the file.
 type Placed = (Range<usize>, Rc<Schema>);
@@ -178,7 +185,7 @@ impl Reader {
             None => {
                 let (value, after) = value(rest)?;
                 // Read on its own, a value may be one level deeper than in a case.
-                if is_deeper(&value, LEVELS) {
+                if is_deeper(&rest[..rest.len() - after.len()], LEVELS) {
                     return None;
                 }
                 (Rc::new(Schema::new(value)), after)
@@ -214,20 +221,39 @@ fn past_space(text: &str) -> &str {
     text.trim_start_matches([' ', '\n', '\r', '\t'])
 }
 
-/// Whether a value has more than so many objects and arrays inside one another.
-fn is_deeper(value: &Value, levels: usize) -> bool {
-    match value {
-        Value::Array(items) => levels == 0 || items.iter().any(|item| is_deeper(item, levels - 1)),
-        Value::Object(members) => {
-            levels == 0 || members.values().any(|member| is_deeper(member, levels - 1))
+/// Whether the text of a value has more than so many objects and arrays inside one another.
+/// It counts what is written, as `serde_json` does while it reads: also a member that a
+/// later one of the same name replaces, and which the value no longer has.
+fn is_deeper(text: &str, levels: usize) -> bool {
+    let (mut depth, mut in_string, mut escaped) = (0_usize, false, false);
+    for byte in text.bytes() {
+        if in_string {
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
         }
-        _ => false,
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth += 1;
+                if depth > levels {
+                    return true;
+                }
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
     }
+    false
 }
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::*;
 
@@ -311,6 +337,22 @@ mod tests {
             assert!(read(&mut reader, &case(&nested(LEVELS))).is_some());
             assert!(read(&mut reader, &case(&nested(LEVELS + 1))).is_none());
             assert!(read(&mut reader, &case(&nested(LEVELS + 2))).is_none());
+            // A member that a later one of the same name replaces is read all the same, and
+            // the nesting of its text counts, though the value does not hold it. A string
+            // that holds brackets is no nesting.
+            let replaced = format!(r#"{{"x": {}, "x": 1, "y": "[[{{"}}"#, nested(LEVELS));
+            assert!(read(&mut reader, &case(&replaced)).is_none());
+            let replaced = format!(r#"{{"x": {}, "x": 1, "y": "[[{{"}}"#, nested(LEVELS - 1));
+            assert!(read(&mut reader, &case(&replaced)).is_some());
+        }
+    }
+
+    #[test]
+    fn a_file_that_is_no_case_is_named_as_serde_json_names_it() {
+        let mut reader = Reader::default();
+        for text in ["null", "[true, null, {}]"] {
+            let error = reader.case(text.to_owned()).err().expect("no case");
+            assert!(error.to_string().contains("struct Case"), "{error}");
         }
     }
 
