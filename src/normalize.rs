@@ -430,11 +430,48 @@ impl Engine<'_> {
             let Some(found) = self.step()? else {
                 continue;
             };
+            let ended = self.tasks.last().expect("a task is at work").of;
             self.end(&found);
             if self.tasks.is_empty() {
                 return Ok(found);
             }
+            if matches!(found, Found::Instance(_)) {
+                self.share(ended, &found)?;
+            }
         }
+    }
+
+    /// Gives the instance of a c-reference to every other c-reference that the task at work
+    /// waits for and that names only variables of the first, each as it stands there or
+    /// negated as it is there. Such a one asks no more of a value, so the instance is one
+    /// of it too, and it needs no task of its own. An instance is one whatever was taken
+    /// to accept nothing, so this is known for good.
+    ///
+    /// The search for an object or an array asks what the values at one place are asked
+    /// together each time one more of them shares the place. So a branch waits for
+    /// c-references that each name every variable of the one before, and the one that
+    /// names the most is decided first.
+    fn share(&mut self, of: CRefId, instance: &Found) -> Result<(), Exhausted> {
+        let task = self
+            .tasks
+            .last()
+            .expect("a task waits for the one that ended");
+        let mut served = Vec::new();
+        for other in &task.wanted {
+            let terms = &self.context.terms;
+            let (named, literals) = (terms.literals(of), terms.literals(*other));
+            let within = |literal| named.binary_search(literal).is_ok();
+            let asks_no_more = literals.iter().all(within);
+            let steps = 1 + (literals.len() / 8) as u64;
+            self.context.budget.charge(steps)?;
+            if asks_no_more && self.known(*other).is_none() {
+                served.push(*other);
+            }
+        }
+        for other in served {
+            self.found.insert(other, instance.clone());
+        }
+        Ok(())
     }
 
     /// What is known of a c-reference, if it was decided or is being decided.
@@ -3561,6 +3598,40 @@ mod tests {
             }
         );
         assert_eq!(check.steps, steps);
+    }
+
+    #[test]
+    fn an_instance_serves_every_c_reference_that_asks_no_more() {
+        // The value of `p` is an integer that is none of 400 numbers, each ruled out by a
+        // schema of its own. All of them meet in the one property, and the search for the
+        // object asks about the first, the first two and so on: 400 c-references, each of
+        // which names the variables of the one before.
+        let ruled_out = |number: u32| json!({"properties": {"p": {"const": number}}});
+        let a = json!({"anyOf": (1..=400).map(ruled_out).collect::<Vec<_>>()});
+        let b = json!({
+            "type": "object",
+            "properties": {"p": {"type": "integer"}},
+            "required": ["p"],
+        });
+        // The one that names them all is decided first, and its instance is one of every
+        // other. A task for each would take in 80,000 variables, which this budget does
+        // not cover.
+        let small = Checker::new().budget(50_000);
+        assert_eq!(
+            small.subsumes(&a, &b).unwrap(),
+            Verdict::No {
+                counterexample: json!({"p": 0})
+            }
+        );
+        // An instance serves no c-reference that asks more: 3 is none of the first two
+        // numbers, and it is the third.
+        let a = json!({"anyOf": (1..=3).map(ruled_out).collect::<Vec<_>>()});
+        let three = |others: &[u32]| {
+            let numbers: Vec<u32> = [3].iter().chain(others).copied().collect();
+            json!({"type": "object", "properties": {"p": {"enum": numbers}}, "required": ["p"]})
+        };
+        yes(&a, &three(&[]));
+        assert_eq!(counterexample(&a, &three(&[4])), json!({"p": 4}));
     }
 
     #[test]
