@@ -7,10 +7,12 @@
 //! an id than the lookup that it is for.
 //!
 //! This one multiplies. Each word of a key is put into the state, the state is multiplied
-//! by a factor, and the two halves of the product are folded into one another, so that
-//! every bit of the word reaches every bit of the state. The factor and the first state are
-//! drawn at random once for the process: a schema cannot be written so that its strings fall
-//! into one bucket of a table, since nothing in the schema says which strings those are.
+//! by a fixed factor, and the two halves of the product are folded into one another. The
+//! factor is the golden ratio as a fraction of 2^64, as in foldhash and in Fibonacci
+//! hashing: ids in a row then fall apart in the high bits as well as in the low ones, which
+//! a factor drawn at random does not do for every draw. The first state is drawn at random
+//! once for the process: a schema cannot be written so that its strings fall into one
+//! bucket of a table, since nothing in the schema says which strings those are.
 //!
 //! No table of a check is gone through in an order that the search or the steps depend
 //! on, so a hash that differs from one process to the next changes neither.
@@ -43,7 +45,7 @@ impl Default for Keyed {
                 seed: random.hash_one(0_u8),
                 // Odd, so that no two states have one product, and with its highest bit
                 // set, so that the product of a small number reaches the upper half.
-                factor: random.hash_one(1_u8) | 1 | 1 << 63,
+                factor: 0x9e37_79b9_7f4a_7c15,
             }
         })
     }

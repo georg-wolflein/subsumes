@@ -247,7 +247,8 @@ impl Partition {
             *from += 1;
         }
         let (of, held) = &self.within[*from];
-        debug_assert_eq!(*of, language, "the language is one of the list");
+        // A language that is not in the list would get the fragments of the next one.
+        assert_eq!(*of, language, "the language is one of the list");
         &self.held[held.clone()]
     }
 }
