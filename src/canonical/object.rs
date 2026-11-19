@@ -362,27 +362,10 @@ impl Partitions {
         if let Some(known) = self.rests.get(patterns) {
             return Ok(Rc::clone(known));
         }
-        let mut rests: Vec<(LanguageId, Vec<bool>)> = vec![(Languages::EVERYTHING, Vec::new())];
-        for pattern in patterns {
-            let other = languages.complement(*pattern, budget)?;
-            let mut cut = Vec::with_capacity(rests.len() + 1);
-            for (names, within) in rests {
-                budget.charge(1)?;
-                for (side, inside) in [(*pattern, true), (other, false)] {
-                    let both = languages.intersection(names, side, budget)?;
-                    if !languages.is_empty(both, Lengths::ANY, budget)? {
-                        let mut within = within.clone();
-                        within.push(inside);
-                        cut.push((both, within));
-                    }
-                }
-            }
-            rests = cut;
-        }
-        let rests = rests.into_iter().map(|(names, within)| Rest {
-            names,
-            within: within.into(),
-        });
+        let rests = languages.cut(patterns, budget)?;
+        let rests = rests
+            .into_iter()
+            .map(|(names, within)| Rest { names, within });
         let rests: Rc<[Rest]> = rests.collect();
         self.rests.insert(patterns.into(), Rc::clone(&rests));
         Ok(rests)

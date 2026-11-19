@@ -2132,6 +2132,31 @@ mod tests {
     }
 
     #[test]
+    fn many_patterns_cut_the_names_at_once() {
+        // A hundred names with a dot, and the same names as patterns, to which the dot is
+        // any character. No two of the patterns share a name, so they cut the names in a
+        // hundred and one. All of them cut at once, in one product of their DFAs. One
+        // after the other they take two products for each of them and each part, and two
+        // million steps.
+        let names = (0..100).map(|at| format!("some.name.of.a.property{at}"));
+        let names: Vec<String> = names.collect();
+        let properties: Map<String, Value> =
+            names.iter().map(|name| (name.clone(), json!({}))).collect();
+        let patterns: Map<String, Value> = names
+            .iter()
+            .map(|name| (format!("^{name}$"), json!({})))
+            .collect();
+        let listed = json!({"properties": properties, "additionalProperties": false});
+        let matched = json!({"patternProperties": patterns, "additionalProperties": false});
+        let small = Checker::new().budget(500_000);
+        assert_eq!(small.subsumes(&matched, &listed).unwrap(), Verdict::Yes);
+        let other = Verdict::No {
+            counterexample: json!({"someanameaofaaaproperty99": null}),
+        };
+        assert_eq!(small.subsumes(&listed, &matched).unwrap(), other);
+    }
+
+    #[test]
     fn what_no_name_and_no_pattern_is_about_is_additional() {
         let closed = |names: &[&str]| {
             let properties: Map<String, Value> = names
