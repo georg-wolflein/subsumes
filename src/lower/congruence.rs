@@ -83,10 +83,10 @@
 //! of the size of the terms, as the work of the load stage is no more than a multiple of the
 //! size of the schemas.
 
-use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher};
 
 use super::classes::components;
+use crate::hash::{Keyed, Map};
 use crate::language::{LanguageId, Languages, Shape};
 use crate::term::{Term, TermId, Terms, TypeSet, VarId};
 
@@ -169,55 +169,12 @@ enum Wanted {
 #[derive(Debug)]
 pub(super) struct GaveUp;
 
-/// The hash of the Rust compiler, `FxHash`: a word at a time, a rotation, an exclusive or and a
-/// multiplication. The canonical terms are small and many, and a hash that resists attacks
-/// is of no use where nothing is iterated and two equal hashes cost only a comparison.
-#[derive(Default)]
-struct Fx(u64);
-
-impl Fx {
-    fn add(&mut self, word: u64) {
-        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95);
-    }
-}
-
-impl Hasher for Fx {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for chunk in bytes.chunks(8) {
-            let mut word = [0; 8];
-            word[..chunk.len()].copy_from_slice(chunk);
-            self.add(u64::from_le_bytes(word));
-        }
-    }
-
-    fn write_u8(&mut self, value: u8) {
-        self.add(value.into());
-    }
-
-    fn write_u32(&mut self, value: u32) {
-        self.add(value.into());
-    }
-
-    fn write_u64(&mut self, value: u64) {
-        self.add(value);
-    }
-
-    fn write_usize(&mut self, value: usize) {
-        self.add(value as u64);
-    }
-}
-
-type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
-
 /// The hash of a connective by its parts, which is what it is in [`Table`] too.
 fn connective_hash(connective: Connective, parts: &[u32]) -> u64 {
-    let mut hasher = Fx(connective as u64 + 1);
+    let mut hasher = Keyed::default().build_hasher();
+    hasher.write_u64(connective as u64 + 1);
     for part in parts {
-        hasher.add(u64::from(*part));
+        hasher.write_u32(*part);
     }
     hasher.finish()
 }
@@ -228,7 +185,7 @@ struct Table {
     canonical: Vec<Canonical>,
     /// For each hash, the last canonical term with it, and for each canonical term the one
     /// with the same hash before it.
-    last: FxMap<u64, u32>,
+    last: Map<u64, u32>,
     before: Vec<u32>,
 }
 
@@ -237,7 +194,7 @@ impl Table {
     fn with_capacity(capacity: usize) -> Self {
         Self {
             canonical: Vec::with_capacity(capacity),
-            last: FxMap::with_capacity_and_hasher(capacity, BuildHasherDefault::default()),
+            last: Map::with_capacity_and_hasher(capacity, Keyed::default()),
             before: Vec::with_capacity(capacity),
         }
     }
@@ -271,7 +228,7 @@ impl Table {
         let hash = match &canonical {
             Canonical::Connective(connective, parts) => connective_hash(*connective, parts),
             other => {
-                let mut hasher = Fx::default();
+                let mut hasher = Keyed::default().build_hasher();
                 other.hash(&mut hasher);
                 hasher.finish()
             }
@@ -297,8 +254,8 @@ struct Pass<'t> {
     table: Table,
     /// The languages as they are compared, each once, by id, and for each language that
     /// was looked at its id among them.
-    compared: FxMap<Language<'t>, u32>,
-    seen_languages: FxMap<LanguageId, u32>,
+    compared: Map<Language<'t>, u32>,
+    seen_languages: Map<LanguageId, u32>,
     /// Whether each variable leads with nothing in between to a cycle of references with
     /// nothing in between, and whether it is on a cycle of references of any kind.
     pinned: Vec<bool>,
@@ -678,8 +635,8 @@ fn classes(terms: &Terms, languages: &Languages, recursive: bool) -> Result<Vec<
         languages,
         // There are about as many canonical terms as there are terms.
         table: Table::with_capacity(terms.len()),
-        compared: FxMap::default(),
-        seen_languages: FxMap::default(),
+        compared: Map::default(),
+        seen_languages: Map::default(),
         pinned,
         cyclic,
         blocks: vec![0; count],
@@ -701,7 +658,7 @@ fn classes(terms: &Terms, languages: &Languages, recursive: bool) -> Result<Vec<
         .filter(|index| pass.cyclic[*index] && !pass.pinned[*index])
         .collect();
     let mut told_apart = usize::from(!on_cycles.is_empty());
-    let mut blocks: FxMap<(u32, u32), u32> = FxMap::default();
+    let mut blocks: Map<(u32, u32), u32> = Map::default();
     loop {
         pass.memo.clear();
         pass.memo.resize(terms.len(), NONE);
