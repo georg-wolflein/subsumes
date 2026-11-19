@@ -1,4 +1,6 @@
-//! The state of one check. Nothing in it outlives the check or is shared with another.
+//! The state of one check. Nothing in it outlives the check or is shared with another, but
+//! the DFAs of the formats, which the store of languages takes from those that are built
+//! once for the process and which no check changes.
 
 use crate::language::{Languages, RegexDialect};
 use crate::term::Terms;

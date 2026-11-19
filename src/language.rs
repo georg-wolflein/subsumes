@@ -22,14 +22,18 @@
 //! so a pattern that cancels against itself before that costs nothing. So it is with the
 //! strings that are in none of a few languages: they are kept as those languages, and who
 //! asks for [the shape](Languages::shape) of the language gets them.
+//!
+//! The patterns of the formats are constants of the library, and the DFA of each is built
+//! once for the process; see [`CONSTANTS`]. That is the one thing that outlives a check.
 
 mod dfa;
 mod ecma;
 mod pattern;
 
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use regex_syntax::hir::Hir;
 
@@ -101,19 +105,59 @@ type Words = Rc<BTreeSet<Box<str>>>;
 #[derive(Debug)]
 enum Language {
     /// These words and no other, or with `others` every string but these words.
-    Words {
-        words: Words,
-        others: bool,
-    },
+    Words { words: Words, others: bool },
     /// A pattern whose DFA nothing has asked for yet.
     Pattern(Box<Hir>),
     /// The pattern of a format, which is not even parsed until something asks for its
-    /// DFA.
+    /// DFA. That DFA is [built once](constant) for all checks.
     Format(&'static str),
     /// Every string that is in none of these languages, of which nothing has asked for the
     /// DFA yet.
     Outside(Box<[LanguageId]>),
-    Dfa(Rc<Dfa>),
+    /// A DFA, which every check shares where it is that of a format.
+    Dfa(Arc<Dfa>),
+}
+
+/// The DFA of a pattern that is a constant of the library, with the steps that building it
+/// costs.
+#[derive(Debug, Clone)]
+struct Constant {
+    dfa: Arc<Dfa>,
+    steps: u64,
+}
+
+/// The DFAs of the patterns that are constants of the library, by the pattern: those of the
+/// formats.
+///
+/// Such a DFA depends on no check, so it is built once for the process and not once for
+/// each check that needs it: that of `uri-reference` takes 16,000 steps and 2 ms, as long
+/// as a hundred small checks. No check changes it. A check that needs it is charged the
+/// steps that building it costs, as if the check had built it, so the steps of a check are
+/// the same whichever checks came before it. There are as many as the formats have
+/// patterns, so the map does not grow with what is checked.
+static CONSTANTS: Mutex<BTreeMap<&'static str, Constant>> = Mutex::new(BTreeMap::new());
+
+/// The DFA of a pattern that is a constant of the library, which is built if no check has
+/// asked for it before. The pattern is one of the `regex` crate, and one that is read as a
+/// language.
+fn constant(pattern: &'static str) -> Constant {
+    // Nothing that is done while the lock is held can fail, so a map that a thread left
+    // when it failed is whole all the same.
+    let known = || CONSTANTS.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(constant) = known().get(pattern) {
+        return constant.clone();
+    }
+    // The DFA is built outside the lock, so that a check which needs another one does not
+    // wait. Two threads may build the same one, and the first is kept. Both cost the same
+    // steps, since the steps of a DFA are those of its pattern.
+    let read = pattern::read_rust(pattern).expect("the pattern of a format is supported");
+    let mut budget = Budget::new(u64::MAX);
+    let dfa = pattern::dfa(&read, &mut budget).expect("a budget without end covers a DFA");
+    let built = Constant {
+        dfa: Arc::new(dfa),
+        steps: budget.spent(),
+    };
+    known().entry(pattern).or_insert(built).clone()
 }
 
 /// How a language is kept, for who can make use of it.
@@ -142,11 +186,11 @@ pub(crate) struct Languages {
     patterns: HashMap<RegexDialect, HashMap<Box<str>, Result<LanguageId, Unsupported>>>,
     formats: HashMap<Box<str>, LanguageId>,
     of_words: HashMap<(Words, bool), LanguageId>,
-    of_dfas: HashMap<Rc<Dfa>, LanguageId>,
+    of_dfas: HashMap<Arc<Dfa>, LanguageId>,
     outsides: HashMap<Box<[LanguageId]>, LanguageId>,
     /// The DFA of a set of words, or of what is outside a few languages, once
     /// something has asked for it.
-    as_dfas: HashMap<LanguageId, Rc<Dfa>>,
+    as_dfas: HashMap<LanguageId, Arc<Dfa>>,
     intersections: HashMap<(LanguageId, LanguageId), LanguageId>,
     complements: HashMap<LanguageId, LanguageId>,
     /// How many words a language has that is no set of words, once that was asked.
@@ -306,37 +350,40 @@ impl Languages {
         if dfa.is_everything() {
             return Self::EVERYTHING;
         }
-        let dfa = Rc::new(dfa);
+        let dfa = Arc::new(dfa);
         if let Some(known) = self.of_dfas.get(&dfa) {
             return *known;
         }
-        let id = self.add(Language::Dfa(Rc::clone(&dfa)));
+        let id = self.add(Language::Dfa(Arc::clone(&dfa)));
         self.of_dfas.insert(dfa, id);
         id
     }
 
     /// The DFA of a language, which is built if it was not before.
-    fn dfa(&mut self, id: LanguageId, budget: &mut Budget) -> Result<Rc<Dfa>, Exhausted> {
+    fn dfa(&mut self, id: LanguageId, budget: &mut Budget) -> Result<Arc<Dfa>, Exhausted> {
         let built = match &self.languages[id.0 as usize] {
-            Language::Dfa(dfa) => return Ok(Rc::clone(dfa)),
-            Language::Pattern(pattern) => pattern::dfa(pattern, budget)?,
+            Language::Dfa(dfa) => return Ok(Arc::clone(dfa)),
+            Language::Pattern(pattern) => Arc::new(pattern::dfa(pattern, budget)?),
+            // The DFA of a format is there for all checks, and costs this one the steps that
+            // building it takes, all at once. A budget that does not cover them ends the
+            // work as it would have ended the building, and the language stays as it was.
             Language::Format(pattern) => {
-                let read =
-                    pattern::read_rust(pattern).expect("the pattern of a format is supported");
-                pattern::dfa(&read, budget)?
+                let constant = constant(pattern);
+                budget.charge(constant.steps)?;
+                constant.dfa
             }
             Language::Words { words, others } => {
                 if let Some(known) = self.as_dfas.get(&id) {
-                    return Ok(Rc::clone(known));
+                    return Ok(Arc::clone(known));
                 }
                 let listed = Dfa::of_words(words.iter().map(AsRef::as_ref), budget)?;
-                let built = Rc::new(if *others { listed.complement() } else { listed });
-                self.as_dfas.insert(id, Rc::clone(&built));
+                let built = Arc::new(if *others { listed.complement() } else { listed });
+                self.as_dfas.insert(id, Arc::clone(&built));
                 return Ok(built);
             }
             Language::Outside(of) => {
                 if let Some(known) = self.as_dfas.get(&id) {
-                    return Ok(Rc::clone(known));
+                    return Ok(Arc::clone(known));
                 }
                 // What is left of every string when each of the languages is taken out.
                 // None of them is kept this way itself, so this goes one level deep.
@@ -347,20 +394,19 @@ impl Languages {
                     left = self.intersection(left, other, budget)?;
                 }
                 let built = self.dfa(left, budget)?;
-                self.as_dfas.insert(id, Rc::clone(&built));
+                self.as_dfas.insert(id, Arc::clone(&built));
                 return Ok(built);
             }
         };
         // Two patterns of one language share the DFA.
-        let built = Rc::new(built);
-        let shared = match self.of_dfas.entry(Rc::clone(&built)) {
-            Entry::Occupied(known) => Rc::clone(known.key()),
+        let shared = match self.of_dfas.entry(Arc::clone(&built)) {
+            Entry::Occupied(known) => Arc::clone(known.key()),
             Entry::Vacant(new) => {
                 new.insert(id);
                 built
             }
         };
-        self.languages[id.0 as usize] = Language::Dfa(Rc::clone(&shared));
+        self.languages[id.0 as usize] = Language::Dfa(Arc::clone(&shared));
         Ok(shared)
     }
 
@@ -536,7 +582,7 @@ impl Languages {
         for language in by {
             dfas.push(self.dfa(*language, budget)?);
         }
-        let dfas: Vec<&Dfa> = dfas.iter().map(Rc::as_ref).collect();
+        let dfas: Vec<&Dfa> = dfas.iter().map(Arc::as_ref).collect();
         let Some(parts) = Dfa::cut(&dfas, budget)? else {
             return self.cut_one_by_one(by, budget);
         };
@@ -1123,6 +1169,39 @@ mod tests {
         assert!(patterns.len() > 15_000, "{} patterns", patterns.len());
         assert!(invalid.len() < 50 && not_modelled.len() < 20);
         assert!(matched > 15_000 && unmatched > 15_000 && too_large < 20);
+    }
+
+    #[test]
+    fn the_dfa_of_a_format_is_built_once_and_each_check_is_charged_for_it() {
+        // A pattern of the library that no other test asks for, so that the first store
+        // here may be the one that builds its DFA.
+        const PATTERN: &str = "^[0-9a-f]{4}(?:-[0-9a-f]{4}){3}$";
+        // What a check that asks whether the format has a word spends, with the DFA that
+        // it gets.
+        let ask = |budget: u64| {
+            let mut store = Languages::default();
+            let format = store.format("made up", PATTERN);
+            let mut budget = Budget::new(budget);
+            let has_a_word = store.is_empty(format, Lengths::ANY, &mut budget);
+            let built = store.dfa(format, &mut unlimited()).unwrap();
+            (has_a_word, budget.spent(), built)
+        };
+        let (first, spent, built) = ask(u64::MAX);
+        let (again, spent_again, built_again) = ask(u64::MAX);
+        assert_eq!((first, again), (Ok(false), Ok(false)));
+        // The second check gets the DFA that the first one got, and spends what it did.
+        assert!(Arc::ptr_eq(&built, &built_again));
+        assert_eq!(spent, spent_again);
+        // That is what building the DFA costs and a little more for the question.
+        let read = pattern::read_rust(PATTERN).unwrap();
+        let mut building = unlimited();
+        pattern::dfa(&read, &mut building).unwrap();
+        assert!(spent > building.spent() && building.spent() > 20);
+        // A budget that covers no more than that does, and one step less ends the work of
+        // the check, although the DFA is there.
+        assert_eq!(ask(spent).0, Ok(false));
+        assert_eq!(ask(spent - 1).0, Err(Exhausted));
+        assert_eq!(ask(10).0, Err(Exhausted));
     }
 
     #[test]
