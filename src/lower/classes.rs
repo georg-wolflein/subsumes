@@ -13,11 +13,12 @@
 //! to in a scope is a reference target like any other.
 
 use std::collections::{HashMap, HashSet};
-use std::fmt::Write;
+use std::convert::Infallible;
+use std::hash::Hash;
 
 use serde_json::{Number, Value};
 
-use super::scopes::Scopes;
+use super::scopes::{Lists, Scopes};
 use super::too_deep;
 use crate::context::{Budget, Exhausted};
 use crate::rational::exact;
@@ -31,6 +32,13 @@ macro_rules! written {
 }
 pub(super) use written;
 
+/// Writes a value as that text at the end of a buffer.
+macro_rules! write_json {
+    ($value:expr, $text:expr) => {
+        serde_json::to_writer(&mut *$text, $value).expect("the value is written as JSON")
+    };
+}
+
 /// The class of every schema as it is reached, in the order in which `scopes` has them.
 ///
 /// # Errors
@@ -43,14 +51,16 @@ pub(super) fn classes(
     budget: &mut Budget,
 ) -> Result<Vec<u32>, Exhausted> {
     let count = scopes.len();
-    // What each schema says by itself, as a number. What it leads to is in `scopes`.
-    let mut texts: HashMap<String, u32> = HashMap::new();
+    // What each schema says by itself, as a number. What it leads to is in `scopes`. Every
+    // text is written into the one buffer, and only a new one is copied out of it.
+    let mut texts: HashMap<Box<[u8]>, u32> = HashMap::with_capacity(count);
+    let mut text = Vec::new();
     let mut own = Vec::with_capacity(count);
     for index in 0..count {
         let id = scopes.at(index).node;
-        let text = described(id, graph.node(id));
-        let next = number(texts.len());
-        own.push(*texts.entry(text).or_insert(next));
+        text.clear();
+        describe(id, graph.node(id), &mut text);
+        own.push(numbered(&mut texts, &text));
     }
     let successors = scopes.leads_to();
     let (order, cyclic) = components(successors);
@@ -59,134 +69,270 @@ pub(super) fn classes(
     // which are known before it. The nodes on cycles are told apart in rounds: all are one
     // block at first, and each round separates those that differ one step further in. When a
     // round separates nothing, nothing will.
+    //
+    // A class is the number of a list: what a schema says by itself, and then the class of
+    // each schema that it leads to. A list that comes again has the number that it had, also
+    // in a later round.
+    //
+    // So a node that leads to no cycle has one class in every round, and the first round
+    // gives it. Of those that lead to a cycle, the rounds after the first class again only
+    // those that a cycle leads to, which are what the nodes on cycles are told apart by. The
+    // others get their class once, in the last round. Every round sees the same nodes on
+    // cycles as when each classed every node, so the classes are the same and so are the
+    // rounds, and a round costs what it did.
     const UNTOLD: u32 = u32::MAX;
-    let mut numbers: HashMap<(u32, Vec<u32>), u32> = HashMap::new();
-    let mut previous = vec![UNTOLD; count];
-    let mut blocks = usize::from(cyclic.contains(&true));
-    loop {
-        let mut current = vec![UNTOLD; count];
-        for &node in &order {
-            let places = successors[node].iter();
-            let leads_to = places.map(|&to| {
+    let mut changes = cyclic.clone();
+    for &node in &order {
+        changes[node] |= successors.of(node).iter().any(|&to| changes[to]);
+    }
+    let mut behind_a_cycle = cyclic.clone();
+    for &node in order.iter().rev() {
+        if behind_a_cycle[node] {
+            for &to in successors.of(node) {
+                behind_a_cycle[to] = true;
+            }
+        }
+    }
+    let in_last = |node: &&usize| changes[**node] && !behind_a_cycle[**node];
+    let in_first: Vec<usize> = order
+        .iter()
+        .filter(|node| !in_last(node))
+        .copied()
+        .collect();
+    let again: Vec<usize> = order
+        .iter()
+        .filter(|node| changes[**node] && behind_a_cycle[**node])
+        .copied()
+        .collect();
+    let last: Vec<usize> = order.iter().filter(in_last).copied().collect();
+
+    let mut numbers: HashMap<Box<[u32]>, u32> = HashMap::with_capacity(count);
+    let mut said = Vec::new();
+    let (mut previous, mut current) = (vec![UNTOLD; count], vec![UNTOLD; count]);
+    let mut class = |nodes: &[usize], previous: &[u32], current: &mut [u32]| {
+        for &node in nodes {
+            said.clear();
+            said.push(own[node]);
+            let places = successors.of(node).iter();
+            said.extend(places.map(|&to| {
                 if cyclic[to] {
                     previous[to]
                 } else {
                     current[to]
                 }
-            });
-            let next = number(numbers.len());
-            let class = numbers
-                .entry((own[node], leads_to.collect()))
-                .or_insert(next);
-            current[node] = *class;
+            }));
+            current[node] = numbered(&mut numbers, &said);
         }
+    };
+    let mut blocks = usize::from(cyclic.contains(&true));
+    let mut round = &in_first;
+    loop {
+        class(round, &previous, &mut current);
         let on_cycles = (0..count).filter(|&node| cyclic[node]);
         let told_apart: HashSet<u32> = on_cycles.map(|node| current[node]).collect();
         if told_apart.len() == blocks {
+            class(&last, &previous, &mut current);
             return Ok(current);
         }
         blocks = told_apart.len();
-        previous = current;
+        previous.copy_from_slice(&current);
+        round = &again;
         budget.charge(count as u64)?;
     }
 }
 
-fn number(count: usize) -> u32 {
-    u32::try_from(count).expect("a check has fewer than 2^32 classes")
+/// The number of a key: the one that it has, or the next one if the key is new. Only a new
+/// key is copied.
+fn numbered<T: Clone + Eq + Hash>(numbers: &mut HashMap<Box<[T]>, u32>, key: &[T]) -> u32 {
+    if let Some(known) = numbers.get(key) {
+        return *known;
+    }
+    let next = u32::try_from(numbers.len()).expect("a check has fewer than 2^32 classes");
+    numbers.insert(key.into(), next);
+    next
 }
 
-/// What a node says by itself, as text that is equal for two nodes exactly when they say the
-/// same apart from the schemas they lead to. The text names those in the order in which
-/// `Scopes` has them: the subschemas of the keywords, the target of `$ref`, and what
+/// Writes what a node says by itself, as text that is equal for two nodes exactly when they
+/// say the same apart from the schemas they lead to. The text names those in the order in
+/// which `Scopes` has them: the subschemas of the keywords, the target of `$ref`, and what
 /// `$dynamicRef` leads to, which is a reference target as that of `$ref` is.
-fn described(id: NodeId, node: &Node) -> String {
+///
+/// Every schema that is reached is described, so the text is written without the formatter
+/// and without a string for each of its parts.
+fn describe(id: NodeId, node: &Node, text: &mut Vec<u8>) {
     let keywords = match &node.schema {
-        Schema::Bool(value) => return value.to_string(),
+        Schema::Bool(true) => return text.extend_from_slice(b"true"),
+        Schema::Bool(false) => return text.extend_from_slice(b"false"),
         Schema::Object(keywords) => keywords,
     };
-    let mut text = String::new();
-    for (keyword, part, _) in keywords.subschemas() {
+    let visited = keywords.visit_subschemas(|keyword, part, _| {
+        text.extend_from_slice(keyword.as_bytes());
         match part {
-            Part::Whole => write!(text, "{keyword};"),
-            Part::Name(name) => write!(text, "{keyword}{};", quoted(name)),
-            Part::Index(_) => write!(text, "{keyword}[];"),
+            Part::Whole => {}
+            Part::Name(name) => write_word(name, text),
+            Part::Index(_) => text.extend_from_slice(b"[]"),
         }
-        .expect("a string takes any text");
-    }
+        text.push(b';');
+        Ok::<_, Infallible>(())
+    });
+    visited.unwrap_or_else(|never| match never {});
     let references = [
         keywords.reference.is_some(),
         keywords.dynamic_reference.is_some(),
     ];
     for _ in references.into_iter().filter(|there| *there) {
-        text.push_str("$ref;");
+        text.extend_from_slice(b"$ref;");
     }
-    assertions(id, keywords, &mut text);
-    text
+    assertions(id, keywords, text);
 }
 
 /// The keywords of a schema that hold no schema, each with its value.
-fn assertions(id: NodeId, keywords: &Keywords, text: &mut String) {
-    let mut put = |keyword: &str, value: Option<String>| {
+fn assertions(id: NodeId, keywords: &Keywords, text: &mut Vec<u8>) {
+    /// Writes a keyword with its value, if the schema has the keyword.
+    fn put<T>(
+        text: &mut Vec<u8>,
+        keyword: &str,
+        value: Option<T>,
+        write: impl FnOnce(T, &mut Vec<u8>),
+    ) {
         if let Some(value) = value {
-            write!(text, "{keyword}={value};").expect("a string takes any text");
+            text.extend_from_slice(keyword.as_bytes());
+            text.push(b'=');
+            write(value, text);
+            text.push(b';');
+        }
+    }
+    // A count that was too large to keep is not known to equal another one.
+    let unlike_any_other = |text: &mut Vec<u8>| {
+        text.push(b'@');
+        write_digits(id.index() as u64, text);
+    };
+    let count = |count: Count, text: &mut Vec<u8>| match count {
+        Count::Of(count) => write_digits(count, text),
+        Count::Beyond => unlike_any_other(text),
+    };
+    // A value that is nested deeper than an instance may be is not written out, and is like
+    // no other.
+    let constant = |value: &Value, text: &mut Vec<u8>| {
+        if too_deep(value) {
+            unlike_any_other(text);
+        } else {
+            write_value(value, text);
         }
     };
-    // A count that was too large to keep is not known to equal another one.
-    let unlike_any_other = || format!("@{}", id.index());
-    let count = |count: Option<Count>| {
-        count.map(|count| match count {
-            Count::Of(count) => count.to_string(),
-            Count::Beyond => unlike_any_other(),
-        })
+    let listed = |values: &[Value], text: &mut Vec<u8>| {
+        for (place, value) in values.iter().enumerate() {
+            if place > 0 {
+                text.push(b',');
+            }
+            constant(value, text);
+        }
     };
+    let (required, dependent) = (&keywords.required, &keywords.dependent_required);
 
     // `$dynamicAnchor` says nothing of an instance: it is a name, as `$anchor` is.
-    put("type", keywords.types.map(|types| format!("{types:?}")));
-    // A number is the number that it stands for, however it is written: `1.0` says what `1`
-    // says, also inside an array or an object. A value that is nested deeper than an
-    // instance may be is not written out, and is like no other.
-    let number = |number: &Number| exact(number).to_string();
-    let constant = |value: &Value| {
-        if too_deep(value) {
-            return unlike_any_other();
+    put(text, "type", keywords.types, |types, text| {
+        write_digits(types.bits().into(), text);
+    });
+    put(text, "enum", keywords.enumeration, listed);
+    put(text, "const", keywords.constant, constant);
+    put(text, "minimum", keywords.minimum, write_number);
+    put(text, "maximum", keywords.maximum, write_number);
+    put(
+        text,
+        "exclusiveMinimum",
+        keywords.exclusive_minimum,
+        write_number,
+    );
+    put(
+        text,
+        "exclusiveMaximum",
+        keywords.exclusive_maximum,
+        write_number,
+    );
+    put(text, "multipleOf", keywords.multiple_of, write_number);
+    put(text, "minLength", keywords.min_length, count);
+    put(text, "maxLength", keywords.max_length, count);
+    put(text, "pattern", keywords.pattern, write_word);
+    put(text, "format", keywords.format, write_word);
+    put(text, "minContains", keywords.min_contains, count);
+    put(text, "maxContains", keywords.max_contains, count);
+    put(text, "minItems", keywords.min_items, count);
+    put(text, "maxItems", keywords.max_items, count);
+    put(
+        text,
+        "uniqueItems",
+        keywords.unique_items.then_some(()),
+        |(), _| {},
+    );
+    let required = Some(required).filter(|names| !names.is_empty());
+    put(text, "required", required, |names, text| {
+        write_words(names, text)
+    });
+    let dependent = Some(dependent).filter(|names| !names.is_empty());
+    put(text, "dependentRequired", dependent, |dependent, text| {
+        write_length(dependent.len(), text);
+        for (name, needed) in dependent {
+            write_word(name, text);
+            write_words(needed, text);
         }
-        let mut text = String::new();
-        write_value(value, &mut text);
-        text
-    };
-    let listed = |values: &[Value]| values.iter().map(constant).collect::<Vec<_>>().join(",");
-    put("enum", keywords.enumeration.map(listed));
-    put("const", keywords.constant.map(constant));
-    put("minimum", keywords.minimum.map(number));
-    put("maximum", keywords.maximum.map(number));
-    put("exclusiveMinimum", keywords.exclusive_minimum.map(number));
-    put("exclusiveMaximum", keywords.exclusive_maximum.map(number));
-    put("multipleOf", keywords.multiple_of.map(number));
-    put("minLength", count(keywords.min_length));
-    put("maxLength", count(keywords.max_length));
-    put("pattern", keywords.pattern.map(quoted));
-    put("format", keywords.format.map(quoted));
-    put("minContains", count(keywords.min_contains));
-    put("maxContains", count(keywords.max_contains));
-    put("minItems", count(keywords.min_items));
-    put("maxItems", count(keywords.max_items));
-    put("uniqueItems", keywords.unique_items.then(String::new));
-    let required = &keywords.required;
-    put(
-        "required",
-        (!required.is_empty()).then(|| written!(required)),
-    );
-    let dependent = &keywords.dependent_required;
-    put(
-        "dependentRequired",
-        (!dependent.is_empty()).then(|| written!(dependent)),
-    );
-    put("minProperties", count(keywords.min_properties));
-    put("maxProperties", count(keywords.max_properties));
+    });
+    put(text, "minProperties", keywords.min_properties, count);
+    put(text, "maxProperties", keywords.max_properties, count);
 }
 
-fn quoted(text: &str) -> String {
-    written!(text)
+/// Writes a word as its length and then its bytes, so that where it ends is known without a
+/// look at the bytes, and no byte has to be escaped.
+fn write_word(word: &str, text: &mut Vec<u8>) {
+    write_length(word.len(), text);
+    text.extend_from_slice(word.as_bytes());
+}
+
+/// Writes a list of words as their number and then each word.
+fn write_words(words: &[&str], text: &mut Vec<u8>) {
+    write_length(words.len(), text);
+    for word in words {
+        write_word(word, text);
+    }
+}
+
+/// Writes a length seven bits to a byte, from the lowest on, with the highest bit of every
+/// byte but the last set. So where the length ends is known.
+fn write_length(mut length: usize, text: &mut Vec<u8>) {
+    while length >= 0x80 {
+        text.push(0x80 | (length & 0x7f) as u8);
+        length >>= 7;
+    }
+    text.push(length as u8);
+}
+
+/// Writes a count in digits.
+fn write_digits(mut count: u64, text: &mut Vec<u8>) {
+    let start = text.len();
+    loop {
+        text.push(b'0' + (count % 10) as u8);
+        count /= 10;
+        if count == 0 {
+            break;
+        }
+    }
+    text[start..].reverse();
+}
+
+/// Writes a number as the number that it stands for, however it is written: `1.0` says
+/// what `1` says. A whole number that 64 bits hold is its digits, as the ratio of such a
+/// number is written, and any other number is written as its ratio.
+fn write_number(number: &Number, text: &mut Vec<u8>) {
+    if let Some(whole) = number.as_u64() {
+        write_digits(whole, text);
+    } else if let Some(whole) = number.as_i64() {
+        if whole < 0 {
+            text.push(b'-');
+        }
+        write_digits(whole.unsigned_abs(), text);
+    } else {
+        text.extend_from_slice(exact(number).to_string().as_bytes());
+    }
 }
 
 /// Writes a value as text that is equal for two values exactly when they are one value: a
@@ -194,30 +340,30 @@ fn quoted(text: &str) -> String {
 /// the order of their names.
 ///
 /// This goes as deep as the value does, which is no deeper than an instance may be.
-fn write_value(value: &Value, text: &mut String) {
+fn write_value(value: &Value, text: &mut Vec<u8>) {
     match value {
-        Value::Number(number) => text.push_str(&exact(number).to_string()),
+        Value::Number(number) => write_number(number, text),
         Value::Array(items) => {
-            text.push('[');
+            text.push(b'[');
             for item in items {
                 write_value(item, text);
-                text.push(',');
+                text.push(b',');
             }
-            text.push(']');
+            text.push(b']');
         }
         Value::Object(members) => {
             let mut members: Vec<(&String, &Value)> = members.iter().collect();
             members.sort_by_key(|(name, _)| *name);
-            text.push('{');
+            text.push(b'{');
             for (name, member) in members {
-                text.push_str(&quoted(name));
-                text.push(':');
+                write_json!(name, text);
+                text.push(b':');
                 write_value(member, text);
-                text.push(',');
+                text.push(b',');
             }
-            text.push('}');
+            text.push(b'}');
         }
-        plain => text.push_str(&written!(plain)),
+        plain => write_json!(plain, text),
     }
 }
 
@@ -225,7 +371,7 @@ fn write_value(value: &Value, text: &mut String) {
 /// are on a cycle with it, and for every node whether it is on a cycle.
 ///
 /// This is Tarjan's algorithm for strongly connected components, without recursion.
-fn components(successors: &[Vec<usize>]) -> (Vec<usize>, Vec<bool>) {
+fn components(successors: &Lists) -> (Vec<usize>, Vec<bool>) {
     const UNSEEN: usize = usize::MAX;
     let count = successors.len();
     let (mut found, mut lowest) = (vec![UNSEEN; count], vec![0; count]);
@@ -247,7 +393,7 @@ fn components(successors: &[Vec<usize>]) -> (Vec<usize>, Vec<bool>) {
                 open.push(node);
                 is_open[node] = true;
             }
-            if let Some(&to) = successors[node].get(*place) {
+            if let Some(&to) = successors.of(node).get(*place) {
                 *place += 1;
                 if found[to] == UNSEEN {
                     visiting.push((to, 0));
@@ -271,7 +417,7 @@ fn components(successors: &[Vec<usize>]) -> (Vec<usize>, Vec<bool>) {
                     }
                 }
                 let alone = order.len() - start == 1;
-                if !alone || successors[node].contains(&node) {
+                if !alone || successors.of(node).contains(&node) {
                     for &member in &order[start..] {
                         cyclic[member] = true;
                     }
@@ -289,6 +435,7 @@ mod tests {
     use super::*;
     use crate::lower::scopes::ScopeId;
     use crate::schema::parse;
+    use crate::testing::Random;
 
     /// The class of each node of one schema, by its location.
     type Classed = Vec<(String, u32)>;
@@ -395,6 +542,61 @@ mod tests {
                 json!({"const": {"a": 1, "b": 1}}),
             ),
             (json!({"const": {"a": [1]}}), json!({"const": {"a": 1}})),
+            // A number is told from the one next to it, also where a float holds neither.
+            (json!({"minimum": 1}), json!({"minimum": -1})),
+            (
+                json!({"minimum": u64::MAX}),
+                json!({"minimum": 1.8446744073709552e19}),
+            ),
+            (
+                json!({"const": i64::MIN}),
+                json!({"const": -9.223372036854778e18}),
+            ),
+            (json!({"minItems": 1}), json!({"minItems": 10})),
+            (json!({"type": "null"}), json!({"type": "boolean"})),
+            (json!({"type": ["null", "array"]}), json!({"type": "array"})),
+            (
+                json!({"required": ["a", "b"]}),
+                json!({"required": ["a,b"]}),
+            ),
+            (
+                json!({"dependentRequired": {"a": ["b"]}}),
+                json!({"dependentRequired": {"b": ["a"]}}),
+            ),
+            (json!({"pattern": "a"}), json!({"format": "a"})),
+            (json!({"pattern": "a\""}), json!({"pattern": "a"})),
+            // A name is told from names that are written alike in part, and from what follows
+            // it, however long it is.
+            (json!({"required": ["ab"]}), json!({"required": ["a", "b"]})),
+            (
+                json!({"required": [""]}),
+                json!({"required": ["", "\u{0}"]}),
+            ),
+            (
+                json!({"properties": {"a": {}, "b": {}}}),
+                json!({"properties": {"a\u{1}\u{1}b": {}}}),
+            ),
+            (
+                json!({"properties": {"a": {}}}),
+                json!({"properties": {"a;properties\u{1}a": {}}}),
+            ),
+            (
+                json!({"properties": {"a".repeat(130): {}}}),
+                json!({"properties": {"a".repeat(2): {}}}),
+            ),
+            (
+                json!({"dependentRequired": {"a": ["b", "c"]}}),
+                json!({"dependentRequired": {"a": ["b"], "c": []}}),
+            ),
+            (
+                json!({"dependentRequired": {"a": [], "b": []}}),
+                json!({"dependentRequired": {"a": ["b"]}}),
+            ),
+            (json!({"pattern": "a;"}), json!({"pattern": "a"})),
+            (
+                json!({"pattern": "a", "format": "b"}),
+                json!({"pattern": "a\u{1}\u{1}b"}),
+            ),
         ];
         for (a, b) in apart {
             let (of_a, of_b) = classed(&a, &b);
@@ -411,6 +613,17 @@ mod tests {
             (json!({"minimum": 1}), json!({"minimum": 1.0})),
             (json!({"multipleOf": 0.5}), json!({"multipleOf": 5e-1})),
             (json!({"const": 1}), json!({"const": 1.0})),
+            (json!({"const": 0}), json!({"const": -0.0})),
+            (json!({"maximum": -12}), json!({"maximum": -1.2e1})),
+            (json!({"minimum": u64::MAX}), json!({"minimum": u64::MAX})),
+            (
+                json!({"const": i64::MIN}),
+                json!({"const": -9.223372036854776e18}),
+            ),
+            (
+                json!({"type": ["null", "array"]}),
+                json!({"type": ["array", "null"]}),
+            ),
             (
                 json!({"enum": [1, "a", null]}),
                 json!({"enum": [1.0, "a", null]}),
@@ -547,7 +760,7 @@ mod tests {
         // Three of the four schemas on the cycle say the same by themselves. Each round tells
         // one more of them apart, by what it leads to, and a round that tells nothing apart
         // ends the work. Every round but the first costs a step for each schema that is
-        // classed.
+        // reached.
         let cycle = json!({"not": {"not": {"not": {"$ref": "#"}}}});
         assert_eq!(classed(&cycle), Err(Exhausted));
         // Schemas that nothing leads to are not classed. Here the root and `true` are, and
@@ -583,9 +796,105 @@ mod tests {
     }
 
     #[test]
+    fn the_classes_are_those_of_rounds_that_class_every_schema() {
+        // The classes as rounds give them that class every schema anew: the rounds that the
+        // budget pays for, and for each schema as it is reached its class.
+        let every_schema_in_every_round = |graph: &Graph, scopes: &Scopes| {
+            let mut texts = HashMap::new();
+            let own: Vec<u32> = (0..scopes.len())
+                .map(|index| {
+                    let id = scopes.at(index).node;
+                    let mut text = Vec::new();
+                    describe(id, graph.node(id), &mut text);
+                    numbered(&mut texts, &text)
+                })
+                .collect();
+            let successors = scopes.leads_to();
+            let (order, cyclic) = components(successors);
+            let mut numbers = HashMap::new();
+            let mut previous = vec![u32::MAX; scopes.len()];
+            let mut blocks = usize::from(cyclic.contains(&true));
+            for rounds in 0.. {
+                let mut current = vec![u32::MAX; scopes.len()];
+                for &node in &order {
+                    let mut said = vec![own[node]];
+                    for &to in successors.of(node) {
+                        said.push(if cyclic[to] {
+                            previous[to]
+                        } else {
+                            current[to]
+                        });
+                    }
+                    current[node] = numbered(&mut numbers, &said);
+                }
+                let on_cycles = (0..scopes.len()).filter(|&node| cyclic[node]);
+                let told_apart: HashSet<u32> = on_cycles.map(|node| current[node]).collect();
+                if told_apart.len() == blocks {
+                    return (rounds, current);
+                }
+                blocks = told_apart.len();
+                previous = current;
+            }
+            unreachable!("a round that tells nothing apart ends the rounds")
+        };
+        // Definitions that refer to each other, in properties, in items and in place, each
+        // with a keyword or two of its own, so that cycles lead to cycles and schemas that
+        // are on none lead to them and are led to.
+        let mut random = Random(7);
+        let schema = |random: &mut Random, depth: u32| -> Value {
+            let mut schema = Map::new();
+            let reference =
+                |random: &mut Random| json!({"$ref": format!("#/$defs/d{}", random.below(5))});
+            for _ in 0..random.below(4) {
+                let (key, value) = match random.below(7) {
+                    0 => ("minimum", json!(random.below(2))),
+                    1 => ("type", json!(random.pick(&["object", "array", "null"]))),
+                    2 => ("items", reference(random)),
+                    3 => (
+                        "properties",
+                        json!({"a": reference(random), "b": {"minItems": random.below(2)}}),
+                    ),
+                    4 => ("allOf", json!([reference(random)])),
+                    5 if depth > 0 => ("not", reference(random)),
+                    _ => ("anyOf", json!([reference(random), {"type": "null"}])),
+                };
+                schema.insert(key.to_owned(), value);
+            }
+            Value::Object(schema)
+        };
+        let document = |random: &mut Random| {
+            let definitions: Map<String, Value> = (0..5)
+                .map(|index| (format!("d{index}"), schema(random, 1)))
+                .collect();
+            let mut root = schema(random, 0);
+            root["$defs"] = Value::Object(definitions);
+            root["$ref"] = json!("#/$defs/d0");
+            root
+        };
+        let mut rounds = 0;
+        for _ in 0..400 {
+            let (a, b) = (document(&mut random), document(&mut random));
+            let graph = parse(&a, &b).unwrap().link().unwrap();
+            let mut budget = Budget::new(u64::MAX);
+            let (scopes, classes) = reached(&graph, &mut budget).unwrap();
+            let (expected_rounds, expected) = every_schema_in_every_round(&graph, &scopes);
+            assert_eq!(budget.spent(), expected_rounds * scopes.len() as u64);
+            rounds += expected_rounds;
+            // The two say of every two schemas alike whether they are of one class.
+            let (mut there, mut back) = (HashMap::new(), HashMap::new());
+            for (class, expected) in classes.iter().zip(&expected) {
+                assert_eq!(*there.entry(class).or_insert(expected), expected, "{a} {b}");
+                assert_eq!(*back.entry(expected).or_insert(class), class, "{a} {b}");
+            }
+        }
+        // Most pairs take rounds after the first.
+        assert!(rounds > 400, "{rounds}");
+    }
+
+    #[test]
     fn the_nodes_on_cycles_are_found() {
         // 0 leads to 1 and 4; 1, 2 and 3 are a cycle; 4 leads to itself; 5 stands alone.
-        let successors = vec![vec![1, 4], vec![2], vec![3], vec![1], vec![4], vec![]];
+        let successors = Lists::from([&[1, 4][..], &[2], &[3], &[1], &[4], &[]]);
         let (order, cyclic) = components(&successors);
         assert_eq!(cyclic, [false, true, true, true, true, false]);
         let place = |node| order.iter().position(|&other| other == node).unwrap();

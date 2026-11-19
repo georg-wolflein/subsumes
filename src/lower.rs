@@ -52,15 +52,19 @@ pub(crate) fn lower<'g>(
 ) -> Result<(VarId, VarId), Exhausted> {
     let scopes = Scopes::of(graph, &mut context.budget)?;
     let classes = classes::classes(graph, &scopes, &mut context.budget)?;
+    // The classes are numbered from zero on, so an array holds the variable of each.
+    let numbers = classes.iter().max().map_or(0, |last| *last as usize + 1);
+    context.terms.reserve(scopes.len());
     let mut lowering = Lowering {
         graph,
         scopes: &scopes,
         classes: &classes,
         context,
-        variables: HashMap::new(),
+        variables: vec![None; numbers],
         constants: HashMap::new(),
         pending: VecDeque::new(),
         scope: ScopeId::NOTHING,
+        parts: Vec::new(),
     };
     let a = lowering.variable(graph.a);
     let b = lowering.variable(graph.b);
@@ -73,7 +77,7 @@ pub(crate) fn lower<'g>(
 
     // A variable stands for every schema of its class, on whichever side it is.
     for (index, class) in classes.iter().enumerate() {
-        if let Some(&variable) = lowering.variables.get(class) {
+        if let Some(variable) = lowering.variables[*class as usize] {
             let side = graph.node(scopes.at(index).node).side as usize;
             lowering.context.terms.variable_mut(variable).sides[side] = true;
         }
@@ -87,8 +91,8 @@ struct Lowering<'g, 'c> {
     /// The class of each schema as it is reached, in the order of `scopes`.
     classes: &'c [u32],
     context: &'c mut Context,
-    /// The variable of each class that has one.
-    variables: HashMap<u32, VarId>,
+    /// The variable of each class that has one, by the number of the class.
+    variables: Vec<Option<VarId>>,
     /// The variable of each term that has one without being the term of a schema: of a
     /// value inside a constant, by the term that says "the instance is this value", and of
     /// what an item is to satisfy unless it is evaluated.
@@ -99,6 +103,9 @@ struct Lowering<'g, 'c> {
     /// The dynamic scope of the schema whose term is being made. Every schema that the
     /// term names is reached from it.
     scope: ScopeId,
+    /// What the keywords of the schema whose term is being made say, each a term. The one
+    /// list serves every schema in turn.
+    parts: Vec<TermId>,
 }
 
 const NULL: TypeSet = TypeSet::of(InstanceType::Null);
@@ -117,15 +124,15 @@ impl<'g, 'c> Lowering<'g, 'c> {
     /// The variable of a schema as it is reached. The first schema of a class to ask gives
     /// the variable its term, and every schema of a class would give the same.
     fn variable_of(&mut self, reached: usize) -> VarId {
-        let class = self.classes[reached];
-        if let Some(&variable) = self.variables.get(&class) {
+        let class = self.classes[reached] as usize;
+        if let Some(variable) = self.variables[class] {
             return variable;
         }
         let variable = self
             .context
             .terms
             .new_variable(self.scopes.at(reached).node);
-        self.variables.insert(class, variable);
+        self.variables[class] = Some(variable);
         self.pending.push_back((variable, reached));
         variable
     }
@@ -154,14 +161,17 @@ impl<'g, 'c> Lowering<'g, 'c> {
             Schema::Bool(false) => return Ok(self.context.terms.falsity()),
             Schema::Object(keywords) => keywords,
         };
-        let mut parts = Vec::new();
+        let mut parts = std::mem::take(&mut self.parts);
+        parts.clear();
         self.connectives(keywords, &mut parts);
         self.any_type(id, keywords, &mut parts);
         self.numbers(keywords, &mut parts);
         self.strings(id, keywords, &mut parts);
         self.arrays(id, keywords, &mut parts)?;
         self.objects(id, keywords, &mut parts)?;
-        Ok(self.context.terms.all_of(parts))
+        let body = self.context.terms.all_of(parts.iter().copied());
+        self.parts = parts;
+        Ok(body)
     }
 
     /// A predicate that the engine does not model. `key` is the keyword with what it holds;
@@ -977,6 +987,10 @@ impl<E: Evaluates> Way<E> {
 /// Whether a value holds more arrays and objects inside one another than an instance may:
 /// more than [`DEEPEST`], itself among them. This goes no deeper than that.
 fn too_deep(value: &Value) -> bool {
+    // Most values hold no other.
+    if !(value.is_array() || value.is_object()) {
+        return false;
+    }
     let mut pending = vec![(value, 1_u32)];
     while let Some((value, depth)) = pending.pop() {
         let inside: Box<dyn Iterator<Item = &Value>> = match value {
