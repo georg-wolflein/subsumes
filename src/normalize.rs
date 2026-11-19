@@ -1331,6 +1331,7 @@ impl Engine<'_> {
             languages,
             budget,
             facts,
+            ..
         } = &mut **context;
         let Facts {
             found,

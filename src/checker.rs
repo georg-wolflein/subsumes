@@ -34,6 +34,8 @@ const DEFAULT_BUDGET: u64 = 10_000_000;
 pub struct Checker {
     budget: u64,
     regex_dialect: RegexDialect,
+    /// Whether the lowering takes one variable for the variables whose terms say the same.
+    merge: bool,
 }
 
 impl Checker {
@@ -44,6 +46,7 @@ impl Checker {
         Self {
             budget: DEFAULT_BUDGET,
             regex_dialect: RegexDialect::default(),
+            merge: true,
         }
     }
 
@@ -89,6 +92,11 @@ impl Checker {
     /// lowered to terms. The converse goes on with what the first check worked out about
     /// them, and pays for none of it again; see [`Converse`].
     ///
+    /// The lowering takes one variable for the variables whose terms say the same, which
+    /// changes the way the search goes. A check that decides nothing where it merged any is
+    /// made again without merging them, and decides at least what that check decides. Its
+    /// steps are then those of the two, and may be twice the budget.
+    ///
     /// ```
     /// use serde_json::json;
     /// use subsumes::{Checker, Verdict};
@@ -112,6 +120,7 @@ impl Checker {
     ) -> Result<(Check, Converse<'s>), Error> {
         let graph = schema::parse(a, b)?.link()?;
         let mut context = Context::new(self.budget, self.regex_dialect);
+        context.merge = self.merge;
         let roots = lower::lower(&graph, &mut context);
         let mut converse = Converse {
             graph,
@@ -121,7 +130,25 @@ impl Checker {
             a,
             b,
         };
-        Ok((converse.decide(Side::A), converse))
+        let check = converse.decide(Side::A);
+        // Variables that are merged change the way the search goes, and it may end at the
+        // budget, at a leaf or with an instance too deep to give, where it would decide
+        // without them. So a check that decides nothing where variables were merged is
+        // made again without merging any, and decides at least what that check decides.
+        // Its steps are those of the two.
+        if matches!(check.verdict, Verdict::Unknown { .. }) && converse.context.merged {
+            let unmerged = Self {
+                merge: false,
+                ..self.clone()
+            };
+            let alone = unmerged.check(a, b)?;
+            let check = Check {
+                verdict: alone.verdict,
+                steps: check.steps + alone.steps,
+            };
+            return Ok((check, converse));
+        }
+        Ok((check, converse))
     }
 
     /// What the library makes of the two schemas before it compares them, as JSON for a tool
@@ -504,6 +531,25 @@ mod tests {
         ));
         let (_, converse) = checker.check_with_converse(&a, &b).unwrap();
         assert!(matches!(converse.check().verdict, Verdict::No { .. }));
+    }
+
+    #[test]
+    fn a_check_that_decides_nothing_where_variables_were_merged_is_made_again_without() {
+        // The schemas of `b` say "an array" three times over, and are one variable. Whether
+        // `a` takes every array turns on `uniqueItems`, which is not supported, so the check
+        // decides nothing, and is made again without merging the variables.
+        let a = json!({"type": "array", "uniqueItems": true});
+        let b = json!({"allOf": [{"allOf": [{"type": "array"}]}]});
+        let unmerged = Checker {
+            merge: false,
+            ..Checker::new()
+        }
+        .check(&a, &b)
+        .unwrap();
+        let check = Checker::new().check(&a, &b).unwrap();
+        assert!(matches!(check.verdict, Verdict::Unknown { .. }));
+        assert_eq!(check.verdict, unmerged.verdict);
+        assert!(check.steps > unmerged.steps);
     }
 
     #[test]

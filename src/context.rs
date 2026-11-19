@@ -19,6 +19,10 @@ pub(crate) struct Context {
     pub terms: Terms,
     pub languages: Languages,
     pub facts: Facts,
+    /// Whether the lowering takes one variable for the variables whose terms say the same,
+    /// and whether it took one for any.
+    pub merge: bool,
+    pub merged: bool,
 }
 
 impl Context {
@@ -29,6 +33,8 @@ impl Context {
             terms: Terms::default(),
             languages: Languages::new(dialect),
             facts: Facts::default(),
+            merge: true,
+            merged: false,
         }
     }
 }

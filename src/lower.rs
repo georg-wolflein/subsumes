@@ -86,12 +86,12 @@ pub(crate) fn lower<'g>(
     }
     // Schemas of other classes may say the same. Where A and B are of one class, there is
     // nothing left to find.
-    if a != b {
+    if a != b && context.merge {
         let Context {
             terms, languages, ..
         } = context;
         // A pass that gives up merges nothing, and the check goes on without it.
-        let _ = congruence::merge(terms, languages, recursive);
+        context.merged = congruence::merge(terms, languages, recursive).unwrap_or(false);
     }
     Ok((a, b))
 }

@@ -602,12 +602,14 @@ pub(super) fn merge(
     terms: &mut Terms,
     languages: &Languages,
     recursive: bool,
-) -> Result<(), GaveUp> {
+) -> Result<bool, GaveUp> {
     let same = classes(terms, languages, recursive)?;
+    let mut merged = false;
     for (index, stands) in same.into_iter().enumerate() {
+        merged |= stands != VarId::at(index);
         terms.variable_mut(VarId::at(index)).same = stands;
     }
-    Ok(())
+    Ok(merged)
 }
 
 /// The variable that stands for each variable.
