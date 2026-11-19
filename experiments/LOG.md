@@ -263,3 +263,44 @@ The corpus is what the experiments were made on, so it says little about what th
 
 - **Unit propagation by looking ahead** (the agent of o18949): after a branch has taken in what needs no split, try the alternatives of every disjunction in a copy until two stand. It decides the four checks of o18949, and in every variant it costs more elsewhere than it saves or loses a verdict: the copy and the search for an object are paid for every disjunction at every node.
 - **A smaller budget.** With E8 in, no check that is decided takes more than 3.6 million steps, so a budget of 4 million would lose no verdict of the corpus and save 3 s of a run. The budget is not changed here: it is a setting of the library and not a part of these experiments.
+
+## The second goal: a tenth of the time again
+
+The goal that followed is a run in a tenth of the 27 s: under 3 s. The work for it is on the branch `perf/x10`.
+
+### E9 is taken in
+
+`7e3686b`. Without E9 the four checks of o18949 alone take 5 s, so the goal is out of reach. The branch `perf/x10` begins as `perf/trunk` with `perf/exp-entailment` merged, with what its second reviewer found written down in `DESIGN.md` under what is left for later. A run takes 13.1 s there, of which 11.0 s are in the checks: three runs on the machine with nothing else at work, 13.10 s, 13.09 s and 13.13 s. No check ends at the budget.
+
+### Where the time goes now
+
+The time is no longer in a few checks.
+
+| checks that take | checks | together |
+| --- | ---: | ---: |
+| under 50 µs | 18,200 | 0.3 s |
+| 50 µs to 200 µs | 8,200 | 0.8 s |
+| 0.2 ms to 1 ms | 5,300 | 2.6 s |
+| 1 ms to 10 ms | 2,240 | 4.6 s |
+| more | 69 | 2.6 s |
+
+By what a check does, measured with a timer around each part:
+
+| | time |
+| --- | ---: |
+| parsing and linking the two schemas | 0.5 s |
+| lowering them to terms | 3.6 s |
+| deciding | 6.7 s |
+| dropping what the check built | 0.2 s |
+| the harness around the checks: listing and reading the cases, parsing JSON, validating counterexamples, writing results | 2.1 s |
+
+A profile of a run says what the parts are made of:
+
+- **Every case is loaded twice.** The harness checks a case in both directions, and each direction parses, links and lowers both schemas anew, builds the DFAs of their patterns anew, and decides what the other has decided.
+- **Lowering is a quarter of a run,** and it gives a term to every schema that A or B leads to, although the engine opens few of them: two versions of one schema share most of their classes.
+- **Whether a string is left is 14% of a run,** nearly all of it the minimal DFA of a pattern, built to ask one question.
+- **Whether an object is left is 21%,** worked out from the start each time a branch has taken in a term about objects.
+- **The memory allocator is 28%** across all of these, and SipHash 6%.
+- Two schemas that say the same in other words have two variables, and the engine finds by search what a canonical form of their terms would show at once.
+
+Each of these is a line of attack of the third round.
