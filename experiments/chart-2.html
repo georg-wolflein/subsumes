@@ -169,7 +169,7 @@ const STEPS = [
   { id: "engine", name: "Engine: fast hash, copy-on-write branches, no allocation where most asked", kind: "constant", before: 8.59, after: 6.25, steps: 72.5 },
   { id: "merge", name: "One variable for variables whose terms say the same (bisimulation)", kind: "algorithmic", before: 6.25, after: 4.69, steps: 39.2 },
   { id: "both", name: "Check both directions of a case on one load", kind: "shared", before: 4.69, after: 3.36, steps: 32.9 },
-  { id: "fallback", name: "A converse that decides nothing is checked again by itself", kind: "fix", before: 3.36, after: 3.45, steps: 33.2 },
+  { id: "fallback", name: "A converse, or a check with merged variables, that decides nothing is checked again", kind: "fix", before: 3.36, after: 3.45, steps: 33.2 },
 ];
 const ROUND2 = [
   { id: "start", name: "start: E9 merged", checks: 11.17, wall: 13.43 },
