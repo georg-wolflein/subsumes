@@ -17,11 +17,13 @@
 //! - As a DFA, a deterministic finite automaton, for anything else.
 //!
 //! A pattern that is one word between `^` and `$`, such as `^type$`, comes in as the set of
-//! that word, by the id that the word has, and no DFA is built from it. Any other pattern
-//! is only parsed when it comes in. Its DFA is built when something is asked that needs it,
-//! so a pattern that cancels against itself before that costs nothing. So it is with the
-//! strings that are in none of a few languages: they are kept as those languages, and who
-//! asks for [the shape](Languages::shape) of the language gets them.
+//! that word, by the id that the word has, and no DFA is built from it. Where the word is
+//! written with no character that either dialect reads as syntax, that is seen without the
+//! parser. Any other pattern is only parsed when it comes in. Its DFA is built when
+//! something is asked that needs it, so a pattern that cancels against itself before that
+//! costs nothing. So it is with the strings that are in none of a few languages: they are
+//! kept as those languages, and who asks for [the shape](Languages::shape) of the language
+//! gets them.
 //!
 //! The patterns of the formats are constants of the library, and the DFA of each is built
 //! once for the process; see [`CONSTANTS`]. That is the one thing that outlives a check.
@@ -185,7 +187,11 @@ pub(crate) struct Languages {
     /// The patterns that came in, by the dialect that each was read in.
     patterns: HashMap<RegexDialect, HashMap<Box<str>, Result<LanguageId, Unsupported>>>,
     formats: HashMap<Box<str>, LanguageId>,
+    /// The sets of words, but for those of one word and no other.
     of_words: HashMap<(Words, bool), LanguageId>,
+    /// The sets of one word and no other, by the word. Most sets are of one word, and a
+    /// word finds its set here without a set being made of it.
+    of_word: HashMap<Box<str>, LanguageId>,
     of_dfas: HashMap<Arc<Dfa>, LanguageId>,
     outsides: HashMap<Box<[LanguageId]>, LanguageId>,
     /// The DFA of a set of words, or of what is outside a few languages, once
@@ -213,6 +219,7 @@ impl Languages {
             patterns: HashMap::new(),
             formats: HashMap::new(),
             of_words: HashMap::new(),
+            of_word: HashMap::new(),
             of_dfas: HashMap::new(),
             outsides: HashMap::new(),
             as_dfas: HashMap::new(),
@@ -256,6 +263,11 @@ impl Languages {
         pattern: &str,
         dialect: RegexDialect,
     ) -> Result<LanguageId, Unsupported> {
+        // Most patterns of a schema that a program wrote are a plain word between `^` and
+        // `$`, which is seen without a parser.
+        if let Some(word) = pattern::plain_word(pattern) {
+            return Ok(self.word(word));
+        }
         let known = self.patterns.get(&dialect);
         if let Some(known) = known.and_then(|known| known.get(pattern)) {
             return *known;
@@ -263,7 +275,7 @@ impl Languages {
         let read = pattern::read(pattern, dialect).map(|read| {
             // A word between `^` and `$` is that word, and needs no DFA.
             if let Some(word) = pattern::one_word(&read) {
-                return self.words([word]);
+                return self.word(word);
             }
             let id = self.add(Language::Pattern(Box::new(read)));
             self.sources.insert(id, format!("{pattern:?}"));
@@ -286,6 +298,15 @@ impl Languages {
         id
     }
 
+    /// The language of one word and no other, which is the one that [`Self::words`] gives
+    /// for the word. A word that came in before is found without making a set of it.
+    pub fn word(&mut self, word: &str) -> LanguageId {
+        if let Some(known) = self.of_word.get(word) {
+            return *known;
+        }
+        self.set(Rc::new(BTreeSet::from([Box::from(word)])), false)
+    }
+
     /// The language of these words and no other.
     pub fn words<'w>(&mut self, words: impl IntoIterator<Item = &'w str>) -> LanguageId {
         let words: BTreeSet<Box<str>> = words.into_iter().map(Box::from).collect();
@@ -293,6 +314,16 @@ impl Languages {
     }
 
     fn set(&mut self, words: Words, others: bool) -> LanguageId {
+        // One word and no other is kept by the word, wherever the set comes from.
+        if let (false, 1, Some(word)) = (others, words.len(), words.first()) {
+            if let Some(known) = self.of_word.get(word.as_ref()) {
+                return *known;
+            }
+            let word = word.clone();
+            let id = self.add(Language::Words { words, others });
+            self.of_word.insert(word, id);
+            return id;
+        }
         if let Some(known) = self.of_words.get(&(Rc::clone(&words), others)) {
             return *known;
         }
@@ -1022,6 +1053,16 @@ mod tests {
         assert_eq!(store.pattern(r"^a\.b$"), store.0.words(["a.b"]));
         assert_eq!(store.pattern("^é𝄞$"), store.0.words(["é𝄞"]));
         assert_eq!(store.pattern("^$"), store.0.words([""]));
+        // A word is one language however it comes in: written plainly or not, as a word
+        // by itself, or as what is left of a set of words.
+        let word = store.0.word("a b");
+        assert_eq!(store.pattern("^a b$"), word);
+        assert_eq!(store.pattern(r"^a\x20b$"), word);
+        assert_eq!(store.pattern("^(?:a b)$"), word);
+        assert_eq!(store.0.words(["a b"]), word);
+        let (two, other) = (store.0.words(["a b", "c"]), store.0.words(["c", "d"]));
+        let not_other = store.not(other);
+        assert_eq!(store.both(two, not_other), word);
         // Anything else between them is a pattern, and so is a word without one of them,
         // or with something else in the place of one.
         for pattern in [
