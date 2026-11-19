@@ -51,7 +51,7 @@ impl Strings {
     pub fn take(&mut self, term: &Term, negated: bool, languages: &mut Languages) {
         match (term, negated) {
             (Term::StrConst(word), _) => {
-                self.ask(languages.words([word.as_ref()]), negated, Some(word));
+                self.ask(languages.word(word), negated, Some(word));
             }
             (Term::Patt(language), _) => self.ask(*language, negated, None),
             (Term::MinLen(least), false) => self.lengths.min = self.lengths.min.max(*least),

@@ -61,6 +61,17 @@ pub(super) fn read_rust(pattern: &str) -> Result<Hir, Unsupported> {
     Ok(read)
 }
 
+/// The word of a pattern that is a plain word between `^` and `$`, as it is written: one in
+/// which no character is a syntax character of ECMA-262, `^$\.*+?()[]{}|`. Every other
+/// character stands for itself in both dialects, so the pattern is read as these characters
+/// between the two ends of the string, and [`one_word`] gives this word for what the parser
+/// of either makes of it. `None` says nothing about the pattern, which the parser reads then.
+pub(super) fn plain_word(pattern: &str) -> Option<&str> {
+    let word = pattern.strip_prefix('^')?.strip_suffix('$')?;
+    let plain = |byte: &u8| !b"^$\\.*+?()[]{}|".contains(byte);
+    word.as_bytes().iter().all(plain).then_some(word)
+}
+
 /// The word of a pattern that is one word between `^` and `$`, so that it matches this
 /// word and no other string.
 pub(super) fn one_word(pattern: &Hir) -> Option<&str> {
@@ -589,6 +600,41 @@ mod tests {
         }
         // `\A` and `\z` are the two ends under other names.
         assert_eq!(of(r"\Aa\z"), of("^a$"));
+    }
+
+    #[test]
+    fn a_plain_word_between_the_two_ends_is_the_word_that_either_parser_reads() {
+        // Patterns of a few characters, some of them syntax of one dialect or of both.
+        let characters = [
+            'a', 'b', ' ', '-', '/', '#', '&', '~', ',', ':', '"', 'é', '𝄞', '^', '$', '\\', '.',
+            '*', '+', '?', '(', ')', '[', ']', '{', '}', '|',
+        ];
+        let mut random = crate::testing::Random(11);
+        let mut plain = 0;
+        for _ in 0..20_000 {
+            let length = random.below(7);
+            let mut pattern: String = (0..length).map(|_| random.pick(&characters)).collect();
+            if random.chance(80) {
+                pattern = format!("^{pattern}$");
+            }
+            let Some(word) = plain_word(&pattern) else {
+                continue;
+            };
+            plain += 1;
+            for dialect in [RegexDialect::Ecma262, RegexDialect::Rust] {
+                let read = read(&pattern, dialect);
+                let read = read.unwrap_or_else(|_| panic!("{pattern:?} in {dialect:?}"));
+                assert_eq!(one_word(&read), Some(word), "{pattern:?} in {dialect:?}");
+            }
+        }
+        assert!(plain > 2_000, "{plain}");
+        // What is not plain is left to the parser, which may read a word all the same.
+        for pattern in [
+            "^a.b$", r"^a\.b$", "^(a)$", "^a", "a$", "^a$|", "^^$", "a^a$",
+        ] {
+            assert_eq!(plain_word(pattern), None, "{pattern:?}");
+        }
+        assert_eq!(plain_word("^$"), Some(""));
     }
 
     #[test]

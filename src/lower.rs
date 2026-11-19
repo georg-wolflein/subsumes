@@ -245,7 +245,7 @@ impl<'g, 'c> Lowering<'g, 'c> {
 
     /// The term for "no object, or an object with this property".
     fn has_property(&mut self, name: &str) -> TermId {
-        let named = self.context.languages.words([name]);
+        let named = self.context.languages.word(name);
         self.context.terms.p_req(named)
     }
 
@@ -326,7 +326,7 @@ impl<'g, 'c> Lowering<'g, 'c> {
                 let mut parts = vec![self.context.terms.type_is(OBJECT)];
                 for (name, member) in members {
                     let variable = self.inside_a_constant(id, member);
-                    let named = self.context.languages.words([name.as_str()]);
+                    let named = self.context.languages.word(name);
                     parts.push(self.context.terms.p_prop(named, variable));
                     parts.push(self.context.terms.p_req(named));
                 }
@@ -504,7 +504,7 @@ impl<'g, 'c> Lowering<'g, 'c> {
         // A property with this name satisfies the schema.
         for (name, schema) in &keywords.properties {
             let variable = self.variable(*schema);
-            let named = self.context.languages.words([*name]);
+            let named = self.context.languages.word(name);
             parts.push(self.context.terms.p_prop(named, variable));
         }
         // So does one whose name the pattern matches. A pattern that is not read as a
