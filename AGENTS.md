@@ -8,6 +8,8 @@ Everything Python runs through `uv`, from `python/`: `uv --directory python run 
 
 `.github/workflows/release.yml` runs release-please: it keeps a release pull request open, and merging that publishes the crate to crates.io and the Python package to PyPI. `.github/workflows/wheels.yml` builds the wheels and the source distribution for it, and runs on a pull request that changes how the package is built.
 
+The two repositories tell each other of a release with a `repository_dispatch` event, sent as the GitHub App of `PR_BOT_CLIENT_ID`. A release here sends `subsumes-released` to subsumes-benchmark, which pins its adapters to it in a pull request. A release of the benchmark sends `benchmark-released` here, and `.github/workflows/benchmark-release.yml` opens a pull request that pins the corpus in the `Makefile` to it.
+
 The release pull request raises the versions. Never change the version in `Cargo.toml`, `python/pyproject.toml`, `python/uv.lock` or `.release-please-manifest.json` by hand.
 
 ## Running the benchmark
