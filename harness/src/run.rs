@@ -8,23 +8,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Instant;
 
-use serde::Deserialize;
-use serde::de::DeserializeOwned;
-use serde_json::Value;
 use subsumes::Checker;
 
+use crate::case::{Case, Reader};
 use crate::counterexample;
 use crate::results::{Direction, Outcome, Record};
-
-/// A case of the corpus, from its file: the two schemas and the labels. What else the file
-/// says about the case is not read.
-#[derive(Deserialize)]
-struct Case {
-    a_subsumes_b: Option<bool>,
-    b_subsumes_a: Option<bool>,
-    a: Value,
-    b: Value,
-}
 
 /// The file in the folder of a collection that describes the collection and is no case.
 const COLLECTION: &str = "collection.json";
@@ -53,13 +41,14 @@ pub fn run(corpus: &Path, jobs: NonZeroUsize) -> Result<Vec<Record>, String> {
     let failed = AtomicBool::new(false);
     // A job takes the next case that no job has taken, until none is left or one has failed.
     let job = || {
+        let mut reader = Reader::default();
         let mut checked = Vec::new();
         while !failed.load(Ordering::Relaxed) {
             let index = next.fetch_add(1, Ordering::Relaxed);
             let Some(case) = cases.get(index) else {
                 break;
             };
-            let records = check(corpus, case, &checker);
+            let records = check(corpus, case, &checker, &mut reader);
             failed.fetch_or(records.is_err(), Ordering::Relaxed);
             checked.push((index, records));
         }
@@ -87,20 +76,25 @@ pub fn run(corpus: &Path, jobs: NonZeroUsize) -> Result<Vec<Record>, String> {
 }
 
 /// Checks one case in both directions.
-fn check(corpus: &Path, case: &str, checker: &Checker) -> Result<[Record; 2], String> {
+fn check(
+    corpus: &Path,
+    case: &str,
+    checker: &Checker,
+    reader: &mut Reader,
+) -> Result<[Record; 2], String> {
     let Case {
         a_subsumes_b,
         b_subsumes_a,
         a,
         b,
-    } = json(&corpus.join(format!("{case}.json")))?;
+    } = reader.read(&corpus.join(format!("{case}.json")))?;
     Ok(Direction::BOTH.map(|direction| {
         let (wide, narrow, expected) = match direction {
             Direction::ASubsumesB => (&a, &b, a_subsumes_b),
             Direction::BSubsumesA => (&b, &a, b_subsumes_a),
         };
         let start = Instant::now();
-        let result = checker.check(wide, narrow);
+        let result = checker.check(&wide.value, &narrow.value);
         let nanos = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         // The validator is asked after the clock has stopped.
         let outcome = Outcome::of(&result, |counterexample| {
@@ -159,18 +153,12 @@ fn entries(folder: &Path) -> Result<Vec<PathBuf>, String> {
     paths.collect::<Result<_, _>>().map_err(failed)
 }
 
-pub fn json<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
-    let failed = |error: &dyn std::fmt::Display| format!("cannot read {}: {error}", path.display());
-    let text = fs::read_to_string(path).map_err(|error| failed(&error))?;
-    serde_json::from_str(&text).map_err(|error| failed(&error))
-}
-
 #[cfg(test)]
 mod tests {
     use std::env;
     use std::process;
 
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::*;
 

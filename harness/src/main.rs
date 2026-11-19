@@ -1,3 +1,4 @@
+mod case;
 mod compare;
 mod counterexample;
 mod inspect;
