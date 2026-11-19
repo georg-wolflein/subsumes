@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Benchmark run time by commit</title>
+<style>
+  .viz { font-family: var(--font-sans, system-ui, sans-serif); color: var(--foreground, #0b0b0b); }
+  .tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .tile { border: 1px solid var(--border, #d9d8d2); border-radius: var(--radius, 8px); padding: 12px 14px; }
+  .tile .label { font-size: 12px; color: var(--muted-foreground, #6b6a66); }
+  .tile .value { font-size: 26px; font-weight: 600; margin-top: 4px; line-height: 1.15; }
+  .tile .value small { font-size: 14px; font-weight: 500; color: var(--muted-foreground, #6b6a66); }
+  .tile .delta { font-size: 12px; margin-top: 4px; color: var(--muted-foreground, #6b6a66); }
+  figure { margin: 0 0 24px 0; }
+  figcaption { margin-bottom: 6px; }
+  figcaption .title { font-size: 14px; font-weight: 600; }
+  figcaption .sub { font-size: 12px; color: var(--muted-foreground, #6b6a66); margin-top: 2px; }
+  svg { display: block; width: 100%; overflow: visible; }
+  svg text { font-family: var(--font-sans, system-ui, sans-serif); fill: var(--muted-foreground, #6b6a66); font-size: 11px; }
+  svg text.value { fill: var(--foreground, #0b0b0b); font-size: 12px; font-weight: 600; }
+  svg text.name { fill: var(--foreground, #0b0b0b); font-size: 11px; }
+  svg .grid { stroke: var(--border, #d9d8d2); stroke-width: 1; }
+  svg .goal { stroke: var(--muted-foreground, #6b6a66); stroke-width: 1; }
+  svg .ring { stroke: var(--background, #fff); stroke-width: 2; }
+  .legend { display: flex; gap: 16px; font-size: 12px; color: var(--muted-foreground, #6b6a66); margin: 2px 0 4px; flex-wrap: wrap; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .legend i { display: inline-block; width: 14px; height: 0; border-top: 2px solid; }
+  .legend i.dot { width: 6px; height: 6px; border: 0; border-radius: 50%; }
+  .tip { position: fixed; pointer-events: none; background: var(--popover, #fff); color: var(--popover-foreground, #0b0b0b); border: 1px solid var(--border, #d9d8d2); border-radius: 6px; padding: 6px 8px; font-size: 12px; line-height: 1.35; box-shadow: 0 2px 8px rgba(0,0,0,.15); display: none; z-index: 5; max-width: 260px; }
+  .tip b { font-weight: 600; }
+  .tip .k { color: var(--muted-foreground, #6b6a66); }
+  details { font-size: 12px; margin-top: 6px; color: var(--muted-foreground, #6b6a66); }
+  details summary { cursor: pointer; }
+  table { border-collapse: collapse; margin-top: 6px; font-size: 12px; color: var(--foreground, #0b0b0b); width: 100%; }
+  th, td { text-align: right; padding: 3px 8px; border-bottom: 1px solid var(--border, #d9d8d2); font-variant-numeric: tabular-nums; }
+  th:first-child, td:first-child { text-align: left; }
+  th { font-weight: 600; color: var(--muted-foreground, #6b6a66); }
+  @media (max-width: 480px) { .tiles { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="viz">
+  <div class="tiles" id="tiles"></div>
+
+  <figure>
+    <figcaption>
+      <div class="title">Time of a whole benchmark run, by commit</div>
+      <div class="sub">34,002 checks, one after the other. Seconds of wall-clock time; the line joins the medians, the small dots are the single runs.</div>
+    </figcaption>
+    <svg id="time" height="300" role="img" aria-label="Time of a whole benchmark run by commit"></svg>
+    <details><summary>Table</summary><div id="time-table"></div></details>
+  </figure>
+
+  <figure>
+    <figcaption>
+      <div class="title">The second round, on its own scale</div>
+      <div class="sub">The same runs from E2 on. E6 decides 30 checks and halves the steps, and a run takes longer: steps are not time.</div>
+    </figcaption>
+    <svg id="zoom" height="240" role="img" aria-label="Time of a whole benchmark run from experiment 2 on"></svg>
+  </figure>
+
+  <figure>
+    <figcaption>
+      <div class="title">Steps of one check as its <code>oneOf</code> grows</div>
+      <div class="sub">A <code>oneOf</code> of n kinds of object, written in two ways, checked against itself. Logarithmic scale: a straight line is exponential growth.</div>
+    </figcaption>
+    <div class="legend" id="steps-legend"></div>
+    <svg id="steps" height="280" role="img" aria-label="Steps of one check against the number of alternatives"></svg>
+    <details><summary>Table</summary><div id="steps-table"></div></details>
+  </figure>
+  <div class="tip" id="tip"></div>
+</div>
+<script>
+/*DATA*/
+const DATA = {
+  commits: [
+    { id: "9e48b0d", name: "Baseline", note: "release 0.4.0", runs: [423.39, 381.66, 390.02, 373.63], budget: 274, unknown: 1686, steps: 3096499359 },
+    { id: "3caefd6", name: "E1", note: "split first on the disjunction that most often left no alternative", runs: [129.88, 132.05, 119.66], budget: 80, unknown: 1492, steps: 1172620331 },
+    { id: "2e2e3fa", name: "E2", note: "count a dead end against the disjunction that brought it", runs: [35.63, 35.57, 36.18, 36.22], budget: 36, unknown: 1448, steps: 571521222 },
+    { id: "e3e7ccb", name: "E4", note: "keep an instance as what it is made of", runs: [35.12, 36.24, 36.40], budget: 34, unknown: 1446, steps: 531701592 },
+    { id: "700c107", name: "E5", note: "cut the names of an object by all patterns in one product", runs: [31.81, 33.05, 33.39], budget: 34, unknown: 1446, steps: 494723460 },
+    { id: "2db7cec", name: "E6", note: "look for a property only where its value can be one", runs: [35.00, 36.37, 35.58], budget: 4, unknown: 1416, steps: 225018161 },
+    { id: "fc470ea", name: "E7", note: "an instance is one of every c-reference that asks no more", runs: [28.61, 30.17, 30.01], budget: 4, unknown: 1416, steps: 184892992 },
+    { id: "11d937e", name: "E8", note: "two of a oneOf share their first", runs: [26.02, 26.74, 27.47], budget: 4, unknown: 1416, steps: 151919035 },
+  ],
+  labelled: ["Baseline", "E1", "E2", "E8"],
+  zoomFrom: 2,
+  scaling: {
+    kinds: [4, 5, 6, 7, 8],
+    series: [
+      { name: "Baseline", steps: [32563, 231300, 1773709, null, null] },
+      { name: "E1", steps: [13183, 65712, 374404, 1921296, 9381607] },
+      { name: "E2", steps: [2839, 5434, 9908, 16578, 24999] },
+      { name: "E8", steps: [1902, 3189, 5416, 8577, 12415] },
+    ],
+    budget: 10000000,
+  },
+};
+/*END*/
+
+const NS = "http://www.w3.org/2000/svg";
+const el = (tag, attrs = {}, text) => {
+  const node = document.createElementNS(NS, tag);
+  for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
+  if (text !== undefined) node.textContent = text;
+  return node;
+};
+const median = values => {
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = sorted.length >> 1;
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+};
+const seconds = value => value >= 100 ? value.toFixed(0) : value.toFixed(1);
+const count = value => value.toLocaleString("en-US");
+const tip = document.getElementById("tip");
+const showTip = (event, rows) => {
+  tip.replaceChildren();
+  rows.forEach(([key, value], index) => {
+    const row = document.createElement("div");
+    if (index === 0) { const b = document.createElement("b"); b.textContent = key; row.append(b); }
+    else {
+      const k = document.createElement("span"); k.className = "k"; k.textContent = key + " ";
+      const v = document.createElement("b"); v.textContent = value;
+      row.append(v, " ", k);
+    }
+    tip.append(row);
+  });
+  tip.style.display = "block";
+  const x = Math.min(event.clientX + 12, window.innerWidth - tip.offsetWidth - 8);
+  tip.style.left = Math.max(8, x) + "px";
+  tip.style.top = Math.max(8, event.clientY - tip.offsetHeight - 10) + "px";
+};
+const hideTip = () => { tip.style.display = "none"; };
+const hit = (svg, x, y, rows) => {
+  const target = el("circle", { cx: x, cy: y, r: 14, fill: "transparent", tabindex: 0 });
+  target.addEventListener("pointermove", event => showTip(event, rows));
+  target.addEventListener("pointerleave", hideTip);
+  target.addEventListener("focus", () => { const box = target.getBoundingClientRect(); showTip({ clientX: box.right, clientY: box.top }, rows); });
+  target.addEventListener("blur", hideTip);
+  svg.append(target);
+};
+
+// The tiles.
+(() => {
+  const first = DATA.commits[0], last = DATA.commits[DATA.commits.length - 1];
+  const before = median(first.runs), after = median(last.runs);
+  const total = 34002;
+  const tiles = [
+    ["Whole run, one case at a time", `${seconds(after)} s`, `was ${seconds(before)} s: ${(100 * (1 - after / before)).toFixed(0)}% less`],
+    ["Checks that end at the budget", count(last.budget), `was ${count(first.budget)} of ${count(total)}`],
+    ["Checks decided", count(total - last.unknown), `was ${count(total - first.unknown)}: ${count(first.unknown - last.unknown)} more, none lost`],
+  ];
+  const root = document.getElementById("tiles");
+  for (const [label, value, delta] of tiles) {
+    const tile = document.createElement("div"); tile.className = "tile";
+    const l = document.createElement("div"); l.className = "label"; l.textContent = label;
+    const v = document.createElement("div"); v.className = "value"; v.textContent = value;
+    const d = document.createElement("div"); d.className = "delta"; d.textContent = delta;
+    tile.append(l, v, d); root.append(tile);
+  }
+})();
+
+// Time by commit: the medians as a line, the single runs as dots.
+function drawRuns(id, commits, options) {
+  const svg = document.getElementById(id);
+  svg.replaceChildren();
+  const width = svg.clientWidth, height = options.height;
+  const margin = { top: 26, right: 28, bottom: 54, left: 40 };
+  const medians = commits.map(commit => median(commit.runs));
+  const all = DATA.commits.map(commit => median(commit.runs));
+  const top = options.top ?? Math.ceil(Math.max(...commits.flatMap(commit => commit.runs)) / options.tick) * options.tick;
+  const inner = width - margin.left - margin.right - 40;
+  const x = index => margin.left + 20 + (commits.length === 1 ? 0.5 : index / (commits.length - 1)) * inner;
+  const y = value => margin.top + (1 - value / top) * (height - margin.top - margin.bottom);
+  for (let tick = 0; tick <= top; tick += options.tick) {
+    svg.append(el("line", { class: "grid", x1: margin.left, x2: width - margin.right, y1: y(tick), y2: y(tick) }));
+    svg.append(el("text", { x: margin.left - 6, y: y(tick) + 4, "text-anchor": "end" }, tick));
+  }
+  svg.append(el("text", { x: margin.left - 6, y: margin.top - 12, "text-anchor": "end" }, "s"));
+  if (options.goal) {
+    const goal = all[0] / 4;
+    svg.append(el("line", { class: "goal", x1: margin.left, x2: width - margin.right, y1: y(goal), y2: y(goal) }));
+    svg.append(el("text", { x: width - margin.right, y: y(goal) - 6, "text-anchor": "end" }, `the goal: a quarter of the baseline, ${seconds(goal)} s`));
+  }
+  const path = medians.map((value, index) => `${index ? "L" : "M"}${x(index)},${y(value)}`).join(" ");
+  svg.append(el("path", { d: path, fill: "none", stroke: "var(--chart-1, #2a78d6)", "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+  commits.forEach((commit, index) => {
+    for (const run of commit.runs) {
+      svg.append(el("circle", { cx: x(index), cy: y(run), r: 2.5, fill: "var(--muted-foreground, #6b6a66)", opacity: 0.75 }));
+    }
+    svg.append(el("circle", { class: "ring", cx: x(index), cy: y(medians[index]), r: 5, fill: "var(--chart-1, #2a78d6)" }));
+    if (!options.labelled || options.labelled.includes(commit.name)) {
+      const first = index === 0 && options.goal;
+      const spread = Math.max(...commit.runs) - Math.min(...commit.runs);
+      const above = y(Math.max(...commit.runs)) - 10;
+      svg.append(el("text", { class: "value", x: x(index) + (first ? 12 : 0), y: first ? y(medians[index]) + 4 : above, "text-anchor": first ? "start" : "middle" }, `${seconds(medians[index])} s`));
+    }
+    svg.append(el("text", { class: "name", x: x(index), y: height - margin.bottom + 18, "text-anchor": "middle" }, commit.name));
+    // The commit below the name, where the points are far enough apart for it.
+    if (commits.length === 1 || inner / (commits.length - 1) >= 56) {
+      svg.append(el("text", { x: x(index), y: height - margin.bottom + 33, "text-anchor": "middle" }, commit.id));
+    }
+    const place = DATA.commits.indexOf(commit);
+    const less = place ? `${(100 * (1 - medians[index] / all[0])).toFixed(1)}% below the baseline` : "the baseline";
+    hit(svg, x(index), y(medians[index]), [
+      [`${commit.name} (${commit.id}): ${commit.note}`],
+      ["median of " + commit.runs.length + " runs", `${seconds(medians[index])} s`],
+      [less, ""], ["checks at the budget", count(commit.budget)], ["steps", count(commit.steps)],
+    ]);
+  });
+}
+
+function drawTime() {
+  drawRuns("time", DATA.commits, { height: 300, tick: 100, goal: true, labelled: DATA.labelled });
+  drawRuns("zoom", DATA.commits.slice(DATA.zoomFrom), { height: 240, tick: 10, top: 40 });
+  const commits = DATA.commits;
+  const medians = commits.map(commit => median(commit.runs));
+  const table = document.createElement("table");
+  const head = table.insertRow();
+  for (const name of ["Commit", "What", "Runs (s)", "Median (s)", "Of the baseline", "At the budget", "Unknown", "Steps"]) { const th = document.createElement("th"); th.textContent = name; head.append(th); }
+  commits.forEach((commit, index) => {
+    const row = table.insertRow();
+    const cells = [`${commit.name} ${commit.id}`, commit.note, commit.runs.map(seconds).join(", "), seconds(medians[index]), `${(100 * medians[index] / medians[0]).toFixed(1)}%`, count(commit.budget), count(commit.unknown), count(commit.steps)];
+    cells.forEach((text, place) => { const cell = row.insertCell(); cell.textContent = text; if (place === 1) cell.style.textAlign = "left"; });
+  });
+  document.getElementById("time-table").replaceChildren(table);
+}
+
+// Steps against the number of alternatives.
+function drawSteps() {
+  const svg = document.getElementById("steps");
+  svg.replaceChildren();
+  const width = svg.clientWidth, height = 280;
+  const margin = { top: 16, right: 86, bottom: 40, left: 52 };
+  const { kinds, series, budget } = DATA.scaling;
+  const colors = ["var(--chart-1, #2a78d6)", "var(--chart-2, #eb6834)", "var(--chart-3, #1baf7a)", "var(--chart-4, #eda100)"];
+  const low = 3, high = 7.3;
+  const x = index => margin.left + index / (kinds.length - 1) * (width - margin.left - margin.right);
+  const y = value => margin.top + (1 - (Math.log10(value) - low) / (high - low)) * (height - margin.top - margin.bottom);
+  for (let power = 3; power <= 7; power++) {
+    svg.append(el("line", { class: "grid", x1: margin.left, x2: width - margin.right, y1: y(10 ** power), y2: y(10 ** power) }));
+    const label = power < 6 ? `${10 ** (power - 3)}K` : `${10 ** (power - 6)}M`;
+    svg.append(el("text", { x: margin.left - 6, y: y(10 ** power) + 4, "text-anchor": "end" }, label));
+  }
+  svg.append(el("text", { x: margin.left, y: y(budget) - 5 }, "the budget: 10 million steps"));
+  kinds.forEach((kind, index) => svg.append(el("text", { x: x(index), y: height - margin.bottom + 16, "text-anchor": "middle" }, kind)));
+  svg.append(el("text", { x: margin.left + (width - margin.left - margin.right) / 2, y: height - 6, "text-anchor": "middle" }, "kinds of object in the oneOf"));
+  const legend = document.getElementById("steps-legend");
+  legend.replaceChildren();
+  series.forEach((one, place) => {
+    const points = one.steps.map((value, index) => value === null ? null : [x(index), y(value)]).filter(Boolean);
+    svg.append(el("path", { d: points.map(([px, py], index) => `${index ? "L" : "M"}${px},${py}`).join(" "), fill: "none", stroke: colors[place], "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+    one.steps.forEach((value, index) => {
+      if (value === null) return;
+      svg.append(el("circle", { class: "ring", cx: x(index), cy: y(value), r: 4, fill: colors[place] }));
+      hit(svg, x(index), y(value), [[`${one.name}, ${kinds[index]} kinds`], ["steps", count(value)]]);
+    });
+    const [lx, ly] = points[points.length - 1];
+    const ended = one.steps[one.steps.length - 1] === null;
+    if (ended) {
+      svg.append(el("text", { class: "name", x: lx - 8, y: ly - 8, "text-anchor": "end" }, `${one.name}: at the budget from 7`));
+    } else {
+      svg.append(el("text", { class: "name", x: lx + 10, y: ly + 4 }, one.name));
+    }
+    const item = document.createElement("span");
+    const key = document.createElement("i"); key.style.borderTopColor = colors[place];
+    item.append(key, one.name); legend.append(item);
+  });
+  const table = document.createElement("table");
+  const head = table.insertRow();
+  for (const name of ["Kinds", ...series.map(one => one.name)]) { const th = document.createElement("th"); th.textContent = name; head.append(th); }
+  kinds.forEach((kind, index) => {
+    const row = table.insertRow();
+    row.insertCell().textContent = kind;
+    for (const one of series) row.insertCell().textContent = one.steps[index] === null ? "at the budget" : count(one.steps[index]);
+  });
+  document.getElementById("steps-table").replaceChildren(table);
+}
+
+const draw = () => { drawTime(); drawSteps(); };
+draw();
+window.addEventListener("resize", draw);
+</script>
+</body>
+</html>
