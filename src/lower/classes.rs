@@ -72,46 +72,15 @@ pub(super) fn classes(
     // round separates nothing, nothing will.
     //
     // A class is the number of a list: what a schema says by itself, and then the class of
-    // each schema that it leads to. A list that comes again has the number that it had, also
-    // in a later round.
-    //
-    // So a node that leads to no cycle has one class in every round, and the first round
-    // gives it. Of those that lead to a cycle, the rounds after the first class again only
-    // those that a cycle leads to, which are what the nodes on cycles are told apart by. The
-    // others get their class once, in the last round. Every round sees the same nodes on
-    // cycles as when each classed every node, so the classes are the same and so are the
-    // rounds, and a round costs what it did.
+    // each schema that it leads to.
     const UNTOLD: u32 = u32::MAX;
-    let mut changes = cyclic.clone();
-    for &node in &order {
-        changes[node] |= successors.of(node).iter().any(|&to| changes[to]);
-    }
-    let mut behind_a_cycle = cyclic.clone();
-    for &node in order.iter().rev() {
-        if behind_a_cycle[node] {
-            for &to in successors.of(node) {
-                behind_a_cycle[to] = true;
-            }
-        }
-    }
-    let in_last = |node: &&usize| changes[**node] && !behind_a_cycle[**node];
-    let in_first: Vec<usize> = order
-        .iter()
-        .filter(|node| !in_last(node))
-        .copied()
-        .collect();
-    let again: Vec<usize> = order
-        .iter()
-        .filter(|node| changes[**node] && behind_a_cycle[**node])
-        .copied()
-        .collect();
-    let last: Vec<usize> = order.iter().filter(in_last).copied().collect();
-
     let mut numbers: HashMap<Box<[u32]>, u32> = HashMap::with_capacity(count);
     let mut said = Vec::new();
-    let (mut previous, mut current) = (vec![UNTOLD; count], vec![UNTOLD; count]);
-    let mut class = |nodes: &[usize], previous: &[u32], current: &mut [u32]| {
-        for &node in nodes {
+    let mut previous = vec![UNTOLD; count];
+    let mut blocks = usize::from(cyclic.contains(&true));
+    loop {
+        let mut current = vec![UNTOLD; count];
+        for &node in &order {
             said.clear();
             said.push(own[node]);
             let places = successors.of(node).iter();
@@ -124,20 +93,13 @@ pub(super) fn classes(
             }));
             current[node] = numbered(&mut numbers, &said);
         }
-    };
-    let mut blocks = usize::from(cyclic.contains(&true));
-    let mut round = &in_first;
-    loop {
-        class(round, &previous, &mut current);
         let on_cycles = (0..count).filter(|&node| cyclic[node]);
         let told_apart: HashSet<u32> = on_cycles.map(|node| current[node]).collect();
         if told_apart.len() == blocks {
-            class(&last, &previous, &mut current);
             return Ok((current, blocks > 0));
         }
         blocks = told_apart.len();
-        previous.copy_from_slice(&current);
-        round = &again;
+        previous = current;
         budget.charge(count as u64)?;
     }
 }
@@ -466,7 +428,6 @@ mod tests {
     use super::*;
     use crate::lower::scopes::ScopeId;
     use crate::schema::parse;
-    use crate::testing::Random;
 
     /// The class of each node of one schema, by its location.
     type Classed = Vec<(String, u32)>;
@@ -791,7 +752,7 @@ mod tests {
         // Three of the four schemas on the cycle say the same by themselves. Each round tells
         // one more of them apart, by what it leads to, and a round that tells nothing apart
         // ends the work. Every round but the first costs a step for each schema that is
-        // reached.
+        // classed.
         let cycle = json!({"not": {"not": {"not": {"$ref": "#"}}}});
         assert_eq!(classed(&cycle), Err(Exhausted));
         // Schemas that nothing leads to are not classed. Here the root and `true` are, and
@@ -824,102 +785,6 @@ mod tests {
         assert_ne!(of_a, of_c);
         // Dropping a value this deep would recurse, which is no concern of this test.
         std::mem::forget((a, b, c));
-    }
-
-    #[test]
-    fn the_classes_are_those_of_rounds_that_class_every_schema() {
-        // The classes as rounds give them that class every schema anew: the rounds that the
-        // budget pays for, and for each schema as it is reached its class.
-        let every_schema_in_every_round = |graph: &Graph, scopes: &Scopes| {
-            let mut texts = HashMap::new();
-            let own: Vec<u32> = (0..scopes.len())
-                .map(|index| {
-                    let id = scopes.at(index).node;
-                    let mut text = Vec::new();
-                    describe(id, graph.node(id), &mut text);
-                    numbered(&mut texts, &text)
-                })
-                .collect();
-            let successors = scopes.leads_to();
-            let (order, cyclic) = components(successors);
-            let mut numbers = HashMap::new();
-            let mut previous = vec![u32::MAX; scopes.len()];
-            let mut blocks = usize::from(cyclic.contains(&true));
-            for rounds in 0.. {
-                let mut current = vec![u32::MAX; scopes.len()];
-                for &node in &order {
-                    let mut said = vec![own[node]];
-                    for &to in successors.of(node) {
-                        said.push(if cyclic[to] {
-                            previous[to]
-                        } else {
-                            current[to]
-                        });
-                    }
-                    current[node] = numbered(&mut numbers, &said);
-                }
-                let on_cycles = (0..scopes.len()).filter(|&node| cyclic[node]);
-                let told_apart: HashSet<u32> = on_cycles.map(|node| current[node]).collect();
-                if told_apart.len() == blocks {
-                    return (rounds, current);
-                }
-                blocks = told_apart.len();
-                previous = current;
-            }
-            unreachable!("a round that tells nothing apart ends the rounds")
-        };
-        // Definitions that refer to each other, in properties, in items and in place, each
-        // with a keyword or two of its own, so that cycles lead to cycles and schemas that
-        // are on none lead to them and are led to.
-        let mut random = Random(7);
-        let schema = |random: &mut Random, depth: u32| -> Value {
-            let mut schema = Map::new();
-            let reference =
-                |random: &mut Random| json!({"$ref": format!("#/$defs/d{}", random.below(5))});
-            for _ in 0..random.below(4) {
-                let (key, value) = match random.below(7) {
-                    0 => ("minimum", json!(random.below(2))),
-                    1 => ("type", json!(random.pick(&["object", "array", "null"]))),
-                    2 => ("items", reference(random)),
-                    3 => (
-                        "properties",
-                        json!({"a": reference(random), "b": {"minItems": random.below(2)}}),
-                    ),
-                    4 => ("allOf", json!([reference(random)])),
-                    5 if depth > 0 => ("not", reference(random)),
-                    _ => ("anyOf", json!([reference(random), {"type": "null"}])),
-                };
-                schema.insert(key.to_owned(), value);
-            }
-            Value::Object(schema)
-        };
-        let document = |random: &mut Random| {
-            let definitions: Map<String, Value> = (0..5)
-                .map(|index| (format!("d{index}"), schema(random, 1)))
-                .collect();
-            let mut root = schema(random, 0);
-            root["$defs"] = Value::Object(definitions);
-            root["$ref"] = json!("#/$defs/d0");
-            root
-        };
-        let mut rounds = 0;
-        for _ in 0..400 {
-            let (a, b) = (document(&mut random), document(&mut random));
-            let graph = parse(&a, &b).unwrap().link().unwrap();
-            let mut budget = Budget::new(u64::MAX);
-            let (scopes, classes) = reached(&graph, &mut budget).unwrap();
-            let (expected_rounds, expected) = every_schema_in_every_round(&graph, &scopes);
-            assert_eq!(budget.spent(), expected_rounds * scopes.len() as u64);
-            rounds += expected_rounds;
-            // The two say of every two schemas alike whether they are of one class.
-            let (mut there, mut back) = (HashMap::new(), HashMap::new());
-            for (class, expected) in classes.iter().zip(&expected) {
-                assert_eq!(*there.entry(class).or_insert(expected), expected, "{a} {b}");
-                assert_eq!(*back.entry(expected).or_insert(class), class, "{a} {b}");
-            }
-        }
-        // Most pairs take rounds after the first.
-        assert!(rounds > 400, "{rounds}");
     }
 
     #[test]
