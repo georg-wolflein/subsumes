@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Benchmark Speed Report</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface-1: #fcfcfb;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --ring: rgba(11,11,11,0.10);
+  --algorithmic: #2a78d6;
+  --shared: #eb6834;
+  --constant: #1baf7a;
+  --fix: #898781;
+  --checks: #6250d6;
+  --outside: #eda100;
+  --line: #52514e;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface-1: #1a1a19;
+    --text-primary: #f0efec;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --ring: rgba(255,255,255,0.10);
+    --algorithmic: #3987e5;
+    --shared: #d95926;
+    --constant: #199e70;
+    --fix: #898781;
+    --checks: #9085e9;
+    --outside: #c98500;
+    --line: #c3c2b7;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface-1: #1a1a19;
+  --text-primary: #f0efec;
+  --text-secondary: #c3c2b7;
+  --text-muted: #898781;
+  --grid: #2c2c2a;
+  --axis: #383835;
+  --ring: rgba(255,255,255,0.10);
+  --algorithmic: #3987e5;
+  --shared: #d95926;
+  --constant: #199e70;
+  --fix: #898781;
+  --checks: #9085e9;
+  --outside: #c98500;
+  --line: #c3c2b7;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--text-primary);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+main { max-width: 960px; margin: 0 auto; padding: 24px 16px 48px; }
+h1 { font-size: 24px; margin: 0 0 4px; font-weight: 650; }
+h2 { font-size: 17px; margin: 0 0 2px; font-weight: 600; }
+p.lead { color: var(--text-secondary); margin: 0 0 20px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 20px; }
+.tile { background: var(--surface-1); border: 1px solid var(--ring); border-radius: 10px; padding: 12px 14px; }
+.tile .k { color: var(--text-secondary); font-size: 13px; }
+.tile .v { font-size: 26px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.tile .s { color: var(--text-muted); font-size: 12px; }
+section.card { background: var(--surface-1); border: 1px solid var(--ring); border-radius: 12px; padding: 16px; margin-bottom: 20px; }
+.sub { color: var(--text-secondary); font-size: 13px; margin: 0 0 10px; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; margin: 0 0 8px; font-size: 13px; color: var(--text-secondary); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+svg { width: 100%; height: auto; display: block; overflow: visible; }
+svg text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+.tick { fill: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.lab { fill: var(--text-secondary); font-size: 12px; }
+.val { fill: var(--text-primary); font-size: 12px; font-variant-numeric: tabular-nums; }
+.note { fill: var(--text-muted); font-size: 11px; }
+#tip {
+  position: fixed; pointer-events: none; z-index: 10; display: none;
+  background: var(--surface-1); color: var(--text-primary);
+  border: 1px solid var(--ring); border-radius: 8px; padding: 8px 10px;
+  font-size: 13px; max-width: 300px; box-shadow: 0 4px 16px rgba(0,0,0,0.12);
+}
+#tip b { display: block; margin-bottom: 2px; }
+#tip .m { color: var(--text-secondary); }
+details { margin-top: 10px; font-size: 13px; }
+summary { cursor: pointer; color: var(--text-secondary); }
+.tablewrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; margin-top: 8px; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+th { color: var(--text-secondary); font-weight: 600; }
+td.n, th.n { text-align: right; }
+.hit { fill: transparent; cursor: default; }
+.hit:focus { outline: none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Benchmark speed report</h1>
+  <p class="lead">One run of the corpus (34,002 checks, one job), from release 0.4.0 to the end of the second goal. Every change was checked to lose no verdict and give no wrong one.</p>
+
+  <div class="tiles">
+    <div class="tile"><div class="k">A whole run</div><div class="v">386 s → 3.4 s</div><div class="s">median of three runs, one job</div></div>
+    <div class="tile"><div class="k">Faster overall</div><div class="v">112×</div><div class="s">time in the checks 377 s → 2.0 s</div></div>
+    <div class="tile"><div class="k">Steps of a run</div><div class="v">94× fewer</div><div class="s">3,096 million → 33 million, the deterministic work count</div></div>
+    <div class="tile"><div class="k">Verdicts</div><div class="v">+274 decided</div><div class="s">0 lost, 0 wrong; none at the budget</div></div>
+  </div>
+
+  <section class="card" aria-labelledby="c1">
+    <h2 id="c1">Time of a whole run after each change</h2>
+    <p class="sub">Seconds, on a log scale. Each point is a commit; its colour says what kind of change it is. E1–E8 were timed with other programs at work on the machine; from E9 on, on a quiet machine (E8 there: 23.7 s).</p>
+    <div class="legend" id="legend1"></div>
+    <svg id="chart1" role="img" aria-label="Time of a whole run after each change, log scale"></svg>
+  </section>
+
+  <section class="card" aria-labelledby="c2">
+    <h2 id="c2">How much faster each change made the run</h2>
+    <p class="sub">The time of a whole run before the change divided by the time after it, in the order the changes were made, on a log scale. Left of 1× is slower.</p>
+    <div class="legend" id="legend2"></div>
+    <svg id="chart2" role="img" aria-label="Speedup of each change, sorted"></svg>
+    <details>
+      <summary>Table view</summary>
+      <div class="tablewrap"><table id="table2"></table></div>
+    </details>
+  </section>
+
+  <section class="card" aria-labelledby="c3">
+    <h2 id="c3">Second goal: in the checks and around them</h2>
+    <p class="sub">Seconds of a whole run, split into the time in the checks and the time of the harness around them (reading cases, validating counterexamples, writing results). Quiet machine, median of three.</p>
+    <div class="legend" id="legend3"></div>
+    <svg id="chart3" role="img" aria-label="Time in the checks and outside them for each change of the second goal"></svg>
+  </section>
+</main>
+<div id="tip" role="tooltip"></div>
+<script>
+const KINDS = {
+  algorithmic: { label: "Algorithmic: the search does less", color: "--algorithmic" },
+  shared: { label: "Work shared or done once", color: "--shared" },
+  constant: { label: "Same work, cheaper", color: "--constant" },
+  fix: { label: "Soundness fix (a cost)", color: "--fix" },
+};
+// The changes in the order they were made. `before` and `after`: seconds of a whole run.
+const STEPS = [
+  { id: "base", name: "Release 0.4.0", kind: null, after: 385.8, steps: 3096 },
+  { id: "E1", name: "Split first on the disjunction that most often left no alternative", kind: "algorithmic", before: 385.8, after: 129.9, steps: 1173 },
+  { id: "E2", name: "Count a dead end against the disjunction that brought it", kind: "algorithmic", before: 129.9, after: 35.9, steps: 572 },
+  { id: "E4", name: "Keep an instance as what it is made of (structure sharing)", kind: "shared", before: 35.9, after: 36.2, steps: 532 },
+  { id: "E5", name: "Cut the names of an object by all patterns in one product DFA", kind: "algorithmic", before: 36.2, after: 33.1, steps: 495 },
+  { id: "E6", name: "Look for a property only where its value can be one", kind: "algorithmic", before: 33.1, after: 35.6, steps: 225 },
+  { id: "E7", name: "Hand an instance on to every c-reference that asks no more", kind: "algorithmic", before: 35.6, after: 30.0, steps: 185 },
+  { id: "E8", name: "Two of a oneOf share their first (factored negated pairs)", kind: "algorithmic", before: 30.0, after: 26.7, steps: 152, quiet: 23.7 },
+  { id: "E9", name: "Drop a disjunction that the branch entails", kind: "algorithmic", before: 23.7, after: 13.1, steps: 72.5, note: "against E8 on a quiet machine" },
+  { id: "harness", name: "Harness: read a schema once while cases share it, fewer copies", kind: "constant", before: 13.43, after: 12.47, steps: 72.5 },
+  { id: "strings", name: "Build the DFA of a format once per process; plain ^word$ without the parser", kind: "shared", before: 12.47, after: 10.54, steps: 72.5 },
+  { id: "lower", name: "Lower each schema without a string, list or map entry of its own", kind: "constant", before: 10.54, after: 8.59, steps: 72.5 },
+  { id: "engine", name: "Engine: fast hash, copy-on-write branches, no allocation where most asked", kind: "constant", before: 8.59, after: 6.25, steps: 72.5 },
+  { id: "merge", name: "One variable for variables whose terms say the same (bisimulation)", kind: "algorithmic", before: 6.25, after: 4.69, steps: 39.2 },
+  { id: "both", name: "Check both directions of a case on one load", kind: "shared", before: 4.69, after: 3.36, steps: 32.9 },
+  { id: "fallback", name: "A converse that decides nothing is checked again by itself", kind: "fix", before: 3.36, after: 3.45, steps: 33.2 },
+];
+const ROUND2 = [
+  { id: "start", name: "start: E9 merged", checks: 11.17, wall: 13.43 },
+  { id: "harness", name: "+ harness", checks: 11.07, wall: 12.47 },
+  { id: "strings", name: "+ strings", checks: 9.06, wall: 10.54 },
+  { id: "lower", name: "+ lowering", checks: 7.23, wall: 8.59 },
+  { id: "engine", name: "+ engine constants", checks: 4.87, wall: 6.25 },
+  { id: "merge", name: "+ merged variables", checks: 3.27, wall: 4.69 },
+  { id: "both", name: "+ both directions", checks: 2.03, wall: 3.36 },
+  { id: "fallback", name: "+ fallback (final)", checks: 2.04, wall: 3.45 },
+];
+
+const NS = "http://www.w3.org/2000/svg";
+const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+function el(tag, attrs, parent, text) {
+  const node = document.createElementNS(NS, tag);
+  for (const [k, v] of Object.entries(attrs || {})) node.setAttribute(k, v);
+  if (text !== undefined) node.textContent = text;
+  if (parent) parent.appendChild(node);
+  return node;
+}
+const tip = document.getElementById("tip");
+function showTip(event, title, lines) {
+  tip.replaceChildren();
+  const b = document.createElement("b"); b.textContent = title; tip.appendChild(b);
+  for (const line of lines) { const d = document.createElement("div"); d.className = "m"; d.textContent = line; tip.appendChild(d); }
+  tip.style.display = "block";
+  const x = event.clientX ?? (event.target.getBoundingClientRect().left + 10);
+  const y = event.clientY ?? (event.target.getBoundingClientRect().top + 10);
+  const w = tip.offsetWidth, h = tip.offsetHeight;
+  tip.style.left = Math.min(window.innerWidth - w - 8, x + 12) + "px";
+  tip.style.top = Math.max(8, Math.min(window.innerHeight - h - 8, y + 12)) + "px";
+}
+function hideTip() { tip.style.display = "none"; }
+function bindTip(node, title, lines) {
+  node.setAttribute("tabindex", "0");
+  node.setAttribute("aria-label", title + ". " + lines.join(". "));
+  node.addEventListener("pointermove", e => showTip(e, title, lines));
+  node.addEventListener("pointerleave", hideTip);
+  node.addEventListener("focus", e => showTip(e, title, lines));
+  node.addEventListener("blur", hideTip);
+}
+function legend(id, items) {
+  const box = document.getElementById(id);
+  box.replaceChildren();
+  for (const [label, color] of items) {
+    const s = document.createElement("span");
+    const i = document.createElement("i"); i.style.background = css(color);
+    s.appendChild(i); s.appendChild(document.createTextNode(label)); box.appendChild(s);
+  }
+}
+const fmt = v => v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2);
+const factorText = f => (f >= 1 ? "" : "") + f.toFixed(2) + "×";
+
+function chart1() {
+  const svg = document.getElementById("chart1");
+  svg.replaceChildren();
+  const W = Math.max(340, svg.clientWidth || 900), H = 340;
+  const m = { l: 44, r: 14, t: 18, b: 64 };
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const lo = Math.log10(2), hi = Math.log10(500);
+  const y = v => m.t + (hi - Math.log10(v)) / (hi - lo) * (H - m.t - m.b);
+  const n = STEPS.length;
+  const x = i => m.l + i * (W - m.l - m.r) / (n - 1);
+  for (const v of [2, 5, 10, 20, 50, 100, 200, 500]) {
+    el("line", { x1: m.l, x2: W - m.r, y1: y(v), y2: y(v), stroke: css("--grid"), "stroke-width": 1 }, svg);
+    el("text", { x: m.l - 6, y: y(v) + 4, "text-anchor": "end", class: "tick" }, svg, v + " s");
+  }
+  // The boundary between the two goals: between E8 and E9.
+  const split = (x(7) + x(8)) / 2;
+  el("line", { x1: split, x2: split, y1: m.t, y2: H - m.b, stroke: css("--axis"), "stroke-dasharray": "4 4" }, svg);
+  el("text", { x: split - 6, y: m.t + 10, "text-anchor": "end", class: "note" }, svg, "first goal");
+  el("text", { x: split + 6, y: m.t + 10, class: "note" }, svg, "second goal");
+  const pts = STEPS.map((s, i) => [x(i), y(s.after)]);
+  el("path", { d: "M" + pts.map(p => p.join(",")).join("L"), fill: "none", stroke: css("--line"), "stroke-width": 2, "stroke-linejoin": "round" }, svg);
+  STEPS.forEach((s, i) => {
+    const color = s.kind ? css(KINDS[s.kind].color) : css("--text-primary");
+    el("circle", { cx: pts[i][0], cy: pts[i][1], r: 5, fill: color, stroke: css("--surface-1"), "stroke-width": 2 }, svg);
+    const t = el("text", { x: pts[i][0], y: H - m.b + 14, class: "tick", "text-anchor": "end", transform: `rotate(-45 ${pts[i][0]} ${H - m.b + 14})` }, svg, s.id);
+    const lines = [fmt(s.after) + " s a whole run", s.steps + " million steps"];
+    if (s.before) lines.unshift(fmt(s.before) + " s → " + fmt(s.after) + " s (" + factorText(s.before / s.after) + ")" + (s.note ? ", " + s.note : ""));
+    if (s.quiet) lines.push(s.quiet + " s on a quiet machine");
+    if (s.kind) lines.push(KINDS[s.kind].label);
+    const hit = el("circle", { cx: pts[i][0], cy: pts[i][1], r: 14, class: "hit" }, svg);
+    bindTip(hit, s.id + ": " + s.name, lines);
+  });
+  // Direct labels on a few points only.
+  const label = (i, text, dx, dy, anchor) => el("text", { x: pts[i][0] + dx, y: pts[i][1] + dy, class: "val", "text-anchor": anchor || "start" }, svg, text);
+  label(0, "386 s", 8, 4);
+  label(2, "35.9 s", 8, -6);
+  label(8, "13.1 s", 8, -8);
+  label(n - 1, "3.4 s", -8, -10, "end");
+}
+
+function chart2() {
+  const svg = document.getElementById("chart2");
+  svg.replaceChildren();
+  const rows = STEPS.filter(s => s.before).map(s => ({ ...s, f: s.before / s.after })).sort((a, b) => b.f - a.f);
+  const W = Math.max(340, svg.clientWidth || 900);
+  const narrow = W < 600;
+  const m = { l: narrow ? 70 : 300, r: 56, t: 22, b: 8 };
+  const rowH = 24, H = m.t + rows.length * rowH + m.b;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const lo = Math.log10(0.85), hi = Math.log10(4);
+  const x = f => m.l + (Math.log10(f) - lo) / (hi - lo) * (W - m.l - m.r);
+  for (const v of [1, 1.5, 2, 3, 4]) {
+    el("line", { x1: x(v), x2: x(v), y1: m.t - 4, y2: H - m.b, stroke: v === 1 ? css("--axis") : css("--grid"), "stroke-width": 1 }, svg);
+    el("text", { x: x(v), y: m.t - 8, "text-anchor": "middle", class: "tick" }, svg, v + "×");
+  }
+  rows.forEach((s, i) => {
+    const yc = m.t + i * rowH + rowH / 2;
+    const x0 = x(1), x1 = x(s.f);
+    const left = Math.min(x0, x1), w = Math.max(2, Math.abs(x1 - x0));
+    el("rect", { x: left, y: yc - 8, width: w, height: 16, rx: 4, fill: css(KINDS[s.kind].color) }, svg);
+    const name = narrow ? s.id : s.id + "  " + (s.name.length > 40 ? s.name.slice(0, 39) + "…" : s.name);
+    el("text", { x: m.l - 8, y: yc + 4, "text-anchor": "end", class: "lab" }, svg, name);
+    el("text", { x: s.f >= 1 ? x1 + 6 : x0 + 6, y: yc + 4, class: "val" }, svg, s.f.toFixed(2) + "×");
+    const hit = el("rect", { x: 0, y: yc - rowH / 2, width: W, height: rowH, class: "hit" }, svg);
+    bindTip(hit, s.id + ": " + s.name, [fmt(s.before) + " s → " + fmt(s.after) + " s, " + s.f.toFixed(2) + "× " + (s.f >= 1 ? "faster" : "slower") + (s.note ? " (" + s.note + ")" : ""), KINDS[s.kind].label]);
+  });
+  const table = document.getElementById("table2");
+  table.replaceChildren();
+  const head = table.insertRow();
+  for (const [t, c] of [["change", ""], ["what", ""], ["kind", ""], ["before (s)", "n"], ["after (s)", "n"], ["factor", "n"]]) { const th = document.createElement("th"); th.textContent = t; if (c) th.className = c; head.appendChild(th); }
+  for (const s of rows) {
+    const r = table.insertRow();
+    for (const [t, c] of [[s.id, ""], [s.name, ""], [KINDS[s.kind].label, ""], [fmt(s.before), "n"], [fmt(s.after), "n"], [s.f.toFixed(2) + "×", "n"]]) { const td = r.insertCell(); td.textContent = t; if (c) td.className = c; }
+  }
+}
+
+function chart3() {
+  const svg = document.getElementById("chart3");
+  svg.replaceChildren();
+  const W = Math.max(340, svg.clientWidth || 900);
+  const narrow = W < 600;
+  const m = { l: narrow ? 64 : 200, r: 48, t: 22, b: 8 };
+  const rowH = 26, H = m.t + ROUND2.length * rowH + m.b;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const max = 14;
+  const x = v => m.l + v / max * (W - m.l - m.r);
+  for (const v of [0, 2, 4, 6, 8, 10, 12, 14]) {
+    el("line", { x1: x(v), x2: x(v), y1: m.t - 4, y2: H - m.b, stroke: v === 0 ? css("--axis") : css("--grid"), "stroke-width": 1 }, svg);
+    el("text", { x: x(v), y: m.t - 8, "text-anchor": "middle", class: "tick" }, svg, v + " s");
+  }
+  ROUND2.forEach((s, i) => {
+    const yc = m.t + i * rowH + rowH / 2;
+    const outside = s.wall - s.checks;
+    el("rect", { x: x(0), y: yc - 8, width: x(s.checks) - x(0), height: 16, rx: 4, fill: css("--checks") }, svg);
+    el("rect", { x: x(s.checks) + 2, y: yc - 8, width: Math.max(2, x(s.wall) - x(s.checks) - 2), height: 16, rx: 4, fill: css("--outside") }, svg);
+    el("text", { x: m.l - 8, y: yc + 4, "text-anchor": "end", class: "lab" }, svg, narrow ? s.id : s.name);
+    el("text", { x: x(s.wall) + 6, y: yc + 4, class: "val" }, svg, s.wall.toFixed(1) + " s");
+    const hit = el("rect", { x: 0, y: yc - rowH / 2, width: W, height: rowH, class: "hit" }, svg);
+    bindTip(hit, s.name, ["in the checks " + s.checks.toFixed(2) + " s", "outside the checks " + outside.toFixed(2) + " s (" + Math.round(100 * outside / s.wall) + "%)", "a whole run " + s.wall.toFixed(2) + " s"]);
+  });
+}
+
+function draw() {
+  legend("legend1", Object.values(KINDS).map(k => [k.label, k.color]));
+  legend("legend2", Object.values(KINDS).map(k => [k.label, k.color]));
+  legend("legend3", [["In the checks", "--checks"], ["Outside the checks (harness)", "--outside"]]);
+  chart1(); chart2(); chart3();
+}
+draw();
+let pending;
+window.addEventListener("resize", () => { clearTimeout(pending); pending = setTimeout(draw, 100); });
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", draw);
+</script>
+</body>
+</html>

@@ -304,3 +304,25 @@ A profile of a run says what the parts are made of:
 - Two schemas that say the same in other words have two variables, and the engine finds by search what a canonical form of their terms would show at once.
 
 Each of these is a line of attack of the third round.
+
+## The third round: seven lines of attack
+
+Each line was built by one agent in a worktree of its own, on a branch `perf/x-<line>` from `7e3686b`, and reviewed by another agent that tried to break it. The first try of the round stopped at a usage limit; the second continued from what the first had committed. [REPORT-2.md](REPORT-2.md) has each change in full and [chart-2.html](chart-2.html) the charts; this is the record.
+
+| | what | kind | a run (median of three, quiet) | in the checks | steps | review |
+| --- | --- | --- | ---: | ---: | ---: | --- |
+| start | E9 merged, `7e3686b` | | 13.43 s | 11.17 s | 72.5 million | |
+| harness | a schema read once while cases share it, one validator per schema, no copies | same work, cheaper | 12.47 s | 11.07 s | 72.5 million | read one file the base refuses; fixed |
+| strings | the DFA of a format built once for the process; a plain word without the parser | work done once | 10.54 s | 9.06 s | 72.5 million | sound |
+| lower | no string, list or map entry for each schema; flat lists of successors | same work, cheaper | 8.59 s | 7.23 s | 72.5 million | sound; one commit reverted |
+| engine | a fast hash, branches that share their parts, no allocation where most asked | same work, cheaper | 6.25 s | 4.87 s | 72.5 million | a test failed one run in four; fixed |
+| merge | one variable for variables whose terms say the same, by partition refinement | algorithmic | 4.69 s | 3.27 s | 39.2 million | lost 5 constructed verdicts; fixed |
+| both | both directions of a case on one load | work shared | 3.36 s | 2.03 s | 32.9 million | lost 44 constructed verdicts; fixed |
+| fallback | a converse that decides nothing is checked again by itself | soundness fix | 3.45 s | 2.04 s | 33.2 million | found in the adversarial folders |
+| objects | keep a question about objects by what it asks | work done once | not merged | | | sound; second commit unbounded in memory |
+
+- **The largest factors are the two that do less work, and the engine.** In the checks, both directions on one load is 1.61×, merging variables 1.49× and the engine 1.48×. The steps of a run fall only with merge and both, from 72.5 million to 33 million; the other changes keep every check's steps, verdict, reason and counterexample bit for bit.
+- **Not built:** lowering only the terms that the engine opens. The engine looks at 84% of them, so it would save 0.1 to 0.3 s and change the order of the ids, and so the search.
+- **Not merged:** the objects branch. Its first commit saved 4.4% of the instructions at the start of the round; after the others, `Objects::left` is 5.4% of a run, and the branch conflicts with the engine branch in 640 lines.
+- **A run takes 3.45 s, 2.04 s of it in the checks.** The goal was under 3 s. The harness around the checks is now 1.41 s, 41% of the run: reading the cases and building the validators that confirm counterexamples.
+- Every verdict of the corpus is that of `7e3686b`. Of the 54 folders that reviewers built, 41 have been run against the base: 0 wrong, 0 flipped, and one verdict lost, which the fallback restored. The rest were still running when this was written.
