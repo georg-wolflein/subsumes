@@ -6,8 +6,9 @@
 //! complement of one is the same DFA with the other states accepting.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::rc::Rc;
 
-use super::Lengths;
+use super::{Lengths, Parts};
 use crate::context::{Budget, Exhausted};
 
 /// A character by its place among the Unicode scalar values. The surrogates are no scalar
@@ -119,6 +120,43 @@ impl Classes {
             theirs += usize::from(after(&other.runs, theirs) == Some(at));
         }
         (Self::new(runs), pairs)
+    }
+
+    /// The classes that tell apart what any of a list tells apart, and for each of them
+    /// the class of each of the list that it is part of: those of class 0 in the order of
+    /// the list, then those of class 1, and so on. The list is not empty.
+    ///
+    /// # Errors
+    ///
+    /// When the budget does not cover a look at each of the list for every run.
+    fn common_of(all: &[&Self], budget: &mut Budget) -> Result<(Self, Vec<u32>), Exhausted> {
+        // The places at which one of them begins a run. Each begins one at 0.
+        let starts = all.iter().flat_map(|classes| &classes.runs);
+        let mut starts: Vec<Place> = starts.map(|run| run.0).collect();
+        budget.charge((starts.len() / 8) as u64)?;
+        starts.sort_unstable();
+        starts.dedup();
+        let mut ids: HashMap<Vec<u32>, u32> = HashMap::new();
+        let mut parts: Vec<u32> = Vec::new();
+        let mut runs = Vec::with_capacity(starts.len());
+        // The run of each that the place at hand is in.
+        let mut within = vec![0_usize; all.len()];
+        for start in starts {
+            budget.charge((all.len() / 8) as u64)?;
+            let mut column = Vec::with_capacity(all.len());
+            for (classes, run) in all.iter().zip(&mut within) {
+                let after = classes.runs.get(*run + 1);
+                *run += usize::from(after.is_some_and(|after| after.0 == start));
+                column.push(classes.runs[*run].1);
+            }
+            let id = u32::try_from(ids.len()).expect("fewer than 2^32 classes");
+            let class = *ids.entry(column).or_insert_with_key(|column| {
+                parts.extend_from_slice(column);
+                id
+            });
+            runs.push((start, class));
+        }
+        Ok((Self::new(runs), parts))
     }
 }
 
@@ -317,6 +355,170 @@ impl Dfa {
             }
         }
         Ok(Self::canonical(&classes, &next, &accepts))
+    }
+
+    /// The parts that a list of DFAs cuts every string into: one for each way of being
+    /// accepted by some of them and by none of the others, unless no string is that way.
+    /// Each part comes with whether each DFA of the list accepts its strings. Of two parts,
+    /// the one comes first that the first DFA which tells them apart accepts. The list is
+    /// not empty.
+    ///
+    /// The parts are read off one product of all the DFAs. A state of the product is the
+    /// state that each DFA is in after some string, and which of them accept there says
+    /// which part the string is of. Each DFA is minimal, so two strings lead to one state
+    /// exactly when, whatever follows them, both come to be of one part: the product is
+    /// the smallest DFA that says which part a string is of. To cut by one DFA after the
+    /// other instead makes two products for every part and DFA, which for a hundred
+    /// patterns that share no string is ten thousand products where this is one.
+    ///
+    /// # Errors
+    ///
+    /// When the budget does not cover the states of the product and of the parts.
+    pub fn cut(all: &[&Self], budget: &mut Budget) -> Result<Parts<Self>, Exhausted> {
+        let narrow = |index: usize| u32::try_from(index).expect("fewer than 2^32 states");
+        let of_all: Vec<&Classes> = all.iter().map(|dfa| &dfa.classes).collect();
+        let (classes, columns) = Classes::common_of(&of_all, budget)?;
+        let (width, count) = (classes.count(), all.len());
+
+        // A state of the product is kept as the states of the DFAs that are not in their
+        // dead state, each with the place of its DFA in the list. A DFA that is in its dead
+        // state stays there and accepts nothing, and most states are of a few DFAs.
+        let live = (0..count).filter(|which| all[*which].dead != Some(0));
+        let first: Rc<[(u32, u32)]> = live.map(|which| (narrow(which), 0)).collect();
+        budget.charge(cost(0, first.len() * width))?;
+        let mut ids: HashMap<Rc<[(u32, u32)]>, u32> = HashMap::from([(Rc::clone(&first), 0)]);
+        let mut states = vec![first];
+        let mut next: Vec<u32> = Vec::new();
+        let mut to: Vec<(u32, u32)> = Vec::new();
+        let mut at = 0;
+        while at < states.len() {
+            for class in 0..width {
+                let column = &columns[class * count..(class + 1) * count];
+                to.clear();
+                for (which, state) in states[at].iter() {
+                    let dfa = all[*which as usize];
+                    let class = column[*which as usize] as usize;
+                    let leads = dfa.next[*state as usize * dfa.classes.count() + class];
+                    if Some(leads) != dfa.dead {
+                        to.push((*which, leads));
+                    }
+                }
+                let id = match ids.get(to.as_slice()) {
+                    Some(known) => *known,
+                    None => {
+                        // A new state costs what it takes to say where each class leads
+                        // from it: a look at each of its DFAs for every class.
+                        budget.charge(cost(0, to.len() * width))?;
+                        let new: Rc<[(u32, u32)]> = to.as_slice().into();
+                        let id = narrow(states.len());
+                        ids.insert(Rc::clone(&new), id);
+                        states.push(new);
+                        id
+                    }
+                };
+                next.push(id);
+            }
+            at += 1;
+        }
+
+        // The DFAs that accept in a state say which part a string is of that leads there.
+        let mut parts: Vec<(Vec<u32>, Vec<u32>)> = Vec::new();
+        let mut places: HashMap<Vec<u32>, usize> = HashMap::new();
+        for (state, of) in states.iter().enumerate() {
+            let accepting = of
+                .iter()
+                .filter(|(which, at)| all[*which as usize].accepts[*at as usize]);
+            let accepting: Vec<u32> = accepting.map(|(which, _)| *which).collect();
+            let place = *places.entry(accepting).or_insert_with_key(|accepting| {
+                parts.push((accepting.clone(), Vec::new()));
+                parts.len() - 1
+            });
+            parts[place].1.push(narrow(state));
+        }
+
+        // The states that lead into each state, each of them once: those of state 0, then
+        // those of state 1, and so on, with where those of each state begin. What leads
+        // from one state comes together, so a state that leads into another by several
+        // classes is seen to have been noted.
+        let total = states.len();
+        let leading = || {
+            let all = next.iter().enumerate();
+            all.map(|(slot, to)| (narrow(slot / width), *to as usize))
+        };
+        let mut starts = vec![0_usize; total + 1];
+        let mut last = vec![u32::MAX; total];
+        for (from, to) in leading() {
+            if std::mem::replace(&mut last[to], from) != from {
+                starts[to + 1] += 1;
+            }
+        }
+        for state in 0..total {
+            starts[state + 1] += starts[state];
+        }
+        let mut sources = vec![0_u32; starts[total]];
+        let (mut filled, mut last) = (starts.clone(), vec![u32::MAX; total]);
+        for (from, to) in leading() {
+            if std::mem::replace(&mut last[to], from) != from {
+                sources[filled[to]] = from;
+                filled[to] += 1;
+            }
+        }
+
+        // The DFA of a part is the product with the states of the part accepting. Only
+        // the states that lead to one of those are written down, so that a part costs what
+        // it has to say and not all of the product: every other state is its dead state.
+        let mut numbers = vec![u32::MAX; total];
+        let mut cut = Vec::with_capacity(parts.len());
+        for (accepting, ends) in parts {
+            budget.charge(1 + (count / 8) as u64)?;
+            let mut kept = ends.clone();
+            for state in &kept {
+                numbers[*state as usize] = 0;
+            }
+            let mut at = 0;
+            while let Some(&state) = kept.get(at) {
+                let from = &sources[starts[state as usize]..starts[state as usize + 1]];
+                budget.charge(cost(from.len(), width))?;
+                for from in from {
+                    if numbers[*from as usize] == u32::MAX {
+                        numbers[*from as usize] = 0;
+                        kept.push(*from);
+                    }
+                }
+                at += 1;
+            }
+            // The first state of the product leads to every state, so it is among them,
+            // and it is the first of these.
+            kept.sort_unstable();
+            for (number, state) in kept.iter().enumerate() {
+                numbers[*state as usize] = narrow(number);
+            }
+            let dead = narrow(kept.len());
+            let mut leads = Vec::with_capacity((kept.len() + 1) * width);
+            for state in &kept {
+                let row = &next[*state as usize * width..(*state as usize + 1) * width];
+                leads.extend(row.iter().map(|to| numbers[*to as usize].min(dead)));
+            }
+            let mut accepts = vec![false; kept.len()];
+            for end in &ends {
+                accepts[numbers[*end as usize] as usize] = true;
+            }
+            if leads.contains(&dead) {
+                leads.extend(std::iter::repeat_n(dead, width));
+                accepts.push(false);
+            }
+            for state in &kept {
+                numbers[*state as usize] = u32::MAX;
+            }
+            let mut within = vec![false; count];
+            for which in accepting {
+                within[which as usize] = true;
+            }
+            let part = Self::canonical(&classes, &leads, &accepts);
+            cut.push((part, within.into_boxed_slice()));
+        }
+        cut.sort_by(|one, other| other.1.cmp(&one.1));
+        Ok(cut)
     }
 
     pub fn accepts(&self, word: &str) -> bool {
@@ -808,6 +1010,40 @@ mod tests {
     }
 
     #[test]
+    fn a_list_of_dfas_cuts_every_string_into_parts() {
+        let cut = |all: &[&Dfa]| Dfa::cut(all, &mut unlimited()).unwrap();
+        // A part for each way of being accepted by some that a string has, and the part
+        // that the first DFA accepts first.
+        let (ab, bc) = (of(&["a", "b"]), of(&["b", "c"]));
+        let within = |held: &[bool]| -> Box<[bool]> { held.into() };
+        let expected = vec![
+            (of(&["b"]), within(&[true, true])),
+            (of(&["a"]), within(&[true, false])),
+            (of(&["c"]), within(&[false, true])),
+            (of(&["a", "b", "c"]).complement(), within(&[false, false])),
+        ];
+        assert_eq!(cut(&[&ab, &bc]), expected);
+        // Two that share no string leave no part for both.
+        let (a, b) = (of(&["a", "ab"]), of(&["b", ""]));
+        let expected = vec![
+            (of(&["a", "ab"]), within(&[true, false])),
+            (of(&["b", ""]), within(&[false, true])),
+            (of(&["a", "ab", "b", ""]).complement(), within(&[false; 2])),
+        ];
+        assert_eq!(cut(&[&a, &b]), expected);
+        // One that accepts nothing, one that accepts everything and one that is there
+        // twice cut nothing.
+        let (nothing, everything) = (of(&[]), of(&[]).complement());
+        let expected = vec![
+            (of(&["a", "b"]), within(&[false, true, true, true])),
+            (ab.complement(), within(&[false, false, true, false])),
+        ];
+        assert_eq!(cut(&[&nothing, &ab, &everything, &ab]), expected);
+        let all = vec![(of(&[]).complement(), within(&[false, true]))];
+        assert_eq!(cut(&[&nothing, &everything]), all);
+    }
+
+    #[test]
     fn the_shortest_word_is_within_the_lengths() {
         let dfa = of(&["abc", "ab", "abcde"]);
         let shortest = |lengths| dfa.shortest(lengths, &mut unlimited()).unwrap();
@@ -862,5 +1098,8 @@ mod tests {
         let (a, b) = (of(&[&long, "b"]), of(&[&long, "c"]));
         let mut budget = Budget::new(100);
         assert!(a.intersection(&b, &mut budget).is_err());
+        // And so is the product of the two that cuts every string by both.
+        let mut budget = Budget::new(100);
+        assert!(Dfa::cut(&[&a, &b], &mut budget).is_err());
     }
 }

@@ -92,6 +92,10 @@ pub enum RegexDialect {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Unsupported;
 
+/// The parts that a list of languages cuts every string into: each with whether its strings
+/// are in each language of the list.
+pub(crate) type Parts<L> = Vec<(L, Box<[bool]>)>;
+
 type Words = Rc<BTreeSet<Box<str>>>;
 
 #[derive(Debug)]
@@ -498,6 +502,46 @@ impl Languages {
         let (not_a, not_b) = (self.complement(a, budget)?, self.complement(b, budget)?);
         let neither = self.intersection(not_a, not_b, budget)?;
         self.complement(neither, budget)
+    }
+
+    /// Every string, cut by a list of languages: one part for each way of being in some of
+    /// them and in none of the others, unless no string is that way. Each part comes with
+    /// whether its strings are in each language of the list. Of two parts, the one comes
+    /// first that the first language which tells them apart holds.
+    ///
+    /// # Errors
+    ///
+    /// When the budget does not cover the DFAs of the languages and of the parts.
+    pub fn cut(
+        &mut self,
+        by: &[LanguageId],
+        budget: &mut Budget,
+    ) -> Result<Parts<LanguageId>, Exhausted> {
+        match by {
+            [] => return Ok(vec![(Self::EVERYTHING, Box::default())]),
+            // One language cuts them in two, and both parts are there already.
+            [only] => {
+                let other = self.complement(*only, budget)?;
+                let mut parts = Vec::with_capacity(2);
+                for (part, inside) in [(*only, true), (other, false)] {
+                    if !self.is_empty(part, Lengths::ANY, budget)? {
+                        parts.push((part, [inside].into()));
+                    }
+                }
+                return Ok(parts);
+            }
+            _ => {}
+        }
+        let mut dfas = Vec::with_capacity(by.len());
+        for language in by {
+            dfas.push(self.dfa(*language, budget)?);
+        }
+        let dfas: Vec<&Dfa> = dfas.iter().map(Rc::as_ref).collect();
+        let parts = Dfa::cut(&dfas, budget)?;
+        let parts = parts.into_iter();
+        Ok(parts
+            .map(|(part, within)| (self.keep(part), within))
+            .collect())
     }
 
     /// The language of every string whose length is within the bounds, unless the bounds
@@ -1109,6 +1153,181 @@ mod tests {
         let with_words = either(&mut store, begins, bc);
         assert!(store.holds(with_words, "c") && store.holds(with_words, "ab"));
         assert!(!store.holds(with_words, "d"));
+    }
+
+    /// Every string, cut by one language after the other: each part so far by the language
+    /// and by its complement. The parts and their order are those of [`Languages::cut`].
+    fn cut_one_by_one(store: &mut Store, by: &[LanguageId]) -> Parts<LanguageId> {
+        let mut parts: Vec<(LanguageId, Vec<bool>)> = vec![(Languages::EVERYTHING, Vec::new())];
+        for language in by {
+            let other = store.not(*language);
+            let mut cut = Vec::new();
+            for (part, within) in parts {
+                for (side, inside) in [(*language, true), (other, false)] {
+                    let both = store.both(part, side);
+                    if !store.is_empty(both, Lengths::ANY) {
+                        let within = within.iter().copied().chain([inside]);
+                        cut.push((both, within.collect()));
+                    }
+                }
+            }
+            parts = cut;
+        }
+        let parts = parts.into_iter();
+        parts.map(|(part, within)| (part, within.into())).collect()
+    }
+
+    #[test]
+    fn a_list_of_languages_cuts_every_string_into_parts() {
+        let mut store = Store::new();
+        let cut = |store: &mut Store, by: &[LanguageId]| store.0.cut(by, &mut unlimited()).unwrap();
+        // By no language there is one part, and by one language there are the language and
+        // its complement, unless one of the two has no string.
+        let everything: Box<[bool]> = Box::default();
+        assert_eq!(cut(&mut store, &[]), [(Languages::EVERYTHING, everything)]);
+        let begins = store.pattern("^a");
+        let other = store.not(begins);
+        let (inside, outside): (Box<[bool]>, Box<[bool]>) = ([true].into(), [false].into());
+        assert_eq!(
+            cut(&mut store, &[begins]),
+            [(begins, inside.clone()), (other, outside)]
+        );
+        let all = store.pattern("(?s)^.*$");
+        assert_eq!(cut(&mut store, &[all]), [(all, inside)]);
+
+        // Two patterns that share strings make four parts, and the part that the first
+        // language holds comes first.
+        let ends = store.pattern("b$");
+        let parts = cut(&mut store, &[begins, ends]);
+        let within: Vec<&[bool]> = parts.iter().map(|part| &*part.1).collect();
+        let expected: [&[bool]; 4] = [&[true, true], &[true, false], &[false, true], &[false; 2]];
+        assert_eq!(within, expected);
+        for (word, part) in [
+            ("ab", 0),
+            ("a", 1),
+            ("abc", 1),
+            ("b", 2),
+            ("", 3),
+            ("ca", 3),
+        ] {
+            for (place, (names, _)) in parts.iter().enumerate() {
+                assert_eq!(store.holds(*names, word), place == part, "{word:?}");
+            }
+        }
+        // A part is the language that the intersections give, by the same id.
+        assert_eq!(parts[0].0, store.both(begins, ends));
+        assert_eq!(parts, cut_one_by_one(&mut store, &[begins, ends]));
+
+        // Patterns that share no string make a part each, and one of every other string.
+        // A way of being in some of them that no string has is no part.
+        let names = ["^a.b$", "^a.c$", "^b.b$"].map(|pattern| store.pattern(pattern));
+        let parts = cut(&mut store, &names);
+        let within: Vec<&[bool]> = parts.iter().map(|part| &*part.1).collect();
+        let expected: [&[bool]; 4] = [
+            &[true, false, false],
+            &[false, true, false],
+            &[false, false, true],
+            &[false; 3],
+        ];
+        assert_eq!(within, expected);
+        let listed = parts.iter().map(|part| part.0);
+        assert_eq!(listed.take(3).collect::<Vec<_>>(), names);
+        assert!(store.holds(parts[3].0, "a.d") && !store.holds(parts[3].0, "a-c"));
+
+        // A language that is there twice, and one that says what another says, cut once.
+        let again = store.pattern("^(?:a)");
+        let parts = cut(&mut store, &[begins, again, begins]);
+        let within: Vec<&[bool]> = parts.iter().map(|part| &*part.1).collect();
+        let expected: [&[bool]; 2] = [&[true; 3], &[false; 3]];
+        assert_eq!(within, expected);
+        // Sets of words are cut like patterns.
+        let (words, more) = (store.0.words(["a", "b"]), store.0.words(["b", "c"]));
+        let parts = cut(&mut store, &[words, more]);
+        let listed: Vec<LanguageId> = parts.iter().map(|part| part.0).collect();
+        let (only_a, only_b, only_c) = (
+            store.0.words(["a"]),
+            store.0.words(["b"]),
+            store.0.words(["c"]),
+        );
+        for (part, words) in listed.iter().zip([only_b, only_a, only_c]) {
+            assert!(store.includes(*part, words) && store.includes(words, *part));
+        }
+        assert_eq!(listed.len(), 4);
+    }
+
+    #[test]
+    fn the_parts_of_a_cut_are_those_of_one_language_after_the_other() {
+        let random = &mut Random(5);
+        let strings = strings();
+        let mut store = Store::new();
+        let mut most = 0;
+        for _ in 0..200 {
+            let count = 2 + random.below(4);
+            let patterns: Vec<String> = (0..count).map(|_| pattern(random, 2)).collect();
+            let by: Vec<LanguageId> = patterns.iter().map(|one| store.pattern(one)).collect();
+            let parts = store.0.cut(&by, &mut unlimited()).unwrap();
+            // Two ids may be one language, so the parts are held against each other by
+            // their DFAs, which are equal exactly when the languages are.
+            let expected = cut_one_by_one(&mut store, &by);
+            assert_eq!(parts.len(), expected.len(), "{patterns:?}");
+            for ((part, within), (other, expected)) in parts.iter().zip(&expected) {
+                assert_eq!(within, expected, "{patterns:?}");
+                let dfas = [*part, *other].map(|id| store.0.dfa(id, &mut unlimited()).unwrap());
+                assert_eq!(dfas[0], dfas[1], "{patterns:?} for {within:?}");
+            }
+            most = most.max(parts.len());
+            // Every string is of the one part that says which patterns match it.
+            let matchers = patterns.iter();
+            let matchers: Vec<Matcher> = matchers
+                .map(|one| Matcher::new(RegexDialect::Rust, one))
+                .collect();
+            for string in strings.iter().step_by(7) {
+                let matched: Vec<bool> = matchers.iter().map(|one| one.is_match(string)).collect();
+                for (names, within) in &parts {
+                    let held = store.holds(*names, string);
+                    assert_eq!(held, **within == *matched, "{patterns:?} on {string:?}");
+                }
+            }
+        }
+        assert!(most >= 8, "{most}");
+    }
+
+    #[test]
+    fn many_patterns_that_share_no_string_are_cut_in_one_product() {
+        // A hundred names with a dot, which is any character to a pattern. Cut by one
+        // pattern after the other, they take two products for every part and pattern, which
+        // is ten thousand products and two million steps.
+        let mut store = Store::new();
+        let patterns = (0..100).map(|at| format!("^some.name.of.a.property{at}$"));
+        let by: Vec<LanguageId> = patterns.map(|one| store.pattern(&one)).collect();
+        let mut budget = Budget::new(500_000);
+        let parts = store.0.cut(&by, &mut budget).unwrap();
+        assert_eq!(parts.len(), 101);
+        for (place, (names, within)) in parts.iter().take(100).enumerate() {
+            assert_eq!(*names, by[place]);
+            assert!(
+                within
+                    .iter()
+                    .enumerate()
+                    .all(|(at, held)| *held == (at == place))
+            );
+        }
+        // The states of the product cost steps, and so do those of the parts.
+        let mut store = Store::new();
+        let patterns = (0..100).map(|at| format!("^some.name.of.a.property{at}$"));
+        let by: Vec<LanguageId> = patterns.map(|one| store.pattern(&one)).collect();
+        for language in &by {
+            store.0.dfa(*language, &mut unlimited()).unwrap();
+        }
+        assert_eq!(store.0.cut(&by, &mut Budget::new(1_000)), Err(Exhausted));
+        // Patterns that each hold a letter anywhere make a part for every choice of them.
+        let mut store = Store::new();
+        let by: Vec<LanguageId> = "abcdefghijklmnop"
+            .chars()
+            .map(|letter| store.pattern(&letter.to_string()))
+            .collect();
+        assert_eq!(store.0.cut(&by, &mut Budget::new(100_000)), Err(Exhausted));
+        assert_eq!(store.0.cut(&by[..8], &mut unlimited()).unwrap().len(), 256);
     }
 
     #[test]
