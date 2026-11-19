@@ -35,8 +35,6 @@ use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
-use serde_json::Value;
-
 use super::search::{self, Place, Placed, Places, Slot};
 use super::{Left, Solver, State, state};
 use crate::context::{Budget, Exhausted};
@@ -379,8 +377,7 @@ impl Places for Search<'_> {
         if !give {
             return Ok(Some(Left::Value(None)));
         }
-        let rest = rest.as_ref();
-        let array = self.given(&placed.slots, budget, length, &plain, rest, deepest + 1)?;
+        let array = self.given(&placed.slots, length, &plain, rest.as_ref());
         Ok(Some(Left::Value(Some(array))))
     }
 }
@@ -410,16 +407,19 @@ impl Search<'_> {
     }
 
     /// The array: the value of the slot at each position that has one, and at every other
-    /// position a value that satisfies what the position asks. `depth` is how deep it is.
+    /// position a value that satisfies what the position asks. The positions after the
+    /// slots that follow the head all have the one value, which the array holds once
+    /// however many they are: an array of a million items costs no more than one of two.
+    ///
+    /// This costs no step. Each value cost one when its position was looked at or when it
+    /// was placed, and the positions that share a value are not gone through.
     fn given(
         &self,
         slots: &[Slot<u64>],
-        budget: &mut Budget,
         length: u64,
         plain: &[Rc<Witness>],
         rest: Option<&Rc<Witness>>,
-        depth: u32,
-    ) -> Result<Rc<Witness>, Exhausted> {
+    ) -> Rc<Witness> {
         let of_slot = |slot: &usize| {
             let value = slots[*slot].value.as_ref();
             value.expect("every slot has a value")
@@ -427,32 +427,27 @@ impl Search<'_> {
         let head = self.head.len() as u64;
         let mut plain = plain.iter();
         let mut items = Vec::new();
-        let mut size = 1_u64;
-        for position in 0..length {
-            let value = if position < head {
-                let slot = self.at_head[index(position)].as_ref();
-                slot.map(of_slot).or_else(|| plain.next())
-            } else {
-                let slot = self.after.get(index(position - head));
-                slot.map(of_slot).or(rest)
-            };
+        for slot in self.at_head.iter().take(index(length.min(head))) {
+            let value = slot.as_ref().map(of_slot).or_else(|| plain.next());
             let value = value.expect("every item of the array has a value");
-            // A step for everything that is copied.
-            budget.charge(value.size)?;
-            size = size.saturating_add(value.size);
-            items.push(value.value.clone());
+            items.push((Rc::clone(value), 1));
         }
-        Ok(Rc::new(Witness {
-            value: Value::Array(items),
-            size,
-            depth,
-        }))
+        if length > head {
+            let after = self.after.iter().map(of_slot);
+            items.extend(after.map(|value| (Rc::clone(value), 1)));
+            let others = length - head - self.after.len() as u64;
+            if others > 0 {
+                let value = rest.expect("every item of the array has a value");
+                items.push((Rc::clone(value), others));
+            }
+        }
+        Witness::array(items)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::*;
     use crate::canonical::made_up::{Engine, given, none};
@@ -772,7 +767,8 @@ mod tests {
         let Left::Value(Some(array)) = left else {
             panic!("{left:?} is no array");
         };
-        assert_eq!(array.value, json!(["2"]));
+        let written = array.written(&mut Budget::new(u64::MAX));
+        assert_eq!(written, Ok(json!(["2"])));
         assert_eq!((array.size, array.depth), (2, 1));
         let first = asked.engine.of(&[2]);
         assert_eq!(asked.engine.decided, [first]);
@@ -782,27 +778,57 @@ mod tests {
         assert!(matches!(left, Ok(Left::Nothing)));
         let (end, at_the_end) = (asked.engine.of(&[0]), asked.engine.of(&[0, 2]));
         assert_eq!(asked.engine.decided, [at_the_end, end]);
-        // A thousand items after the head are one question, and a step for each to copy.
+        // A thousand items after the head are one question, and the array holds their
+        // value once: it is given within far fewer steps than it has items.
         let mut asked = Asked::new().from(0, &[5]).count(1000, None);
-        let left = asked.left(&mut Budget::new(u64::MAX)).unwrap();
+        let left = asked.left(&mut Budget::new(100)).unwrap();
         let Left::Value(Some(array)) = left else {
             panic!("{left:?} is no array");
         };
-        assert_eq!(array.value.as_array().unwrap().len(), 1000);
         assert_eq!((array.size, asked.engine.decided.len()), (1001, 1));
-        // Without steps enough to copy them, there is no answer.
-        let mut asked = Asked::new().count(1000, None);
-        assert!(asked.left(&mut Budget::new(100)).is_err());
+        // To write it out is a step for each of them, and each is a value of its own.
+        assert!(array.written(&mut Budget::new(100)).is_err());
+        let written = array.written(&mut Budget::new(u64::MAX)).unwrap();
+        assert_eq!(written, Value::Array(vec![json!("5"); 1000]));
+    }
+
+    #[test]
+    fn an_array_shares_its_items_until_it_is_written_out() {
+        // An array of a thousand arrays of a thousand items is given within far fewer
+        // steps than it has values, since each array holds its items once.
+        let row = Witness::array(vec![(Witness::plain(json!(1)), 1000)]);
+        let mut asked = Asked::new().from(0, &[2]).some(1, &[5]).count(1000, None);
+        let (every, other) = (asked.engine.of(&[2]), asked.engine.of(&[2, 5]));
+        asked.engine.found.insert(every, Found::Instance(row));
+        let one = Witness::array(vec![(Witness::plain(json!(2)), 1)]);
+        asked.engine.found.insert(other, Found::Instance(one));
+        let left = asked.left(&mut Budget::new(100)).unwrap();
+        let Left::Value(Some(array)) = left else {
+            panic!("{left:?} is no array");
+        };
+        assert_eq!((array.size, array.depth), (1 + 999 * 1001 + 2, 2));
+        // Written out, the item that there has to be is where it was put, and every other
+        // position has a value of its own.
+        assert!(array.written(&mut Budget::new(100_000)).is_err());
+        let written = array.written(&mut Budget::new(u64::MAX)).unwrap();
+        let rows = written.as_array().unwrap();
+        assert_eq!(rows.len(), 1000);
+        for (position, row) in rows.iter().enumerate() {
+            let expected = if position == 1 {
+                json!([2])
+            } else {
+                Value::Array(vec![json!(1); 1000])
+            };
+            assert_eq!(row, &expected, "at {position}");
+        }
     }
 
     #[test]
     fn an_array_is_no_deeper_than_it_can_be_given() {
+        // A value in so many arrays inside one another.
         let deep = |depth| {
-            Rc::new(Witness {
-                value: json!(null),
-                size: 1,
-                depth,
-            })
+            let nested = |inner, _| Witness::array(vec![(inner, 1)]);
+            (0..depth).fold(Witness::plain(json!(null)), nested)
         };
         for (depth, given) in [(DEEPEST - 1, true), (DEEPEST, false)] {
             let mut asked = Asked::new().from(0, &[2]).count(1, None);

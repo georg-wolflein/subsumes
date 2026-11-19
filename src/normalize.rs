@@ -50,7 +50,7 @@ use crate::canonical::number::Numbers;
 use crate::canonical::object::{Objects, Partitions};
 use crate::canonical::string::Strings;
 use crate::canonical::{Left, Solver};
-use crate::context::{Context, Exhausted};
+use crate::context::{Budget, Context, Exhausted};
 use crate::generate;
 use crate::language::{LanguageId, Languages};
 use crate::term::{CRefId, InstanceType, LeafId, Term, TermId, Terms, TypeSet, VarId};
@@ -92,13 +92,33 @@ pub(crate) enum Found {
 }
 
 /// An instance that the engine gives.
+///
+/// It is kept as what it is made of and not as a value: an array and an object share the
+/// instances inside them with whatever else holds those, and an array holds an instance that
+/// many positions in a row have once, with how many they are. So to put an instance together
+/// costs nothing beyond finding the instances inside it, however large those are and however
+/// many positions have one. Most instances are found for a c-reference that the
+/// counterexample does not come to hold, or for a check that has none, and are never
+/// written out. The one that is the answer of the check is written out once.
 #[derive(Debug)]
 pub(crate) struct Witness {
-    pub value: Value,
-    /// How many values it is made of, itself among them: what it costs to copy.
+    made_of: MadeOf,
+    /// How many values it is made of, itself among them. Those inside it are what it costs
+    /// to write out.
     pub size: u64,
     /// How many objects and arrays it holds inside one another, itself among them.
     pub depth: u32,
+}
+
+/// What an instance is made of.
+#[derive(Debug)]
+enum MadeOf {
+    /// A value that holds no other.
+    Plain(Value),
+    /// The items of an array in order: an instance, and how many positions in a row have it.
+    Items(Vec<(Rc<Witness>, u64)>),
+    /// The properties of an object.
+    Properties(Vec<(String, Rc<Witness>)>),
 }
 
 impl Witness {
@@ -106,10 +126,74 @@ impl Witness {
     pub(crate) fn plain(value: Value) -> Rc<Self> {
         let depth = u32::from(value.is_object() || value.is_array());
         Rc::new(Self {
-            value,
+            made_of: MadeOf::Plain(value),
             size: 1,
             depth,
         })
+    }
+
+    /// An array of these items: each instance at so many positions in a row.
+    pub(crate) fn array(items: Vec<(Rc<Self>, u64)>) -> Rc<Self> {
+        let sizes = items
+            .iter()
+            .map(|(item, count)| item.size.saturating_mul(*count));
+        let size = sizes.fold(1_u64, u64::saturating_add);
+        let deepest = items.iter().map(|(item, _)| item.depth).max();
+        Rc::new(Self {
+            made_of: MadeOf::Items(items),
+            size,
+            depth: deepest.unwrap_or(0) + 1,
+        })
+    }
+
+    /// An object of these properties.
+    pub(crate) fn object(properties: Vec<(String, Rc<Self>)>) -> Rc<Self> {
+        let sizes = properties.iter().map(|(_, value)| value.size);
+        let size = sizes.fold(1_u64, u64::saturating_add);
+        let deepest = properties.iter().map(|(_, value)| value.depth).max();
+        Rc::new(Self {
+            made_of: MadeOf::Properties(properties),
+            size,
+            depth: deepest.unwrap_or(0) + 1,
+        })
+    }
+
+    /// The instance as a value.
+    ///
+    /// # Errors
+    ///
+    /// When the budget does not cover writing it out, which is a step for every value
+    /// inside it. What the instance holds once for many places is a value of its own at
+    /// each of them.
+    pub(crate) fn written(&self, budget: &mut Budget) -> Result<Value, Exhausted> {
+        budget.charge(self.size - 1)?;
+        Ok(self.value())
+    }
+
+    /// Writes the instance out. This recurses once for each level, and an instance has no
+    /// more than [`DEEPEST`] of them.
+    fn value(&self) -> Value {
+        match &self.made_of {
+            MadeOf::Plain(value) => value.clone(),
+            MadeOf::Items(items) => {
+                let mut values = Vec::new();
+                for (item, count) in items {
+                    let Some(others) = count.checked_sub(1) else {
+                        continue;
+                    };
+                    let value = item.value();
+                    for _ in 0..others {
+                        values.push(value.clone());
+                    }
+                    values.push(value);
+                }
+                Value::Array(values)
+            }
+            MadeOf::Properties(properties) => {
+                let written = |(name, value): &(String, Rc<Self>)| (name.clone(), value.value());
+                Value::Object(properties.iter().map(written).collect())
+            }
+        }
     }
 }
 
@@ -136,7 +220,8 @@ pub(crate) fn decide(context: &mut Context, a: VarId, b: VarId) -> Result<Outcom
     };
     Ok(match engine.decide(both)? {
         Found::Nothing => Outcome::Yes,
-        Found::Instance(witness) => Outcome::No(witness.value.clone()),
+        // The counterexample is the one instance that is written out.
+        Found::Instance(witness) => Outcome::No(witness.written(&mut engine.context.budget)?),
         Found::Unknown(cause) => Outcome::Unknown(cause),
     })
 }
@@ -2762,6 +2847,44 @@ mod tests {
         let check = small.check(&json!(false), &endless).unwrap();
         assert_eq!(reason_of(&check.verdict), Some(Reason::Budget));
         yes(&json!({"minItems": 3}), &endless);
+    }
+
+    #[test]
+    fn an_instance_is_written_out_once_and_only_as_the_counterexample() {
+        let within = |schema: Value| json!({"type": "object", "required": ["x"], "properties": {"x": schema}});
+        // An array of a billion numbers in a property. A check that ends in `Yes` finds
+        // that there is such an array and never writes it out, so a small budget covers it.
+        let many =
+            json!({"type": "array", "minItems": 1_000_000_000, "items": {"type": "integer"}});
+        let small = Checker::new().budget(10_000);
+        let any = within(json!({"type": "array"}));
+        let check = small.check(&any, &within(many.clone())).unwrap();
+        assert_eq!(check.verdict, Verdict::Yes);
+        // As the counterexample it is written out, at a step for each of its items.
+        let none = within(json!({"type": "string"}));
+        let check = small.check(&none, &within(many)).unwrap();
+        assert_eq!(reason_of(&check.verdict), Some(Reason::Budget));
+        // Ten thousand numbers in thirty objects inside one another are written out once
+        // and not once for each object around them: the budget is far smaller than thirty
+        // times the numbers.
+        let numbers = |least: i64| {
+            let item = json!({"type": "number", "minimum": least});
+            json!({"type": "array", "minItems": 10_000, "items": item})
+        };
+        let nested = |inner: Value| (0..30).fold(inner, |inner, _| within(inner));
+        let enough = Checker::new().budget(100_000);
+        let check = enough.check(&nested(numbers(0)), &nested(numbers(-1)));
+        let Verdict::No { counterexample } = check.unwrap().verdict else {
+            panic!("the numbers below zero tell the two apart");
+        };
+        let mut innermost = &counterexample;
+        for _ in 0..30 {
+            innermost = &innermost["x"];
+        }
+        // One item is below zero, and each of the others is a value of its own.
+        let items = innermost.as_array().unwrap();
+        let below = items.iter().filter(|item| **item == json!(-1));
+        assert_eq!((items.len(), below.count()), (10_000, 1));
     }
 
     #[test]
