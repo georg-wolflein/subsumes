@@ -726,23 +726,48 @@ mod tests {
         assert_eq!(asked.engine.waited, 1);
     }
 
+    /// Every item satisfies 3, so none satisfies 4, and the item that has to is at none of
+    /// three hundred positions. The other item that there has to be may be at any of them.
+    fn an_item_without_a_position() -> Asked {
+        let all = Asked::new().from(0, &[3]).at(299, &[5]);
+        all.some(1, &[2]).some(0, &[4])
+    }
+
     #[test]
     fn the_search_for_an_array_costs_steps() {
-        // A place that is tried costs a step. Every item satisfies 3, so none satisfies 4,
-        // and the item that has to is at no position. The other item that there has to be
-        // may be at any of three hundred, and for each of them the first is tried at every
-        // position again.
-        let asked = || {
-            let all = Asked::new().from(0, &[3]).at(299, &[5]);
-            all.some(1, &[2]).some(0, &[4])
-        };
-        let left = asked().left(&mut Budget::new(u64::MAX));
+        // A place that is tried costs a step, and the item that is at no position is tried
+        // at each of them.
+        let left = an_item_without_a_position().left(&mut Budget::new(u64::MAX));
         assert!(matches!(left, Ok(Left::Nothing)));
-        assert!(asked().left(&mut Budget::new(10_000)).is_err());
+        let left = an_item_without_a_position().left(&mut Budget::new(100));
+        assert!(left.is_err());
         // So does the head, each time an array is looked for, however short the array is
         // that is found: here it would be the empty one.
         let mut long = Asked::new().at(99_999, &[2]);
         assert!(long.left(&mut Budget::new(1_000)).is_err());
+    }
+
+    #[test]
+    fn an_item_without_a_position_ends_the_search() {
+        // The item that is at no position owes that to no other item: where it would share
+        // a position, it cannot be at the position by itself either. So the other item is
+        // not moved, and the search ends within a budget far below the ninety thousand
+        // places that it tries if every position of the other is followed by every position
+        // of this one.
+        let left = an_item_without_a_position().left(&mut Budget::new(10_000));
+        assert!(matches!(left, Ok(Left::Nothing)));
+    }
+
+    #[test]
+    fn the_search_goes_back_to_the_item_that_is_in_the_way() {
+        // An item that satisfies 4 can only be at position 1: every other item satisfies
+        // 3. The item that is placed first is there, and it satisfies 3. Two more are placed
+        // between the two, and no other place for those helps. So the search goes back to
+        // the first, which moves behind the head, and puts the two where they were.
+        let asked = Asked::new().at(0, &[3]).from(2, &[3]);
+        let asked = asked.some(1, &[3]).some(0, &[4]);
+        let asked = asked.some(0, &[2]).some(0, &[5]);
+        assert_eq!(asked.given(), Ok(json!(["2 3 5", "4", "3"])));
     }
 
     #[test]

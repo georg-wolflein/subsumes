@@ -2307,6 +2307,44 @@ mod tests {
     }
 
     #[test]
+    fn a_property_without_a_name_is_found_without_placing_the_others_in_every_way() {
+        // Twelve kinds of object, each with six properties of its own and no other. One
+        // schema closes a kind with `additionalProperties` next to its properties, and the
+        // other with a list of patterns, so the two say the same.
+        let kind = |number: u32, by_patterns: bool| {
+            let names = (0..6).map(|index| format!("p{number}_{index}"));
+            let of = |name: String| (name, json!({"type": "string"}));
+            let properties: Map<String, Value> = names.clone().map(of).collect();
+            if !by_patterns {
+                return json!({
+                    "type": "object",
+                    "properties": properties,
+                    "additionalProperties": false,
+                });
+            }
+            let pattern = |name: String| (format!("^{name}$"), json!(true));
+            let patterns: Map<String, Value> = names.map(pattern).collect();
+            json!({"allOf": [
+                {"type": "object", "properties": properties},
+                {"patternProperties": patterns, "additionalProperties": false},
+            ]})
+        };
+        let kinds = |by_patterns: bool| {
+            let kinds: Vec<Value> = (0..12).map(|number| kind(number, by_patterns)).collect();
+            json!({"anyOf": kinds})
+        };
+        // An object of one kind that is of no kind of the other schema has a property
+        // outside each of the other eleven kinds, which may be any of its six, and one
+        // outside its own kind, for which no name is left. The eleven can be placed in 362
+        // million ways, and none of them has a part in that. So the budget may be far
+        // smaller than the ways are many.
+        let small = Checker::new().budget(1_000_000);
+        let (patterns, plain) = (kinds(true), kinds(false));
+        assert_eq!(small.subsumes(&patterns, &plain).unwrap(), Verdict::Yes);
+        assert_eq!(small.subsumes(&plain, &patterns).unwrap(), Verdict::Yes);
+    }
+
+    #[test]
     fn a_schema_that_holds_itself_in_a_property_accepts_what_is_built_in_finitely_many_steps() {
         let list = |value: Value| {
             json!({

@@ -456,6 +456,13 @@ impl Places for Search<'_> {
         }
     }
 
+    /// An object that may have no more properties than it has slots has no room for a new
+    /// one, in whatever fragment the slots are.
+    fn crowded(&self, placed: &Placed<u32>) -> bool {
+        let most = self.objects.max;
+        most.is_some_and(|most| placed.slots.len() as u64 >= most)
+    }
+
     /// With a place for every property that there has to be: whether the object has
     /// properties enough, with more of them from the fragments that have names to spare.
     ///
@@ -781,6 +788,79 @@ mod tests {
         // Three that cannot share, for two names.
         let asked = Asked::new().some("^[xy]$", &[3]).some("^[xy]$", &[4]);
         assert_eq!(asked.some("^[xy]$", &[3, 4]).given(), none());
+    }
+
+    #[test]
+    fn a_property_without_a_name_ends_the_search() {
+        // Every name but three is closed. Ten properties may each have any of the three,
+        // and one more has only names that are closed. It is placed last, and it owes to
+        // no other that it has no name, so no other is moved: the search ends within a
+        // budget far below the 59,049 ways of placing the ten.
+        let mut asked = Asked::new().none("!a,b,c");
+        for other in 0..10 {
+            asked = asked.some(&format!("=a,b,c,p{other}"), &[]);
+        }
+        let closed: Vec<String> = (0..10).map(|other| format!("p{other}")).collect();
+        let mut asked = asked.some(&format!("={}", closed.join(",")), &[]);
+        let left = asked.left(&mut Budget::new(1_000));
+        assert!(matches!(left, Ok(Left::Nothing)), "{left:?}");
+    }
+
+    #[test]
+    fn the_search_goes_back_to_the_property_that_is_in_the_way() {
+        // A property that satisfies 4 can only be `b`, and the property that is placed
+        // first has that name and satisfies 3. Two more are placed between the two, and
+        // no other name for those helps. So the search goes back to the first, which
+        // becomes `a`, and puts the two where they were.
+        let asked = Asked::new().none("=q,r,s").some("=a,b", &[3]);
+        let asked = asked.some("=c,d,e", &[2]).some("=c,d,e", &[5]);
+        let asked = asked.some("=b,q,r,s", &[4]);
+        assert_eq!(
+            asked.given(),
+            Ok(json!({"a": "3", "b": "4", "d": "5", "e": "2"}))
+        );
+        // An object that may have one property has no room for a second, in whatever
+        // fragment the first is. So a property that finds no place then owes that to the
+        // first, which is moved to where the two can be one.
+        let asked = Asked::new().some("^x", &[2]).some("y$", &[4]);
+        assert_eq!(asked.count(0, Some(1)).given(), Ok(json!({"xy": "2 4"})));
+    }
+
+    #[test]
+    fn the_property_that_the_search_goes_back_to_is_owed_what_the_other_was() {
+        // A property that satisfies 4 can only be `b` or `c`, and two that satisfy 3 have
+        // those names: the first could be `a` too, and the second only `c`. The search goes
+        // back to the second, which has no other name. It is owed the first then, which
+        // gets the other name.
+        let asked = Asked::new().none("=q,r,s").some("=a,b", &[3]);
+        let asked = asked.some("=c,q", &[3]).some("=b,c,r,s", &[4]);
+        assert_eq!(asked.given(), Ok(json!({"a": "3", "b": "4", "c": "3"})));
+    }
+
+    #[test]
+    fn a_place_that_fails_for_what_the_engine_does_not_know_is_owed_to_every_property() {
+        // The engine does not know whether a value satisfies 5, and it knows one that
+        // satisfies 2 and 5. The second property can only be `a`, where the object stands
+        // only as far as the engine knows, unless the first one is `a` as well, which is
+        // its last name. What the engine does not know of a place by itself says nothing
+        // of the place with more asked of it, so the first property is moved again.
+        let mut asked = Asked::new().none("=q,r,s").some("=a,b,c", &[2]);
+        asked = asked.some("=a,q,r,s", &[5]);
+        let alone = asked.engine.of(&[5]);
+        let unknown = Found::Unknown(Cause::Number);
+        asked.engine.found.insert(alone, unknown);
+        assert_eq!(asked.given(), Ok(json!({"a": "2 5"})));
+    }
+
+    #[test]
+    fn an_object_that_is_known_is_looked_for_after_one_that_is_not() {
+        // Whether the first property can be `b`, the engine does not know. With it there
+        // the object stands only as far as the engine knows, whatever name the second
+        // property has. Both have a part in that, so the search goes back to the first,
+        // which can be `a` as well.
+        let asked = Asked::new().every("=b", &[1]).some("=a,b", &[2]);
+        let asked = asked.some("=c,d,e", &[5]);
+        assert_eq!(asked.given(), Ok(json!({"a": "2", "e": "5"})));
     }
 
     #[test]
