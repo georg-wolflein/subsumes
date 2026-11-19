@@ -1,13 +1,11 @@
 //! Drawing what the library makes of two schemas, as a page for the browser.
 
-use std::env;
 use std::path::Path;
 use std::process::Command;
+use std::{env, fs};
 
 use serde_json::{Value, json};
 use subsumes::Checker;
-
-use crate::run::json;
 
 /// The page without a graph. It draws with Graphviz, which it loads from a CDN.
 const PAGE: &str = include_str!("viewer.html");
@@ -17,14 +15,21 @@ const PLACE: &str = "{{graph}}";
 /// The page that shows the schema graph of the schemas in two files. Without a second file, B
 /// is the schema `true`.
 pub fn page(a: &Path, b: Option<&Path>) -> Result<String, String> {
-    let schema_a: Value = json(a)?;
-    let schema_b: Value = b.map_or(Ok(Value::Bool(true)), json)?;
+    let schema_a = json(a)?;
+    let schema_b = b.map_or(Ok(Value::Bool(true)), json)?;
     let mut graph = Checker::new()
         .inspect(&schema_a, &schema_b)
         .map_err(|error| error.to_string())?;
     let name = |path: &Path| path.display().to_string();
     graph["names"] = json!({"a": name(a), "b": b.map_or_else(|| "true".to_owned(), name)});
     Ok(with_graph(&graph))
+}
+
+/// The schema in a file.
+fn json(path: &Path) -> Result<Value, String> {
+    let failed = |error: &dyn std::fmt::Display| format!("cannot read {}: {error}", path.display());
+    let text = fs::read_to_string(path).map_err(|error| failed(&error))?;
+    serde_json::from_str(&text).map_err(|error| failed(&error))
 }
 
 /// The page with a graph in it. Every `<` of the graph is written as an escape, so that no

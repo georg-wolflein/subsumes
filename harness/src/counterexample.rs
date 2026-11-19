@@ -13,6 +13,8 @@
 //! two against each other. No string is known on which they differ. Whether a time with the
 //! second 60 is one, the library leaves open and gives no such string.
 
+use std::cell::OnceCell;
+
 use jsonschema::{Draft, Validator};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -45,14 +47,44 @@ impl Default for Confirmation {
     }
 }
 
+/// A schema with its validator.
+///
+/// The validator is built when a counterexample is first held against the schema, and kept
+/// with it. A case is checked in both directions, and the case after it often has the same
+/// two schemas the other way round, so most schemas would have their validator built two to
+/// four times, which for a large schema takes longer than the check.
+pub struct Schema {
+    /// The schema as the library is given it.
+    pub value: Value,
+    /// The validator, or why it does not take the schema. Empty until it is asked for.
+    validator: OnceCell<Result<Validator, String>>,
+}
+
+impl Schema {
+    pub fn new(value: Value) -> Self {
+        Self {
+            value,
+            validator: OnceCell::new(),
+        }
+    }
+
+    /// The validator of the schema, or why there is none.
+    fn validator(&self) -> Result<&Validator, &String> {
+        let built = self.validator.get_or_init(|| validator(&self.value));
+        built.as_ref()
+    }
+}
+
 /// Asks the validator about a counterexample.
-pub fn confirmation(wide: &Value, narrow: &Value, counterexample: &Value) -> Confirmation {
-    let validators = validator(narrow).and_then(|narrow| Ok((validator(wide)?, narrow)));
+pub fn confirmation(wide: &Schema, narrow: &Schema, counterexample: &Value) -> Confirmation {
+    let validators = narrow
+        .validator()
+        .and_then(|narrow| Ok((wide.validator()?, narrow)));
     match validators {
         Ok((_, narrow)) if !narrow.is_valid(counterexample) => Confirmation::RejectedByNarrow,
         Ok((wide, _)) if wide.is_valid(counterexample) => Confirmation::AcceptedByWide,
         Ok(_) => Confirmation::Confirmed,
-        Err(refusal) => Confirmation::NotChecked(refusal),
+        Err(refusal) => Confirmation::NotChecked(refusal.clone()),
     }
 }
 
@@ -70,6 +102,44 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// What the validator makes of a counterexample, for two schemas that are met here first.
+    fn confirmation(wide: &Value, narrow: &Value, counterexample: &Value) -> Confirmation {
+        let (wide, narrow) = (Schema::new(wide.clone()), Schema::new(narrow.clone()));
+        super::confirmation(&wide, &narrow, counterexample)
+    }
+
+    #[test]
+    fn the_validator_of_a_schema_is_built_once() {
+        let (strings, anything) = (
+            Schema::new(json!({"type": "string"})),
+            Schema::new(json!(true)),
+        );
+        // Nothing is built before a counterexample asks for it.
+        assert!(strings.validator.get().is_none());
+        assert_eq!(
+            super::confirmation(&strings, &anything, &json!(null)),
+            Confirmation::Confirmed
+        );
+        let built: *const Validator = strings.validator().unwrap();
+        // The other way round, and with another counterexample, it is the same validator.
+        assert_eq!(
+            super::confirmation(&anything, &strings, &json!(null)),
+            Confirmation::RejectedByNarrow
+        );
+        assert_eq!(
+            super::confirmation(&strings, &anything, &json!("")),
+            Confirmation::AcceptedByWide
+        );
+        assert!(std::ptr::eq(built, strings.validator().unwrap()));
+        // A schema that the validator does not take is refused in the same words each time,
+        // and the narrow schema is asked first.
+        let elsewhere = Schema::new(json!({"$ref": "https://example.com/schema.json"}));
+        let first = super::confirmation(&elsewhere, &strings, &json!(""));
+        assert!(matches!(first, Confirmation::NotChecked(_)), "{first:?}");
+        assert_eq!(super::confirmation(&elsewhere, &strings, &json!("")), first);
+        assert_eq!(super::confirmation(&strings, &elsewhere, &json!(0)), first);
+    }
 
     #[test]
     fn the_validator_reads_a_large_float_as_the_whole_number_that_it_holds() {
