@@ -103,6 +103,7 @@ impl Engine {
                 languages: &mut self.languages,
                 budget,
                 partitions: &mut self.partitions,
+                too_deep: &mut false,
             };
             let left = search(&mut solver, &mut ask)?;
             let Left::Needs(wanted) = left else {

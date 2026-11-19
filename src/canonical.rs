@@ -30,6 +30,8 @@ pub(crate) struct Solver<'s> {
     pub languages: &'s mut Languages,
     pub budget: &'s mut Budget,
     pub partitions: &'s mut Partitions,
+    /// Whether an object or an array was passed over because it would be too deep to give.
+    pub too_deep: &'s mut bool,
 }
 
 /// What is left of the objects of a branch, or of its arrays.

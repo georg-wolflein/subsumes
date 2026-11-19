@@ -526,6 +526,7 @@ impl Places for Search<'_> {
         let values = values.chain(more.iter().map(|(_, _, value)| value));
         let deepest = values.map(|value| value.depth).max().unwrap_or(0);
         if deepest >= DEEPEST {
+            *with.too_deep = true;
             placed.depends.get_or_insert(Cause::Depth);
             return Ok(None);
         }

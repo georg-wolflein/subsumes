@@ -371,6 +371,7 @@ impl Places for Search<'_> {
         let values = of_slots.chain(&plain).chain(&rest);
         let deepest = values.map(|value| value.depth).max().unwrap_or(0);
         if deepest >= DEEPEST {
+            *with.too_deep = true;
             placed.depends.get_or_insert(Cause::Depth);
             return Ok(None);
         }

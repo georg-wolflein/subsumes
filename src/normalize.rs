@@ -206,24 +206,38 @@ pub(crate) fn decide(context: &mut Context, a: VarId, b: VarId) -> Result<Outcom
     let terms = &mut context.terms;
     let (accepted, rejected) = (terms.literal(b, false), terms.literal(a, true));
     let both = terms.both(accepted, rejected);
-    let mut engine = Engine {
-        context,
-        unfoldings: Vec::new(),
-        tasks: Vec::new(),
-        found: HashMap::new(),
-        assumed: HashMap::new(),
-        at_work: HashMap::new(),
-        answers: 0,
-        names: HashMap::new(),
-        partitions: Partitions::default(),
-        dead_ends: HashMap::new(),
-    };
-    Ok(match engine.decide(both)? {
-        Found::Nothing => Outcome::Yes,
-        // The counterexample is the one instance that is written out.
-        Found::Instance(witness) => Outcome::No(witness.written(&mut engine.context.budget)?),
-        Found::Unknown(cause) => Outcome::Unknown(cause),
-    })
+    let mut hands_on = true;
+    loop {
+        let mut engine = Engine {
+            context: &mut *context,
+            unfoldings: Vec::new(),
+            tasks: Vec::new(),
+            found: HashMap::new(),
+            assumed: HashMap::new(),
+            at_work: HashMap::new(),
+            answers: 0,
+            names: HashMap::new(),
+            partitions: Partitions::default(),
+            dead_ends: HashMap::new(),
+            hands_on,
+            handed_on: false,
+            too_deep: false,
+        };
+        return Ok(match engine.decide(both)? {
+            Found::Nothing => Outcome::Yes,
+            // The counterexample is the one instance that is written out.
+            Found::Instance(witness) => Outcome::No(witness.written(&mut engine.context.budget)?),
+            // An instance that was handed on may be deeper than the one that a task of
+            // its own gives. So where a value was passed over for its depth, the check is
+            // made again without handing instances on: the answer is then the one that
+            // it was before instances were handed on.
+            Found::Unknown(_) if engine.handed_on && engine.too_deep => {
+                hands_on = false;
+                continue;
+            }
+            Found::Unknown(cause) => Outcome::Unknown(cause),
+        });
+    }
 }
 
 /// A term that a branch has yet to take in, as it is or negated.
@@ -519,6 +533,12 @@ struct Engine<'c> {
     /// refuted before it came to a split. A branch splits on the one that did so most often
     /// first, since it is likely to do so again whatever the other disjunctions are split to.
     dead_ends: HashMap<Disjunction, u32>,
+    /// Whether an instance is handed on to the c-references that ask no more, whether one
+    /// was, and whether an object or an array was passed over because it would be too
+    /// deep to give.
+    hands_on: bool,
+    handed_on: bool,
+    too_deep: bool,
 }
 
 impl Engine<'_> {
@@ -545,7 +565,7 @@ impl Engine<'_> {
             if self.tasks.is_empty() {
                 return Ok(found);
             }
-            if matches!(found, Found::Instance(_)) {
+            if self.hands_on && matches!(found, Found::Instance(_)) {
                 self.share(ended, &found)?;
             }
         }
@@ -579,6 +599,7 @@ impl Engine<'_> {
             }
         }
         for other in served {
+            self.handed_on = true;
             self.found.insert(other, instance.clone());
         }
         Ok(())
@@ -890,6 +911,7 @@ impl Engine<'_> {
             assumed,
             at_work,
             partitions,
+            too_deep,
             ..
         } = self;
         let Context {
@@ -923,6 +945,7 @@ impl Engine<'_> {
             languages,
             budget,
             partitions,
+            too_deep,
         };
         let left = if of == InstanceType::Array {
             branch.arrays.left(&mut solver, &mut ask, give)?
@@ -3823,6 +3846,48 @@ mod tests {
             }
         );
         assert_eq!(check.steps, steps);
+    }
+
+    #[test]
+    fn an_instance_that_is_handed_on_costs_no_verdict_for_its_depth() {
+        // The value of `p` is asked two things together, of which the one is a chain of
+        // 127 objects inside one another, and the value of `q` only the other, which
+        // `null` satisfies. The search for the object waits for both c-references, and the
+        // one that names more is decided first: its instance is the chain, which is one of
+        // the other as well. With it for `q`, the object is too deep to give.
+        let mut definitions = Map::new();
+        definitions.insert("V".to_owned(), json!({"type": ["object", "null"]}));
+        definitions.insert("d0".to_owned(), json!({"type": "object"}));
+        for depth in 1..=126 {
+            let inside = format!("#/$defs/d{}", depth - 1);
+            let chain = json!({
+                "type": "object",
+                "required": ["n"],
+                "properties": {"n": {"$ref": inside}},
+            });
+            definitions.insert(format!("d{depth}"), chain);
+        }
+        let b = json!({
+            "$defs": definitions,
+            "type": "object",
+            "properties": {"q": {"$ref": "#/$defs/V"}},
+            "anyOf": [
+                {
+                    "required": ["q", "p"],
+                    "allOf": [
+                        {"properties": {"p": {"$ref": "#/$defs/V"}}},
+                        {"properties": {"p": {"$ref": "#/$defs/d126"}}},
+                    ],
+                },
+                {"required": ["q"]},
+            ],
+        });
+        // The check is then made again without handing instances on, and gives the plain
+        // value that a task of its own finds for `q`.
+        assert_eq!(
+            counterexample(&json!({"type": "null"}), &b),
+            json!({"q": null})
+        );
     }
 
     #[test]
