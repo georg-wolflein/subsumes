@@ -36,10 +36,37 @@ pub(super) enum Place<At> {
 
 /// What was done for one value that there has to be, and what else can be tried.
 struct Level<At> {
-    places: Vec<Place<At>>,
+    /// Where its places are in the places of all levels, and the next to try.
+    from: usize,
+    to: usize,
     next: usize,
     /// What the place that was tried last did, if it stands.
     done: Option<Done<At>>,
+}
+
+/// The lists that a search is put together in. A search leaves them to the next, which
+/// clears them and keeps their memory.
+pub(super) struct Work<At> {
+    levels: Vec<Level<At>>,
+    /// The places of each level, one level after the other.
+    places: Vec<Place<At>>,
+    slots: Vec<Slot<At>>,
+}
+
+impl<At> Default for Work<At> {
+    fn default() -> Self {
+        Self {
+            levels: Vec::new(),
+            places: Vec::new(),
+            slots: Vec::new(),
+        }
+    }
+}
+
+impl<At> std::fmt::Debug for Work<At> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Work")
+    }
 }
 
 /// What putting a value in a place did, to take it back.
@@ -70,8 +97,9 @@ pub(super) trait Places {
     /// asks, or `None` where there are fewer of them.
     fn asked(&self, which: usize) -> Option<CRefId>;
 
-    /// Where the value of this number may go, in the order in which the places are tried.
-    fn places(&self, placed: &Placed<Self::At>, which: usize) -> Vec<Place<Self::At>>;
+    /// Where the value of this number may go, in the order in which the places are tried,
+    /// put after the places that are there.
+    fn places(&self, placed: &Placed<Self::At>, which: usize, places: &mut Vec<Place<Self::At>>);
 
     /// What a value satisfies by its place alone.
     fn at(&self, at: Self::At) -> CRefId;
@@ -122,29 +150,57 @@ pub(super) trait Places {
 ///
 /// When the budget does not cover the search. Each place that is tried costs a step.
 pub(super) fn run<P: Places>(
-    mut places: P,
+    places: P,
     with: &mut Solver,
     ask: &mut dyn FnMut(CRefId) -> Option<Found>,
     give: bool,
+    work: &mut Work<P::At>,
 ) -> Result<Left, Exhausted> {
     let mut placed = Placed {
-        slots: Vec::new(),
+        slots: std::mem::take(&mut work.slots),
         wanted: Vec::new(),
         depends: None,
     };
-    let mut levels: Vec<Level<P::At>> = Vec::new();
+    work.levels.clear();
+    work.places.clear();
+    let left = search(places, &mut placed, with, ask, give, work);
+    // What the search holds is let go, and the memory of its lists is kept.
+    work.levels.clear();
+    work.places.clear();
+    placed.slots.clear();
+    work.slots = placed.slots;
+    left
+}
+
+/// The search of [`run`], in the lists of `work` and with what it has put together in
+/// `placed`.
+fn search<P: Places>(
+    mut places: P,
+    placed: &mut Placed<P::At>,
+    with: &mut Solver,
+    ask: &mut dyn FnMut(CRefId) -> Option<Found>,
+    give: bool,
+    work: &mut Work<P::At>,
+) -> Result<Left, Exhausted> {
+    let Work {
+        levels,
+        places: tried,
+        ..
+    } = work;
     let mut onward = true;
     loop {
         if onward && places.asked(levels.len()).is_none() {
             // Every one of them has a place.
-            if let Some(left) = places.fill(&mut placed, with, ask, give)? {
+            if let Some(left) = places.fill(placed, with, ask, give)? {
                 return Ok(left);
             }
         } else if onward {
-            let tried = places.places(&placed, levels.len());
+            let from = tried.len();
+            places.places(placed, levels.len(), tried);
             levels.push(Level {
-                places: tried,
-                next: 0,
+                from,
+                to: tried.len(),
+                next: from,
                 done: None,
             });
         }
@@ -159,11 +215,13 @@ pub(super) fn run<P: Places>(
             }
             None => {}
         }
-        let Some(place) = level.places.get(level.next).copied() else {
+        if level.next == level.to {
+            tried.truncate(level.from);
             levels.pop();
             onward = false;
             continue;
-        };
+        }
+        let place = tried[level.next];
         level.next += 1;
         with.budget.charge(1)?;
         let asked = places.asked(levels.len() - 1);
@@ -172,7 +230,7 @@ pub(super) fn run<P: Places>(
             Place::Join(slot) => (placed.slots[slot].at, placed.slots[slot].of),
             Place::Open(at) => (at, places.at(at)),
         };
-        onward = places.reaches(at, &mut placed, with, ask)?;
+        onward = places.reaches(at, placed, with, ask)?;
         if !onward {
             continue;
         }
@@ -202,7 +260,7 @@ pub(super) fn run<P: Places>(
         levels.last_mut().expect("a level is at work").done = Some(done);
     }
     Ok(match placed.depends {
-        _ if !placed.wanted.is_empty() => Left::Needs(placed.wanted),
+        _ if !placed.wanted.is_empty() => Left::Needs(std::mem::take(&mut placed.wanted)),
         Some(cause) => Left::Unknown(cause),
         None => Left::Nothing,
     })

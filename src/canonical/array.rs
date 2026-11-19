@@ -205,7 +205,7 @@ impl Arrays {
             looked: 0,
             end: None,
         };
-        search::run(search, with, ask, give)
+        search::run(search, with, ask, give, &mut search::Work::default())
     }
 }
 
@@ -273,13 +273,12 @@ impl Places for Search<'_> {
     }
 
     /// Where one of the items that there have to be may go.
-    fn places(&self, _: &Placed<u64>, which: usize) -> Vec<Place<u64>> {
+    fn places(&self, _: &Placed<u64>, which: usize, places: &mut Vec<Place<u64>>) {
         let (from, _) = self.some[which];
         let head = self.head.len();
         // No position at which the array has ended, and none that it may not get to.
         let most = self.arrays.max.unwrap_or(u64::MAX);
         let before = self.end.map_or(most, |end| end.min(most));
-        let mut places = Vec::new();
         // The first positions first, which makes the shortest array.
         for position in from..head {
             if position as u64 >= before {
@@ -299,7 +298,6 @@ impl Places for Search<'_> {
         if self.arrays.max.is_some() {
             places.extend(self.after.iter().map(|slot| Place::Join(*slot)));
         }
-        places
     }
 
     /// With a place for every item that there has to be: whether the array has items

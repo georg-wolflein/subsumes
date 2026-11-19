@@ -720,8 +720,7 @@ impl Engine<'_> {
         for other in &task.wanted {
             let terms = &self.context.terms;
             let (named, literals) = (terms.literals(of), terms.literals(*other));
-            let within = |literal| named.binary_search(literal).is_ok();
-            let asks_no_more = literals.iter().all(within);
+            let asks_no_more = within(literals, named);
             let steps = 1 + (literals.len() / 8) as u64;
             self.context.budget.charge(steps)?;
             if asks_no_more && self.known(*other).is_none() {
@@ -1762,6 +1761,17 @@ fn holds_a_schema(leaf: &Leaf) -> bool {
     ];
     leaf.keyword
         .is_none_or(|keyword| !WITHOUT_A_SCHEMA.contains(&keyword))
+}
+
+/// Whether every element of a list in order is in another list in order. The two are gone
+/// through once, side by side.
+fn within<T: Ord>(some: &[T], all: &[T]) -> bool {
+    if some.len() > all.len() {
+        return false;
+    }
+    let mut all = all.iter();
+    some.iter()
+        .all(|wanted| all.by_ref().find(|had| *had >= wanted) == Some(wanted))
 }
 
 /// The alternatives of a disjunction, each made when it is asked for.
@@ -4593,6 +4603,16 @@ mod tests {
             ]
         });
         assert_eq!(counterexample(&a, &b), json!({"a": null}));
+    }
+
+    #[test]
+    fn a_list_in_order_is_within_another_in_order() {
+        assert!(within(&[2, 5], &[1, 2, 3, 5]));
+        assert!(within::<u32>(&[], &[]));
+        assert!(within(&[1], &[1]));
+        assert!(!within(&[2, 4], &[1, 2, 3, 5]));
+        assert!(!within(&[6], &[1, 2, 3, 5]));
+        assert!(!within(&[1, 2], &[1]));
     }
 
     #[test]

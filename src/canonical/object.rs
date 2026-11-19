@@ -32,12 +32,13 @@
 //! what it does not know yet it is told to find out first.
 
 use std::collections::BTreeSet;
+use std::ops::Range;
 use std::rc::Rc;
 
 use super::search::{self, Place, Placed, Places, Slot};
 use super::{Left, Solver, State, add, state};
 use crate::context::{Budget, Exhausted};
-use crate::hash::{Keyed, Map};
+use crate::hash::Map;
 use crate::language::{LanguageId, Languages, Lengths, Shape};
 use crate::normalize::{Cause, DEEPEST, Found, Witness};
 use crate::term::{CRefId, Term, Terms};
@@ -156,19 +157,27 @@ impl Objects {
         if self.none || self.max.is_some_and(|max| max < self.min) {
             return Ok(Left::Nothing);
         }
-        let languages = self.every.iter().chain(&*self.some).map(|asked| asked.0);
-        let languages: BTreeSet<LanguageId> = languages.collect();
-        let languages: Vec<LanguageId> = languages.into_iter().collect();
+        // The lists of the search are those of the search before, which keeps their memory.
+        let mut work = std::mem::take(&mut with.partitions.work);
+        let (every, some) = (self.every.iter(), self.some.iter());
+        merge(
+            every.map(|of| of.0),
+            some.map(|of| of.0),
+            &mut work.languages,
+        );
         let partition = with
             .partitions
-            .of(&languages, with.languages, with.budget)?;
+            .of(&work.languages, with.languages, with.budget)?;
 
         // What every property of a fragment satisfies.
-        let mut every = vec![Terms::ANYTHING; partition.fragments.len()];
+        let every = &mut work.every;
+        every.clear();
+        every.resize(partition.fragments.len(), Terms::ANYTHING);
+        let mut from = 0;
         for (names, of) in &*self.every {
-            let held = &partition.within[names];
+            let held = partition.within(*names, &mut from);
             with.budget.charge(1 + (held.len() / 8) as u64)?;
-            for fragment in held.iter() {
+            for fragment in held {
                 let all = &mut every[*fragment as usize];
                 *all = with.terms.both(*all, *of);
             }
@@ -177,53 +186,70 @@ impl Objects {
         // those of its language whose properties can have a value at all. An object that
         // takes no property but those that it names leaves few of them, and a property
         // that is left with none leaves no object.
-        let mut open: Vec<u32> = Vec::new();
-        let mut ends: Vec<(usize, usize, CRefId)> = Vec::with_capacity(self.some.len());
+        let (open, some) = (&mut work.open, &mut work.some);
+        open.clear();
+        some.clear();
+        let mut from = 0;
         for (names, of) in &*self.some {
-            let held = &partition.within[names];
+            let held = partition.within(*names, &mut from);
             with.budget.charge((held.len() / 8) as u64)?;
             let before = open.len();
             let takes_a_value = |fragment: &&u32| every[**fragment as usize] != Terms::NOTHING;
             open.extend(held.iter().filter(takes_a_value));
             if open.len() == before {
+                with.partitions.work = work;
                 return Ok(Left::Nothing);
             }
-            ends.push((open.len(), held.len(), *of));
+            some.push((held.len(), before..open.len(), *of));
         }
         // Those first whose language holds the fewest fragments.
-        let mut some: Vec<(usize, &[u32], CRefId)> = Vec::with_capacity(ends.len());
-        let mut from = 0;
-        for (to, held, of) in ends {
-            some.push((held, &open[from..to], of));
-            from = to;
-        }
         some.sort_by_key(|(held, _, _)| *held);
-        let some: Vec<(&[u32], CRefId)> = some
-            .into_iter()
-            .map(|(_, fragments, of)| (fragments, of))
-            .collect();
+        let used = &mut work.used;
+        used.truncate(partition.fragments.len());
+        used.iter_mut().for_each(Vec::clear);
+        used.resize_with(partition.fragments.len(), Vec::new);
 
         let search = Search {
             objects: self,
             partition: &partition,
-            every: &every,
-            some: &some,
-            used: vec![Vec::new(); partition.fragments.len()],
+            every: &work.every,
+            open: &work.open,
+            some: &work.some,
+            used: &mut work.used,
         };
-        search::run(search, with, ask, give)
+        let left = search::run(search, with, ask, give, &mut work.search);
+        with.partitions.work = work;
+        left
     }
 }
 
 /// The names of all properties, cut into fragments by a list of languages.
 #[derive(Debug)]
 pub(crate) struct Partition {
+    /// The names that a language lists, in order. Each is a fragment of its own.
+    names: Vec<Box<str>>,
     /// The fragments: first those of one name each, in the order of the names, then the
     /// others.
     fragments: Vec<Fragment>,
     /// How many of them are of one name each.
     named: usize,
-    /// The fragments that each language of the list holds, in order.
-    within: Map<LanguageId, Box<[u32]>>,
+    /// The languages of the list, each with where the fragments that it holds are in
+    /// `held`, in order.
+    within: Vec<(LanguageId, Range<usize>)>,
+    held: Vec<u32>,
+}
+
+impl Partition {
+    /// The fragments that a language of the list holds, in order. The languages are asked
+    /// in order, from where the one before was found, so the list is gone through once.
+    fn within(&self, language: LanguageId, from: &mut usize) -> &[u32] {
+        while self.within[*from].0 < language {
+            *from += 1;
+        }
+        let (of, held) = &self.within[*from];
+        debug_assert_eq!(*of, language, "the language is one of the list");
+        &self.held[held.clone()]
+    }
 }
 
 #[derive(Debug)]
@@ -235,13 +261,11 @@ struct Fragment {
 
 #[derive(Debug)]
 enum Names {
-    /// One name.
-    One(Box<str>),
-    /// The names of a language, but for a few of them that are fragments of their own.
-    Of {
-        language: LanguageId,
-        but: Vec<Box<str>>,
-    },
+    /// The name of the same number.
+    One,
+    /// The names of a language, but for a few of them that are fragments of their own,
+    /// each by its number.
+    Of { language: LanguageId, but: Vec<u32> },
 }
 
 /// The names that no language lists, cut by a list of patterns: one part for each way of
@@ -258,6 +282,28 @@ struct Rest {
 pub(crate) struct Partitions {
     of: Map<Box<[LanguageId]>, Rc<Partition>>,
     rests: Map<Box<[LanguageId]>, Rc<[Rest]>>,
+    /// The lists that the search for an object is put together in. A search leaves them
+    /// to the next, which clears them and keeps their memory.
+    work: Work,
+}
+
+/// The lists of a search for an object.
+#[derive(Debug, Default)]
+struct Work {
+    /// The languages that the object is asked about, in order.
+    languages: Vec<LanguageId>,
+    /// What every property of each fragment satisfies.
+    every: Vec<CRefId>,
+    /// The fragments that the properties that there have to be may be in, one after the
+    /// other.
+    open: Vec<u32>,
+    /// The properties that there have to be: how many fragments their language holds,
+    /// where their fragments are in `open`, and what their value satisfies.
+    some: Vec<(usize, Range<usize>, CRefId)>,
+    /// The slots of each fragment.
+    used: Vec<Vec<usize>>,
+    /// The lists of the search itself.
+    search: search::Work<u32>,
 }
 
 impl Partitions {
@@ -272,50 +318,50 @@ impl Partitions {
             return Ok(Rc::clone(known));
         }
         // A language that is kept as what is outside a few others is cut as they are.
-        let mut made_of: BTreeSet<LanguageId> = BTreeSet::new();
+        let mut made_of: Vec<LanguageId> = Vec::with_capacity(asked.len());
         for language in asked {
             match languages.shape(*language) {
-                Shape::Outside(of) => made_of.extend(of.iter().copied()),
-                _ => {
-                    made_of.insert(*language);
-                }
+                Shape::Outside(of) => made_of.extend_from_slice(of),
+                _ => made_of.push(*language),
             }
         }
+        made_of.sort_unstable();
+        made_of.dedup();
         // Every word that a set of words lists is a name of its own. Every other language
-        // is a pattern here.
-        let mut names: BTreeSet<Box<str>> = BTreeSet::new();
+        // is a pattern here. A name that several sets list is copied once.
         let mut patterns: Vec<LanguageId> = Vec::new();
+        let mut listed: Vec<&str> = Vec::new();
         for language in &made_of {
             match languages.shape(*language) {
-                Shape::Words { words, .. } => names.extend(words.iter().cloned()),
+                Shape::Words { words, .. } => listed.extend(words.iter().map(AsRef::as_ref)),
                 Shape::Outside(_) | Shape::Other => patterns.push(*language),
             }
         }
-        let names: Vec<Box<str>> = names.into_iter().collect();
-        let mut matched: Vec<Box<[bool]>> = Vec::with_capacity(names.len());
+        listed.sort_unstable();
+        listed.dedup();
+        let names: Vec<Box<str>> = listed.into_iter().map(Box::from).collect();
+        // Whether each name is in each pattern: a row of the patterns for each name.
+        let mut matched: Vec<bool> = Vec::with_capacity(names.len() * patterns.len());
         for name in &names {
-            let mut by = Vec::with_capacity(patterns.len());
             for pattern in &patterns {
-                by.push(languages.contains(*pattern, name, budget)?);
+                matched.push(languages.contains(*pattern, name, budget)?);
             }
-            matched.push(by.into());
         }
+        let row = |name: usize| &matched[name * patterns.len()..(name + 1) * patterns.len()];
 
-        let mut fragments: Vec<Fragment> = Vec::with_capacity(names.len() + 1);
-        for name in &names {
-            fragments.push(Fragment {
-                names: Names::One(name.clone()),
-                size: Some(1),
-            });
-        }
+        let named = names.len();
+        let mut fragments: Vec<Fragment> = Vec::with_capacity(named + 1);
+        fragments.extend((0..named).map(|_| Fragment {
+            names: Names::One,
+            size: Some(1),
+        }));
         let rests = self.rests(&patterns, languages, budget)?;
         let mut kept: Vec<&Rest> = Vec::with_capacity(rests.len());
         for rest in rests.iter() {
             // The names that are fragments of their own are not of this one.
-            let listed = names.iter().zip(&matched);
-            let but: Vec<Box<str>> = listed
-                .filter(|(_, by)| **by == rest.within)
-                .map(|(name, _)| name.clone())
+            let but: Vec<u32> = (0..named)
+                .filter(|name| row(*name) == &*rest.within)
+                .map(number)
                 .collect();
             let size = languages.size(rest.names, budget)?;
             let size = size.map(|size| size.saturating_sub(but.len() as u64));
@@ -331,47 +377,83 @@ impl Partitions {
             }
         }
 
-        // Whether one of the languages that the list is made of holds a fragment.
-        let place: Map<LanguageId, usize> = patterns.iter().copied().zip(0..).collect();
-        let named = names.len();
-        let holds = |languages: &Languages, language: LanguageId, fragment: usize| match (
-            languages.shape(language),
-            fragment.checked_sub(named),
-        ) {
-            (Shape::Words { words, others }, None) => words.contains(&names[fragment]) != others,
-            (Shape::Words { others, .. }, Some(_)) => others,
-            (_, None) => matched[fragment][place[&language]],
-            (_, Some(rest)) => kept[rest].within[place[&language]],
+        // The fragments that one of the languages that the list is made of holds are marked.
+        // The names are in order, and the patterns too.
+        let index = |word: &str| {
+            let found = names.binary_search_by(|name| (**name).cmp(word));
+            found.expect("every word that is listed is a name")
         };
-        let index: Map<&str, u32> = names.iter().map(AsRef::as_ref).zip(0..).collect();
-        let mut within = Map::with_capacity_and_hasher(asked.len(), Keyed::default());
+        let place = |pattern: LanguageId| {
+            let found = patterns.binary_search(&pattern);
+            found.expect("every language that lists no words is a pattern")
+        };
+        let mark = |languages: &Languages, language: LanguageId, marks: &mut [bool]| {
+            let (of_names, of_rests) = marks.split_at_mut(named);
+            match languages.shape(language) {
+                Shape::Words {
+                    words,
+                    others: false,
+                } => {
+                    for word in words {
+                        of_names[index(word)] = true;
+                    }
+                }
+                Shape::Words {
+                    words,
+                    others: true,
+                } => {
+                    for (name, marked) in names.iter().zip(of_names) {
+                        *marked |= !words.contains(name);
+                    }
+                    of_rests.fill(true);
+                }
+                Shape::Outside(_) | Shape::Other => {
+                    let at = place(language);
+                    for (name, marked) in of_names.iter_mut().enumerate() {
+                        *marked |= row(name)[at];
+                    }
+                    for (rest, marked) in kept.iter().zip(of_rests) {
+                        *marked |= rest.within[at];
+                    }
+                }
+            }
+        };
+        let mut marks = vec![false; fragments.len()];
+        let mut within = Vec::with_capacity(asked.len());
+        let mut held: Vec<u32> = Vec::new();
         for language in asked {
-            let all = 0..fragments.len();
-            let held: Vec<u32> = match languages.shape(*language) {
+            let from = held.len();
+            match languages.shape(*language) {
                 // A few words are found by their names.
                 Shape::Words {
                     words,
                     others: false,
-                } => words.iter().map(|word| index[word.as_ref()]).collect(),
+                } => held.extend(words.iter().map(|word| number(index(word)))),
                 Shape::Outside(of) => {
                     budget.charge(1 + (fragments.len() / 8) as u64)?;
-                    let outside =
-                        |fragment: &usize| !of.iter().any(|one| holds(languages, *one, *fragment));
-                    all.filter(outside).map(number).collect()
+                    marks.fill(false);
+                    for one in of {
+                        mark(languages, *one, &mut marks);
+                    }
+                    let outside = marks.iter().enumerate().filter(|(_, marked)| !**marked);
+                    held.extend(outside.map(|(fragment, _)| number(fragment)));
                 }
                 _ => {
                     budget.charge(1 + (fragments.len() / 8) as u64)?;
-                    all.filter(|fragment| holds(languages, *language, *fragment))
-                        .map(number)
-                        .collect()
+                    marks.fill(false);
+                    mark(languages, *language, &mut marks);
+                    let inside = marks.iter().enumerate().filter(|(_, marked)| **marked);
+                    held.extend(inside.map(|(fragment, _)| number(fragment)));
                 }
-            };
-            within.insert(*language, held.into());
+            }
+            within.push((*language, from..held.len()));
         }
         let partition = Rc::new(Partition {
+            names,
             fragments,
             named,
             within,
+            held,
         });
         self.of.insert(asked.into(), Rc::clone(&partition));
         Ok(partition)
@@ -397,6 +479,29 @@ impl Partitions {
     }
 }
 
+/// Puts what two lists in order hold into a third, in order and each once.
+fn merge<T: Ord + Copy>(
+    one: impl Iterator<Item = T>,
+    other: impl Iterator<Item = T>,
+    all: &mut Vec<T>,
+) {
+    all.clear();
+    let (mut one, mut other) = (one.peekable(), other.peekable());
+    loop {
+        let next = match (one.peek(), other.peek()) {
+            (Some(first), Some(second)) if second < first => other.next(),
+            (Some(_), _) => one.next(),
+            (None, _) => other.next(),
+        };
+        let Some(next) = next else {
+            return;
+        };
+        if all.last() != Some(&next) {
+            all.push(next);
+        }
+    }
+}
+
 fn number(fragment: usize) -> u32 {
     u32::try_from(fragment).expect("fewer than 2^32 fragments")
 }
@@ -408,18 +513,19 @@ struct Search<'s> {
     partition: &'s Partition,
     /// What every property of each fragment satisfies.
     every: &'s [CRefId],
-    /// The properties that there have to be: the fragments that each may be in, and what
-    /// its value satisfies.
-    some: &'s [(&'s [u32], CRefId)],
+    /// The properties that there have to be: where the fragments that each may be in are
+    /// in `open`, and what its value satisfies.
+    open: &'s [u32],
+    some: &'s [(usize, Range<usize>, CRefId)],
     /// The slots of each fragment.
-    used: Vec<Vec<usize>>,
+    used: &'s mut [Vec<usize>],
 }
 
 impl Places for Search<'_> {
     type At = u32;
 
     fn asked(&self, which: usize) -> Option<CRefId> {
-        self.some.get(which).map(|(_, of)| *of)
+        self.some.get(which).map(|(_, _, of)| *of)
     }
 
     fn at(&self, fragment: u32) -> CRefId {
@@ -435,32 +541,45 @@ impl Places for Search<'_> {
     }
 
     /// Where one of the properties that there have to be may go.
-    fn places(&self, placed: &Placed<u32>, which: usize) -> Vec<Place<u32>> {
-        let (fragments, _) = self.some[which];
+    fn places(&self, placed: &Placed<u32>, which: usize, places: &mut Vec<Place<u32>>) {
+        let fragments = &self.open[self.some[which].1.clone()];
         let most = self.objects.max;
         let room = most.is_none_or(|most| (placed.slots.len() as u64) < most);
-        let (mut join, mut open) = (Vec::new(), Vec::new());
         // The fragments that are not of one name come last and are tried first: what their
         // properties satisfy is the least.
-        for fragment in fragments.iter().rev() {
+        let fragments = fragments.iter().map(|fragment| {
             let size = self.partition.fragments[*fragment as usize].size;
-            let used = &self.used[*fragment as usize];
-            // A new property is asked no more than one that is shared. So sharing is tried
-            // only where a fragment may run out of names or the object out of properties.
-            if most.is_some() || size.is_some() {
-                join.extend(used.iter().map(|slot| Place::Join(*slot)));
+            (*fragment, size, &self.used[*fragment as usize])
+        });
+        let fragments = fragments.rev();
+        // A new property is asked no more than one that is shared. So sharing is tried only
+        // where a fragment may run out of names or the object out of properties.
+        let join = |places: &mut Vec<Place<u32>>| {
+            let shared = fragments
+                .clone()
+                .filter(|(_, size, _)| most.is_some() || size.is_some());
+            for (_, _, used) in shared {
+                places.extend(used.iter().map(|slot| Place::Join(*slot)));
             }
-            if room && size.is_none_or(|size| (used.len() as u64) < size) {
-                open.push(Place::Open(*fragment));
-            }
-        }
+        };
+        let open = |places: &mut Vec<Place<u32>>| {
+            let more = |(_, size, used): &(u32, Option<u64>, &Vec<usize>)| {
+                room && size.is_none_or(|size| (used.len() as u64) < size)
+            };
+            places.extend(
+                fragments
+                    .clone()
+                    .filter(more)
+                    .map(|(at, ..)| Place::Open(at)),
+            );
+        };
         // With a most, the fewest properties first.
         if most.is_some() {
-            join.extend(open);
-            join
+            join(places);
+            open(places);
         } else {
-            open.extend(join);
-            open
+            open(places);
+            join(places);
         }
     }
 
@@ -570,9 +689,12 @@ impl Search<'_> {
         for (fragment, count, value) in filled.chain(added) {
             for _ in 0..count {
                 let name = match &self.partition.fragments[fragment].names {
-                    Names::One(name) => name.to_string(),
+                    Names::One => self.partition.names[fragment].to_string(),
                     Names::Of { language, but } => {
                         let before = made_up.entry(fragment).or_default();
+                        let but = but
+                            .iter()
+                            .map(|name| &*self.partition.names[*name as usize]);
                         let name = new_name(*language, but, before, with)?;
                         before.push(name.clone());
                         name
@@ -587,15 +709,14 @@ impl Search<'_> {
 
 /// A name of a language that is none of those left out and none of those made up before:
 /// the shortest that is not empty, and of several one of plain characters.
-fn new_name(
+fn new_name<'n>(
     language: LanguageId,
-    but: &[Box<str>],
-    before: &[String],
+    but: impl Iterator<Item = &'n str>,
+    before: &'n [String],
     with: &mut Solver,
 ) -> Result<String, Exhausted> {
     with.budget.charge(1 + before.len() as u64)?;
-    let left_out = but.iter().map(AsRef::as_ref);
-    let left_out = left_out.chain(before.iter().map(String::as_str));
+    let left_out = but.chain(before.iter().map(String::as_str));
     let left_out = with.languages.words(left_out);
     let others = with.languages.outside([left_out]);
     let left = with.languages.intersection(language, others, with.budget)?;
@@ -835,5 +956,42 @@ mod tests {
         // The search costs steps.
         let left = four().left(&mut Budget::new(0));
         assert_eq!(left.map(|_| ()), Err(Exhausted));
+    }
+
+    #[test]
+    fn a_search_leaves_nothing_to_the_next() {
+        // The searches of a check are made with the lists of the one before. Each finds
+        // what it finds with lists of its own: the largest comes first, then one that
+        // ends before the search, one in which properties share a name, and one of no
+        // property at all.
+        let asks: [fn(Asked) -> Asked; 5] = [
+            |asked| {
+                let asked = asked.every("=a,b", &[2]).every("!a,b", &[5]);
+                asked.some("=a", &[3]).some("=b", &[-3]).some("[0-9]", &[4])
+            },
+            |asked| asked.none("!a").some("=b", &[2]),
+            |asked| asked.count(2, Some(2)).some("=a", &[2]).some("=a,b", &[-3]),
+            |asked| asked.some("=a", &[3]).some("=a", &[4]),
+            |asked| asked,
+        ];
+        let mut asked = Asked::new();
+        for ask in asks {
+            let alone = ask(Asked::new()).given();
+            asked.objects = Objects::default();
+            asked = ask(asked);
+            let left = asked.left(&mut Budget::new(u64::MAX)).unwrap();
+            assert_eq!(given(left), alone);
+        }
+    }
+
+    #[test]
+    fn two_lists_in_order_are_merged_in_order() {
+        let mut all = vec![9];
+        merge([1, 3, 3, 5].into_iter(), [2, 3, 6].into_iter(), &mut all);
+        assert_eq!(all, [1, 2, 3, 5, 6]);
+        merge([].into_iter(), [4, 4].into_iter(), &mut all);
+        assert_eq!(all, [4]);
+        merge([7].into_iter(), [].into_iter(), &mut all);
+        assert_eq!(all, [7]);
     }
 }
