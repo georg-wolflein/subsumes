@@ -621,6 +621,63 @@ impl Terms {
         &mut self.variables[id.index()]
     }
 
+    /// Whether some variable refers to itself in place: by way of connectives and
+    /// references alone, so that its schema is asked again of the instance that it is asked
+    /// of. A reference in a property or in an item is asked of another value.
+    pub fn refer_in_place(&self) -> bool {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Mark {
+            New,
+            OnTheWay,
+            Done,
+        }
+        // The variables that the term of a variable refers to in place.
+        let in_place = |variable: usize| {
+            let (mut found, mut seen) = (Vec::new(), HashSet::new());
+            let mut pending = vec![self.variables[variable].body];
+            while let Some(term) = pending.pop() {
+                if !seen.insert(term) {
+                    continue;
+                }
+                match self.term(term) {
+                    Term::AllOf(parts) | Term::AnyOf(parts) | Term::OneOf(parts) => {
+                        pending.extend(parts.iter().copied());
+                    }
+                    Term::Not(inner) => pending.push(*inner),
+                    Term::Ref(other) => found.push(other.index()),
+                    _ => {}
+                }
+            }
+            found
+        };
+        // A walk that goes as deep as it can first: a variable that is met while it is on
+        // the way closes a cycle.
+        let mut marks = vec![Mark::New; self.variables.len()];
+        for start in 0..self.variables.len() {
+            if marks[start] != Mark::New {
+                continue;
+            }
+            marks[start] = Mark::OnTheWay;
+            let mut way = vec![(start, in_place(start))];
+            while let Some((variable, others)) = way.last_mut() {
+                let Some(other) = others.pop() else {
+                    marks[*variable] = Mark::Done;
+                    way.pop();
+                    continue;
+                };
+                match marks[other] {
+                    Mark::OnTheWay => return true,
+                    Mark::Done => {}
+                    Mark::New => {
+                        marks[other] = Mark::OnTheWay;
+                        way.push((other, in_place(other)));
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// A term as text, for tests. A language is named by its id, as in `patt(l2)`.
     #[cfg(test)]
     pub fn show(&self, id: TermId) -> String {
@@ -965,6 +1022,26 @@ mod tests {
         );
         // At least no item is asked of nothing.
         assert_eq!(terms.min_its(0), terms.truth());
+    }
+
+    #[test]
+    fn a_variable_refers_to_itself_in_place_by_connectives_alone() {
+        let mut terms = Terms::default();
+        let [x, y, z] = [(); 3].map(|()| terms.new_variable(NodeId::new(0)));
+        let (names, other) = (Languages::EVERYTHING, leaf(&mut terms, "a"));
+        // `x` holds `y` in a property, and `y` refers to `z`: no way leads back.
+        terms.variable_mut(x).body = terms.p_prop(names, y);
+        let to_z = terms.reference(z);
+        terms.variable_mut(y).body = terms.any_of([to_z, other]);
+        assert!(!terms.refer_in_place());
+        // `z` holds `x` in a property, which is asked of another value.
+        terms.variable_mut(z).body = terms.p_prop(names, x);
+        assert!(!terms.refer_in_place());
+        // By a negation in a conjunction, `z` leads back to `y` in place.
+        let to_y = terms.reference(y);
+        let negated = terms.not(to_y);
+        terms.variable_mut(z).body = terms.all_of([negated, other]);
+        assert!(terms.refer_in_place());
     }
 
     #[test]

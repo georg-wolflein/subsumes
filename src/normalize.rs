@@ -133,6 +133,8 @@ pub(crate) fn decide(context: &mut Context, a: VarId, b: VarId) -> Result<Outcom
         names: HashMap::new(),
         partitions: Partitions::default(),
         dead_ends: HashMap::new(),
+        rested: false,
+        in_place: None,
     };
     Ok(match engine.decide(both)? {
         Found::Nothing => Outcome::Yes,
@@ -232,6 +234,9 @@ struct Branch {
     todo: VecDeque<Item>,
     /// The disjunctions that were met and not split yet.
     choices: VecDeque<Item>,
+    /// How many of them, the first ones, the branch had when it was made: those that the
+    /// alternative did not bring.
+    inherited: usize,
     /// A disjunction that the branch splits on before any other, as soon as it stands: the
     /// second half of an alternative of "two hold".
     and: Option<Later>,
@@ -259,6 +264,7 @@ impl Default for Branch {
             met: BTreeSet::new(),
             todo: VecDeque::new(),
             choices: VecDeque::new(),
+            inherited: 0,
             and: None,
         }
     }
@@ -364,6 +370,12 @@ struct Task {
     lowest: usize,
     /// How many answers had been found when the task began.
     began: u64,
+    /// Whether the task only looks for a refutation: it ends with no answer as soon as one
+    /// of its branches stands with nothing left to split, or waits for another task. The
+    /// try of a complement asks for such tasks, so that it gives no instance and goes no
+    /// deeper than the values that the complement asks about. Only a try of such a task
+    /// asks for more of them.
+    refuting: bool,
 }
 
 /// A branch that was split on one of its disjunctions.
@@ -380,6 +392,22 @@ struct Split {
     /// taken in what needs no split, and it did not end in a split on a disjunction that it
     /// brought and that left it with no alternative either.
     stood: bool,
+    /// What holds where the disjunction does not, if that is a conjunction that is still to
+    /// be tried. It is tried before the alternatives: if the branch is refuted with it,
+    /// every instance of the branch satisfies the disjunction, which says nothing then and
+    /// is not split.
+    complement: Option<Alternative>,
+    /// The try of the complement, while it lasts.
+    trying: Option<Try>,
+}
+
+/// The try of the complement of a disjunction.
+struct Try {
+    /// The lowest task that the task at work had taken to accept nothing before.
+    lowest: usize,
+    /// The c-references that the try asked for and whose tasks ended with no answer. A
+    /// value may satisfy them, as far as the try knows.
+    open: Vec<CRefId>,
 }
 
 /// A disjunction by what it says: a term, as it is or negated.
@@ -434,6 +462,11 @@ struct Engine<'c> {
     /// refuted before it came to a split. A branch splits on the one that did so most often
     /// first, since it is likely to do so again whatever the other disjunctions are split to.
     dead_ends: HashMap<Disjunction, u32>,
+    /// Whether a branch was last asked what it leaves of objects or arrays with an answer
+    /// that holds only as long as tasks at work accept nothing.
+    rested: bool,
+    /// Whether some schema refers to itself in place, once that was looked for.
+    in_place: Option<bool>,
 }
 
 impl Engine<'_> {
@@ -442,13 +475,18 @@ impl Engine<'_> {
         if let Some(known) = self.known(of) {
             return Ok(known);
         }
-        self.begin(of)?;
+        self.begin(of, false)?;
         loop {
             // What the task at work asked for comes first.
             let task = self.tasks.last_mut().expect("a task is at work");
             if let Some(wanted) = task.wanted.pop() {
+                // What the try of a complement asks for is refuted or left open.
+                let refuting = task
+                    .splits
+                    .last()
+                    .is_some_and(|split| split.trying.is_some());
                 if self.known(wanted).is_none() {
-                    self.begin(wanted)?;
+                    self.begin(wanted, refuting)?;
                 }
                 continue;
             }
@@ -477,7 +515,7 @@ impl Engine<'_> {
 
     /// Puts a task for a c-reference on the stack. It begins as one branch that takes in
     /// the variables: those that stand as they are first.
-    fn begin(&mut self, of: CRefId) -> Result<(), Exhausted> {
+    fn begin(&mut self, of: CRefId, refuting: bool) -> Result<(), Exhausted> {
         self.context.budget.charge(1)?;
         let terms = &mut self.context.terms;
         let literals = terms.literals(of).to_vec();
@@ -498,12 +536,15 @@ impl Engine<'_> {
                 choice: None,
                 brought: false,
                 stood: true,
+                complement: None,
+                trying: None,
             }],
             waiting: None,
             wanted: Vec::new(),
             depends_on: None,
             lowest: usize::MAX,
             began: self.answers,
+            refuting,
         });
         Ok(())
     }
@@ -575,7 +616,17 @@ impl Engine<'_> {
                     self.stood();
                     return Ok(None);
                 }
-                let Some(alternative) = split.still_to_come.next() else {
+                // What holds where the disjunction does not is tried before its
+                // alternatives, on a branch like any of theirs.
+                let alternative = if let Some(complement) = split.complement.take() {
+                    split.trying = Some(Try {
+                        lowest: task.lowest,
+                        open: Vec::new(),
+                    });
+                    complement
+                } else if let Some(alternative) = split.still_to_come.next() {
+                    alternative
+                } else {
                     let dead_end = !split.stood;
                     if let (Some(choice), true) = (split.choice, dead_end) {
                         *self.dead_ends.entry(choice).or_default() += 1;
@@ -591,13 +642,36 @@ impl Engine<'_> {
                 };
                 self.context.budget.charge(1 + split.branch.weight() / 32)?;
                 let mut branch = split.branch.clone();
+                branch.inherited = branch.choices.len();
                 branch.todo.extend(alternative.holds);
                 branch.and = alternative.and;
                 branch
             }
         };
-        match self.settle(&mut branch)? {
+        let task = self.tasks.last().expect("a task is at work");
+        let refuting = task.refuting;
+        let trying = task
+            .splits
+            .last()
+            .is_some_and(|split| split.trying.is_some());
+        self.rested = false;
+        let settled = self.settle(&mut branch)?;
+        if trying {
+            // The branch is the complement of the disjunction of the split at work, and is
+            // followed no further than this.
+            match settled {
+                Settled::Needs(wanted) => self.wait(branch, wanted),
+                Settled::Refuted => self.tried(true),
+                Settled::Stands => self.tried(false),
+            }
+            return Ok(None);
+        }
+        match settled {
             Settled::Refuted => return Ok(None),
+            Settled::Needs(_) if refuting => {
+                self.give_up();
+                return Ok(None);
+            }
             Settled::Needs(wanted) => {
                 self.wait(branch, wanted);
                 return Ok(None);
@@ -621,11 +695,26 @@ impl Engine<'_> {
                 choice: None,
                 brought: true,
                 stood: false,
+                complement: None,
+                trying: None,
             });
             return Ok(None);
         }
         if let Some((choice, brought)) = self.choose(&mut branch) {
-            let still_to_come = alternatives(&self.context.terms, &choice);
+            let terms = &self.context.terms;
+            let still_to_come = alternatives(terms, &choice);
+            // The complement is tried where the branch has another disjunction to split: a
+            // disjunction that says nothing costs most by what it does to the others, which
+            // are split anew under each of its alternatives, with what the alternative asks
+            // besides. With no other, a split costs its own alternatives and no more.
+            //
+            // An instance satisfies the disjunction or its complement, one of the two,
+            // unless a schema refers to itself in place: the engine models neither a schema
+            // that is negated inside itself nor the negation of one that refers to itself,
+            // so of such a schema it is not known which of the two an instance satisfies.
+            let tried = !branch.choices.is_empty()
+                && !*self.in_place.get_or_insert_with(|| terms.refer_in_place());
+            let complement = tried.then(|| complement(terms, &choice)).flatten();
             let task = self.tasks.last_mut().expect("a task is at work");
             task.splits.push(Split {
                 branch,
@@ -633,7 +722,13 @@ impl Engine<'_> {
                 choice: Some((choice.term, choice.negated)),
                 brought,
                 stood: false,
+                complement,
+                trying: None,
             });
+            return Ok(None);
+        }
+        if refuting {
+            self.give_up();
             return Ok(None);
         }
         self.stood();
@@ -657,14 +752,49 @@ impl Engine<'_> {
         }
     }
 
+    /// Ends the try of the complement of the disjunction of the split at work.
+    ///
+    /// If the branch is refuted with the complement, each of its instances satisfies the
+    /// disjunction. So the disjunction says nothing in the branch: the split is taken
+    /// back, and the branch goes on without it. That is sound only where the refutation
+    /// holds whatever the tasks at work accept. A branch that goes on without a
+    /// disjunction may give an instance, and an instance is kept for good, while a
+    /// refutation that rests on a task at work is kept only as long as that task accepts
+    /// nothing. So one that rests on such a task counts for nothing here.
+    fn tried(&mut self, refuted: bool) {
+        let says_nothing = refuted && !self.rested;
+        let task = self.tasks.last_mut().expect("a task is at work");
+        let split = task.splits.last_mut().expect("a complement is of a split");
+        // What the try asked of c-references is no part of what the task found.
+        if let Some(tried) = split.trying.take() {
+            task.lowest = tried.lowest;
+        }
+        if says_nothing {
+            let split = task.splits.pop().expect("the split is there");
+            task.waiting = Some(split.branch);
+        }
+    }
+
+    /// Ends the task at work with no answer: it only looked for a refutation, and one of
+    /// its branches stands or waits. The try that asked for it leaves its c-reference open.
+    fn give_up(&mut self) {
+        let task = self.tasks.pop().expect("a task is at work");
+        self.at_work.remove(&task.of);
+        // What was found while this task was at work may have taken it to accept nothing,
+        // which was not shown.
+        self.assumed
+            .retain(|_, assumed| assumed.since <= task.began);
+        let asked = self.tasks.last_mut().expect("a task asked for this one");
+        let split = asked.splits.last_mut().expect("a try is of a split");
+        let tried = split.trying.as_mut().expect("a try asked for this task");
+        tried.open.push(task.of);
+    }
+
     /// Takes the disjunction that the branch splits on next, and says whether the branch
     /// brought it: whether it was not yet met when the split at work was made. It is the
     /// disjunction that most often left a branch with no alternative, and of several the
     /// one that was met first.
     fn choose(&self, branch: &mut Branch) -> Option<(Item, bool)> {
-        let task = self.tasks.last().expect("a task is at work");
-        let split = task.splits.last().expect("a branch is of a split");
-        let met = split.branch.choices.len();
         let mut most = (0, 0);
         if !self.dead_ends.is_empty() {
             let dead_ends = |choice: &Item| {
@@ -679,7 +809,11 @@ impl Engine<'_> {
             }
         }
         let choice = branch.choices.remove(most.0)?;
-        Some((choice, most.0 >= met))
+        let brought = most.0 >= branch.inherited;
+        if !brought {
+            branch.inherited -= 1;
+        }
+        Some((choice, brought))
     }
 
     /// Lets a branch of the task at work wait for c-references to be decided.
@@ -768,6 +902,7 @@ impl Engine<'_> {
             assumed,
             at_work,
             partitions,
+            rested,
             ..
         } = self;
         let Context {
@@ -777,6 +912,10 @@ impl Engine<'_> {
         } = &mut **context;
         // The task at work. The language of the names of an object is worked out with none.
         let mut lowest = tasks.last().map_or(usize::MAX, |task| task.lowest);
+        // What the try of a complement left open, if the branch is one.
+        let split = tasks.last().and_then(|task| task.splits.last());
+        let tried = split.and_then(|split| split.trying.as_ref());
+        let open: &[CRefId] = tried.map_or(&[], |tried| &tried.open);
         // What the engine knows of a c-reference. One that a task is deciding, or that was
         // found to accept nothing only as long as tasks are at work, is taken to accept
         // nothing, and the task at work notes the lowest of those tasks.
@@ -787,12 +926,18 @@ impl Engine<'_> {
                 if let Some(known) = found.get(&of) {
                     return Some(known.clone());
                 }
+                if open.contains(&of) {
+                    // A value may satisfy it: which cause stands in the way is not asked.
+                    return Some(Found::Unknown(Cause::Number));
+                }
                 if let Some(at) = at_work.get(&of) {
                     lowest = lowest.min(*at);
+                    *rested = true;
                     return Some(Found::Nothing);
                 }
                 let assumed = assumed.get(&of)?;
                 lowest = lowest.min(assumed.lowest);
+                *rested = true;
                 Some(assumed.found.clone())
             }
         };
@@ -1194,6 +1339,28 @@ fn alternatives(terms: &Terms, choice: &Item) -> Box<dyn Iterator<Item = Alterna
         }
         (other, _) => unreachable!("{other:?} is no disjunction"),
     }
+}
+
+/// What holds where a disjunction does not, if the disjunction is the negation of a
+/// conjunction: every term of the conjunction.
+///
+/// The terms stand in the unfolding that the disjunction stands in. So a variable among
+/// them that the branch has taken the other way refutes the branch only where that does not
+/// rest on the disjunction itself, as for any term of the unfolding.
+fn complement(terms: &Terms, choice: &Item) -> Option<Alternative> {
+    let (Term::AllOf(parts), true) = (terms.term(choice.term), choice.negated) else {
+        return None;
+    };
+    let within = choice.within;
+    let holds: Vec<Item> = parts
+        .iter()
+        .map(|part| Item {
+            term: *part,
+            negated: false,
+            within,
+        })
+        .collect();
+    Some(holds.into())
 }
 
 /// The alternatives of "one of the terms of a `OneOf` after a place holds".
@@ -3811,6 +3978,68 @@ mod tests {
             counterexample(&overlap, &json!({"type": "number"})),
             json!(0)
         );
+    }
+
+    #[test]
+    fn a_disjunction_that_says_nothing_is_not_split() {
+        // Forty kinds of object as a `oneOf`, written in two ways. An object of one kind
+        // is of no other, so "not of kind n" says nothing of it, 78 times over, and one
+        // disjunction leaves no alternative: that it is not of its own kind as the other
+        // schema writes it. Split one inside the other, each of the 78 stands by the
+        // property that tells the kinds apart, and asks more of its value each time. Each
+        // is tried against its complement instead, "of kind n", which is refuted. The kinds
+        // are told apart by a property of two values, so that takes a split in the task
+        // that looks for a value of two kinds.
+        let kinds = |closed: bool| {
+            let kind = |n: u32| {
+                let mut kind = json!({
+                    "type": "object",
+                    "required": ["kind", "x"],
+                    "properties": {
+                        "kind": {"enum": [format!("k{n}"), format!("K{n}")]},
+                        "x": {"type": "number"},
+                    },
+                });
+                if closed {
+                    kind["additionalProperties"] = json!(false);
+                } else {
+                    kind["propertyNames"] = json!({"enum": ["kind", "x"]});
+                }
+                kind
+            };
+            json!({"oneOf": (0..40).map(kind).collect::<Vec<_>>()})
+        };
+        let (closed, named) = (kinds(true), kinds(false));
+        let enough = Checker::new().budget(400_000);
+        assert_eq!(enough.subsumes(&closed, &named).unwrap(), Verdict::Yes);
+        assert_eq!(enough.subsumes(&named, &closed).unwrap(), Verdict::Yes);
+        // A disjunction that says something is split as before, and the instance that
+        // only one of its alternatives accepts is found.
+        let a = json!({"type": "object", "required": ["kind"]});
+        let b = json!({
+            "not": {"type": "object", "required": ["x", "y"]},
+            "anyOf": [{"required": ["kind"]}, {"required": ["x"]}],
+        });
+        assert_eq!(counterexample(&a, &b), json!(null));
+        let b = json!({"allOf": [b, {"type": "object"}]});
+        assert_eq!(counterexample(&a, &b), json!({"x": null}));
+    }
+
+    #[test]
+    fn no_complement_is_tried_of_a_schema_that_is_negated_inside_itself() {
+        // `e` asks for its own negation, so of a string it is not known whether `e`
+        // accepts it. "Not both `e` and its negation" then is not known to hold for a
+        // string either, although no instance satisfies its complement: the branch of a
+        // string depends on a leaf. A number above 1 is no instance of `e`. The choice
+        // between a string and a number stands so deep that it is met after the negation.
+        let b = json!({
+            "$defs": {"e": {"maximum": 1, "not": {"$ref": "#/$defs/e"}}},
+            "not": {"allOf": [{"$ref": "#/$defs/e"}, {"not": {"$ref": "#/$defs/e"}}]},
+            "allOf": [{"allOf": [{"allOf": [
+                {"anyOf": [{"type": "string"}, {"type": "number"}]},
+            ]}]}],
+        });
+        assert_eq!(counterexample(&json!(false), &b), json!(2));
     }
 
     #[test]
