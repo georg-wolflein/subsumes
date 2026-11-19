@@ -1,6 +1,7 @@
 //! Running the library over the corpus.
 
 use std::fs;
+use std::io;
 use std::num::NonZeroUsize;
 use std::panic::resume_unwind;
 use std::path::{Path, PathBuf};
@@ -96,8 +97,9 @@ fn check(
         let start = Instant::now();
         let result = checker.check(&wide.value, &narrow.value);
         let nanos = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let steps = result.as_ref().map_or(0, |check| check.steps);
         // The validator is asked after the clock has stopped.
-        let outcome = Outcome::of(&result, |counterexample| {
+        let outcome = Outcome::of(result.map(|check| check.verdict), |counterexample| {
             counterexample::confirmation(wide, narrow, counterexample)
         });
         Record {
@@ -105,7 +107,7 @@ fn check(
             direction,
             expected,
             outcome,
-            steps: result.map_or(0, |check| check.steps),
+            steps,
             nanos,
         }
     }))
@@ -116,15 +118,15 @@ fn check(
 /// case is every other JSON file below it. The ids are sorted folder by folder.
 fn cases(corpus: &Path) -> Result<Vec<String>, String> {
     let mut cases = Vec::new();
-    for collection in entries(corpus)? {
+    for (collection, is_folder) in entries(corpus)? {
         let described = collection.join(COLLECTION);
-        if !described.is_file() {
+        if !is_folder || !described.is_file() {
             continue;
         }
         let mut pending = vec![collection];
         while let Some(folder) = pending.pop() {
-            for path in entries(&folder)? {
-                if path.is_dir() {
+            for (path, is_folder) in entries(&folder)? {
+                if is_folder {
                     pending.push(path);
                 } else if path.extension().is_some_and(|it| it == "json") && path != described {
                     let inside = path.with_extension("");
@@ -141,16 +143,29 @@ fn cases(corpus: &Path) -> Result<Vec<String>, String> {
             corpus.display()
         ));
     }
-    cases.sort_by(|one, other| one.split('/').cmp(other.split('/')));
+    // Byte by byte with `/` as the least byte, which orders the ids as the lists of their
+    // names would be ordered, without splitting them.
+    let byte = |byte: u8| if byte == b'/' { 0 } else { byte };
+    cases.sort_by(|one, other| one.bytes().map(byte).cmp(other.bytes().map(byte)));
     Ok(cases)
 }
 
-/// What a folder holds, as paths.
-fn entries(folder: &Path) -> Result<Vec<PathBuf>, String> {
-    let failed = |error| format!("cannot list {}: {error}", folder.display());
+/// What a folder holds: each path, and whether it is a folder. The listing says of each
+/// entry what it is, so only a link is looked at to see where it leads.
+fn entries(folder: &Path) -> Result<Vec<(PathBuf, bool)>, String> {
+    let failed = |error: io::Error| format!("cannot list {}: {error}", folder.display());
+    let entry = |entry: io::Result<fs::DirEntry>| {
+        let entry = entry?;
+        let (path, kind) = (entry.path(), entry.file_type()?);
+        let is_folder = if kind.is_symlink() {
+            path.is_dir()
+        } else {
+            kind.is_dir()
+        };
+        Ok((path, is_folder))
+    };
     let entries = fs::read_dir(folder).map_err(failed)?;
-    let paths = entries.map(|entry| entry.map(|entry| entry.path()));
-    paths.collect::<Result<_, _>>().map_err(failed)
+    entries.map(entry).collect::<Result<_, _>>().map_err(failed)
 }
 
 #[cfg(test)]
@@ -243,11 +258,47 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_link_is_listed_as_what_it_leads_to() {
+        use std::os::unix::fs::symlink;
+
+        let corpus = corpus("links", 1);
+        let elsewhere = corpus.with_extension("elsewhere");
+        fs::create_dir_all(elsewhere.join("collection")).unwrap();
+        fs::copy(corpus.join("strings/00.json"), elsewhere.join("case.json")).unwrap();
+        fs::write(elsewhere.join("collection/collection.json"), "{}").unwrap();
+        fs::copy(
+            corpus.join("strings/00.json"),
+            elsewhere.join("collection/a.json"),
+        )
+        .unwrap();
+        // A link to a folder of cases, to a case, and to a collection.
+        symlink(&elsewhere, corpus.join("strings/linked")).unwrap();
+        symlink(elsewhere.join("case.json"), corpus.join("strings/01.json")).unwrap();
+        symlink(elsewhere.join("collection"), corpus.join("collection")).unwrap();
+        let cases = cases(&corpus);
+        fs::remove_dir_all(&corpus).unwrap();
+        fs::remove_dir_all(&elsewhere).unwrap();
+        // Below the top of a collection, a `collection.json` is a case as any other file is.
+        assert_eq!(
+            cases.unwrap(),
+            [
+                "collection/a",
+                "strings/00",
+                "strings/01",
+                "strings/linked/case",
+                "strings/linked/collection/a",
+                "strings/linked/collection/collection",
+            ]
+        );
+    }
+
     #[test]
     fn the_cases_are_sorted_folder_by_folder() {
         let corpus = corpus("sorted", 1);
-        // As plain text `strings/group.b` is before `strings/group/a`.
-        for case in ["group.b", "group/a", "group/deeper/c"] {
+        // As plain text `strings/group-b` and `strings/group.b` are before `strings/group/a`.
+        for case in ["group.b", "group-b", "group/a", "group/deeper/c"] {
             let path = corpus.join(format!("strings/{case}.json"));
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::copy(corpus.join("strings/00.json"), path).unwrap();
@@ -260,6 +311,7 @@ mod tests {
                 "strings/00",
                 "strings/group/a",
                 "strings/group/deeper/c",
+                "strings/group-b",
                 "strings/group.b",
             ]
         );

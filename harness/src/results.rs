@@ -6,7 +6,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use subsumes::{Check, Error, Reason, Verdict};
+use subsumes::{Error, Reason, Verdict};
 
 use crate::counterexample::Confirmation;
 
@@ -65,22 +65,21 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// `confirmation` is asked about the counterexample of a `No`.
+    /// `confirmation` is asked about the counterexample of a `No`. The verdict is taken and
+    /// not borrowed, so that a counterexample is not copied: some hold millions of values.
     pub fn of(
-        result: &Result<Check, Error>,
+        result: Result<Verdict, Error>,
         confirmation: impl FnOnce(&Value) -> Confirmation,
     ) -> Self {
         match result {
-            Ok(check) => match &check.verdict {
-                Verdict::Yes => Self::Yes,
-                Verdict::No { counterexample } => Self::No {
-                    confirmation: confirmation(counterexample),
-                    counterexample: counterexample.clone(),
-                },
-                Verdict::Unknown { reason } => Self::Unknown {
-                    reason: group(reason),
-                    detail: reason.to_string(),
-                },
+            Ok(Verdict::Yes) => Self::Yes,
+            Ok(Verdict::No { counterexample }) => Self::No {
+                confirmation: confirmation(&counterexample),
+                counterexample,
+            },
+            Ok(Verdict::Unknown { reason }) => Self::Unknown {
+                reason: group(&reason),
+                detail: reason.to_string(),
             },
             Err(error) => Self::Error {
                 message: error.to_string(),
@@ -262,14 +261,20 @@ impl Counts {
     }
 }
 
+/// How much of the results file is put together before it is written out.
+const BUFFER: usize = 1 << 20;
+
 pub fn write(path: &Path, records: &[Record]) -> Result<(), String> {
-    let failed = |error: std::io::Error| format!("cannot write {}: {error}", path.display());
-    let mut file = BufWriter::new(File::create(path).map_err(failed)?);
+    let failed =
+        |error: &dyn std::fmt::Display| format!("cannot write {}: {error}", path.display());
+    let file = File::create(path).map_err(|error| failed(&error))?;
+    // A line is written into the buffer of the file as it is made, with no string of its own.
+    let mut file = BufWriter::with_capacity(BUFFER, file);
     for record in records {
-        let line = serde_json::to_string(record).map_err(|error| error.to_string())?;
-        writeln!(file, "{line}").map_err(failed)?;
+        serde_json::to_writer(&mut file, record).map_err(|error| failed(&error))?;
+        file.write_all(b"\n").map_err(|error| failed(&error))?;
     }
-    file.flush().map_err(failed)
+    file.flush().map_err(|error| failed(&error))
 }
 
 pub fn read(path: &Path) -> Result<Vec<Record>, String> {
@@ -359,16 +364,16 @@ mod tests {
     fn the_outcome_of_a_no_holds_what_the_validator_says() {
         let checker = subsumes::Checker::new();
         // `null` is no string.
-        let check = checker.check(&json!({"type": "string"}), &json!(true));
-        let outcome = Outcome::of(&check, |counterexample| {
+        let verdict = checker.subsumes(&json!({"type": "string"}), &json!(true));
+        let outcome = Outcome::of(verdict, |counterexample| {
             assert_eq!(counterexample, &json!(null));
             Confirmation::AcceptedByWide
         });
         assert_eq!(outcome, no(json!(null), Confirmation::AcceptedByWide));
         // Nothing is asked about any other verdict.
-        let check = checker.check(&json!(true), &json!({"type": "string"}));
+        let verdict = checker.subsumes(&json!(true), &json!({"type": "string"}));
         let unasked = |_: &Value| panic!("a Yes has no counterexample");
-        assert_eq!(Outcome::of(&check, unasked), Outcome::Yes);
+        assert_eq!(Outcome::of(verdict, unasked), Outcome::Yes);
     }
 
     #[test]
@@ -388,6 +393,23 @@ mod tests {
             let line = serde_json::to_string(&record).unwrap();
             assert_eq!(serde_json::from_str::<Record>(&line).unwrap(), record);
         }
+    }
+
+    #[test]
+    fn the_file_holds_a_line_for_each_record() {
+        // One counterexample is longer than the buffer of the file.
+        let long = no(json!("é".repeat(BUFFER)), Confirmation::Confirmed);
+        let unchecked = no(json!([]), Confirmation::NotChecked("why".to_owned()));
+        let outcomes = [Outcome::Yes, long, unknown(), unchecked];
+        let records = outcomes.map(|outcome| record(None, outcome));
+        let path =
+            std::env::temp_dir().join(format!("subsumes-results-{}.jsonl", std::process::id()));
+        write(&path, &records).unwrap();
+        let (text, read) = (std::fs::read_to_string(&path).unwrap(), read(&path));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(read.unwrap(), records);
+        let lines = records.map(|record| serde_json::to_string(&record).unwrap() + "\n");
+        assert_eq!(text, lines.concat());
     }
 
     #[test]

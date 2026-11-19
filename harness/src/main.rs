@@ -8,7 +8,7 @@ mod run;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::{env, fs};
+use std::{env, fs, mem};
 
 use clap::{Args, Parser, Subcommand};
 use compare::{Base, LABEL};
@@ -129,6 +129,9 @@ fn run(arguments: &RunArguments) -> Result<bool, String> {
     for record in failed.take(NAMED) {
         eprintln!("{}", record.described());
     }
+    // The process ends with the command. Its memory goes back to the system at once, where
+    // dropping the records would free each value of each counterexample on its own.
+    mem::forget(records);
     Ok(counts.wrong == 0 && counts.errors == 0)
 }
 
