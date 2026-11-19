@@ -60,7 +60,7 @@ This is thrashing, as constraint solvers call it, and the remedies are theirs: s
 
 ### E0. Baseline
 
-`9e48b0d`. Three runs: 423 s, 382 s and 390 s for the whole run, 377 s to 418 s in the checks. The first run began with the machine under the most load.
+`9e48b0d`. Three runs: 423 s, 382 s and 390 s for the whole run, 377 s to 418 s in the checks. The first run began with the machine under the most load. A fourth run, made with the other experiments in the second session, took 374 s.
 
 23,597 `Yes`, 8,719 `No`, 1,686 `Unknown`, of which 274 at the budget. 3,096 million steps.
 
