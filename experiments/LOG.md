@@ -2,13 +2,35 @@
 
 A log of the experiments of step 8, "Speed": what was tried, why, and what it did to a run over the corpus. The goal is a run that takes a quarter of the time or less.
 
+## Summary
+
+A run takes 27 s where it took 386 s: 7% of the time, with 270 more checks decided, none lost and none wrong.
+
+| | commit | what | a run | of the baseline | steps | at the budget | `Unknown` |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| baseline | `9e48b0d` | release 0.4.0 | 385.8 s | 100% | 3,096 million | 274 | 1,686 |
+| E1 | `3caefd6` | split first on the disjunction that most often left no alternative | 129.9 s | 33.7% | 1,173 million | 80 | 1,492 |
+| E2 | `2e2e3fa` | count a dead end against the disjunction that brought it | 35.9 s | 9.3% | 572 million | 36 | 1,448 |
+| E4 | `e3e7ccb` | keep an instance as what it is made of | 36.2 s | 9.4% | 532 million | 34 | 1,446 |
+| E5 | `700c107` | cut the names of an object by all patterns in one product | 33.1 s | 8.6% | 495 million | 34 | 1,446 |
+| E6 | `2db7cec` | look for a property only where its value can be one | 35.6 s | 9.2% | 225 million | 4 | 1,416 |
+| E7 | `fc470ea` | an instance is one of every c-reference that asks no more | 30.0 s | 7.8% | 185 million | 4 | 1,416 |
+| E8 | `11d937e` | two of a `oneOf` share their first | 26.7 s | 6.9% | 152 million | 4 | 1,416 |
+
+- **Two changes are nearly all of it.** E1 and E2 are one idea, about a hundred lines together: in which order a branch splits its disjunctions. They take a run from 386 s to 36 s, 91% of the time, and decide 238 checks. The checks that ended at the budget thrashed, and the remedy is the one that constraint solvers have for it.
+- **The second round is worth more in verdicts and steps than in time.** E4 to E8 decide 32 more checks and take the steps of a run from 572 million to 152 million, and the time from 36 s to 27 s. E6 alone halves the steps and makes a run 2.5 s slower: what it saves were the cheapest steps, and the four checks that are left at the budget spend theirs on dearer work.
+- **What is left.** Of the 24 s that the checks of a run take, 5 s are those four checks, of one schema. E9 decides them and is not kept; see there. About 7 s are the 33,500 checks that take less than 3 ms each, and 3 s of a run are outside the checks: reading the cases, validating the counterexamples and writing the results.
+- **E3 and E9** are experiments that were not kept, and each has its entry below.
+
+The time of a run is the median of three or four runs with one job. A run on a machine with nothing else at work takes about a tenth less: 24 s for E8 and 32 s for E2.
+
 ## How a run is measured
 
 - **The run.** `make benchmark`, which checks the 17,001 cases of corpus 0.8.0 one after the other, in both directions: 34,002 checks. The time is the wall-clock time of the whole run, and "in the checks" is the sum of the times of the checks, which leaves out reading the cases, validating the counterexamples and writing the results.
 - **The machine.** An Apple M3 Pro with 11 cores. Other programs were at work on it during the runs, among them a virtual machine that used four to five cores, so a time is good to a few percent and no better. The load before each run is in `timings.csv`.
 - **Verdicts first.** An experiment is kept only if no check loses its verdict, none is wrong and no counterexample is refused by the validator. That is seen with `make benchmark JOBS=8`, whose times are no more than a hint. The time of an experiment is then measured with one job.
 - **The tests.** `cargo test --workspace` passes for every experiment that is kept.
-- **`timings.csv`** has one line for each timed run.
+- **`timings.csv`** has one line for each timed run. The runs were made in three sessions: the first with the baseline, E1 and E2 as they were made, the second with every experiment in turn three times, and the third on the machine with nothing else at work.
 
 ## Where the time goes
 
