@@ -14,6 +14,7 @@ pub(crate) mod object;
 mod search;
 pub(crate) mod string;
 
+use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use self::object::Partitions;
@@ -32,6 +33,16 @@ pub(crate) struct Solver<'s> {
     pub partitions: &'s mut Partitions,
     /// Whether an object or an array was passed over because it would be too deep to give.
     pub too_deep: &'s mut bool,
+}
+
+/// Adds to a set that a branch may share with the branch that it was copied from. A set
+/// that is shared is copied first, unless it holds the element already (copy on write).
+pub(crate) fn add<T: Ord + Clone>(set: &mut Rc<BTreeSet<T>>, element: T) {
+    if let Some(own) = Rc::get_mut(set) {
+        own.insert(element);
+    } else if !set.contains(&element) {
+        Rc::make_mut(set).insert(element);
+    }
 }
 
 /// What is left of the objects of a branch, or of its arrays.

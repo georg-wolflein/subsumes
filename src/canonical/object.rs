@@ -35,7 +35,7 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use super::search::{self, Place, Placed, Places, Slot};
-use super::{Left, Solver, State, state};
+use super::{Left, Solver, State, add, state};
 use crate::context::{Budget, Exhausted};
 use crate::hash::{Keyed, Map};
 use crate::language::{LanguageId, Languages, Lengths, Shape};
@@ -43,13 +43,17 @@ use crate::normalize::{Cause, DEEPEST, Found, Witness};
 use crate::term::{CRefId, Term, Terms};
 
 /// The objects that a branch still accepts.
+///
+/// A copy shares the two sets with what it was copied from, and each is copied when one of
+/// the two first adds to it. An alternative of a split adds to one of them at most before it
+/// is refuted, more often than not.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Objects {
     /// What the value of every property with a name of a language satisfies.
-    every: BTreeSet<(LanguageId, CRefId)>,
+    every: Rc<BTreeSet<(LanguageId, CRefId)>>,
     /// The properties that there have to be: each with a name of a language and a value
     /// that satisfies something.
-    some: BTreeSet<(LanguageId, CRefId)>,
+    some: Rc<BTreeSet<(LanguageId, CRefId)>>,
     /// The least number of properties, and the most if there is a most.
     min: u64,
     max: Option<u64>,
@@ -109,7 +113,7 @@ impl Objects {
         if there.any(|(_, other)| terms.both(of, *other) == Terms::NOTHING) {
             self.none = true;
         }
-        self.every.insert((names, of));
+        add(&mut self.every, (names, of));
     }
 
     fn some(&mut self, names: LanguageId, of: CRefId, terms: &mut Terms) {
@@ -122,7 +126,7 @@ impl Objects {
         {
             self.none = true;
         }
-        self.some.insert((names, of));
+        add(&mut self.some, (names, of));
     }
 
     fn at_most(&mut self, most: u64) {
@@ -152,7 +156,7 @@ impl Objects {
         if self.none || self.max.is_some_and(|max| max < self.min) {
             return Ok(Left::Nothing);
         }
-        let languages = self.every.iter().chain(&self.some).map(|asked| asked.0);
+        let languages = self.every.iter().chain(&*self.some).map(|asked| asked.0);
         let languages: BTreeSet<LanguageId> = languages.collect();
         let languages: Vec<LanguageId> = languages.into_iter().collect();
         let partition = with
@@ -161,7 +165,7 @@ impl Objects {
 
         // What every property of a fragment satisfies.
         let mut every = vec![Terms::ANYTHING; partition.fragments.len()];
-        for (names, of) in &self.every {
+        for (names, of) in &*self.every {
             let held = &partition.within[names];
             with.budget.charge(1 + (held.len() / 8) as u64)?;
             for fragment in held.iter() {
@@ -175,7 +179,7 @@ impl Objects {
         // that is left with none leaves no object.
         let mut open: Vec<u32> = Vec::new();
         let mut ends: Vec<(usize, usize, CRefId)> = Vec::with_capacity(self.some.len());
-        for (names, of) in &self.some {
+        for (names, of) in &*self.some {
             let held = &partition.within[names];
             with.budget.charge((held.len() / 8) as u64)?;
             let before = open.len();
