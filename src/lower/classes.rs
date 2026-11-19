@@ -39,7 +39,8 @@ macro_rules! write_json {
     };
 }
 
-/// The class of every schema as it is reached, in the order in which `scopes` has them.
+/// The class of every schema as it is reached, in the order in which `scopes` has them, and
+/// whether a schema leads back to itself.
 ///
 /// # Errors
 ///
@@ -49,7 +50,7 @@ pub(super) fn classes(
     graph: &Graph,
     scopes: &Scopes,
     budget: &mut Budget,
-) -> Result<Vec<u32>, Exhausted> {
+) -> Result<(Vec<u32>, bool), Exhausted> {
     let count = scopes.len();
     // What each schema says by itself, as a number. What it leads to is in `scopes`. Every
     // text is written into the one buffer, and only a new one is copied out of it.
@@ -132,7 +133,7 @@ pub(super) fn classes(
         let told_apart: HashSet<u32> = on_cycles.map(|node| current[node]).collect();
         if told_apart.len() == blocks {
             class(&last, &previous, &mut current);
-            return Ok(current);
+            return Ok((current, blocks > 0));
         }
         blocks = told_apart.len();
         previous.copy_from_slice(&current);
@@ -371,7 +372,7 @@ fn write_value(value: &Value, text: &mut Vec<u8>) {
 /// are on a cycle with it, and for every node whether it is on a cycle.
 ///
 /// This is Tarjan's algorithm for strongly connected components, without recursion.
-fn components(successors: &Lists) -> (Vec<usize>, Vec<bool>) {
+pub(super) fn components(successors: &impl Successors) -> (Vec<usize>, Vec<bool>) {
     const UNSEEN: usize = usize::MAX;
     let count = successors.len();
     let (mut found, mut lowest) = (vec![UNSEEN; count], vec![0; count]);
@@ -428,6 +429,36 @@ fn components(successors: &Lists) -> (Vec<usize>, Vec<bool>) {
     (order, cyclic)
 }
 
+/// The nodes that each node leads to, for [`components`]: those of a schema in a flat list,
+/// those of a variable in a vector of their own.
+pub(super) trait Successors {
+    /// How many nodes there are.
+    fn len(&self) -> usize;
+
+    /// The nodes that a node leads to.
+    fn of(&self, node: usize) -> &[usize];
+}
+
+impl Successors for Lists {
+    fn len(&self) -> usize {
+        Lists::len(self)
+    }
+
+    fn of(&self, node: usize) -> &[usize] {
+        Lists::of(self, node)
+    }
+}
+
+impl Successors for Vec<Vec<usize>> {
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+
+    fn of(&self, node: usize) -> &[usize] {
+        &self[node]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{Map, Value, json};
@@ -446,7 +477,7 @@ mod tests {
         budget: &mut Budget,
     ) -> Result<(Scopes<'g>, Vec<u32>), Exhausted> {
         let scopes = Scopes::of(graph, budget)?;
-        let classes = classes(graph, &scopes, budget)?;
+        let (classes, _) = classes(graph, &scopes, budget)?;
         Ok((scopes, classes))
     }
 

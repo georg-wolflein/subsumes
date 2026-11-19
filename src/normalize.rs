@@ -1378,7 +1378,8 @@ impl Engine<'_> {
             within,
         } = item;
         if let Term::Ref(variable) = self.context.terms.term(term) {
-            return self.unfold(branch, *variable, negated, within);
+            let variable = self.context.terms.same(*variable);
+            return self.unfold(branch, variable, negated, within);
         }
         let found = self.context.terms.term(term);
         let stands = match (found, negated) {
@@ -1497,6 +1498,7 @@ impl Engine<'_> {
             branch.objects_asked = true;
             return Ok(true);
         };
+        let variable = &self.context.terms.same(*variable);
         // Every name is of the language of the strings that the schema accepts: none is
         // outside it. Where no language says which strings those are, this is a leaf.
         let Some(names) = self.names(*variable)? else {
@@ -1699,6 +1701,7 @@ fn indefinite(terms: &Terms) -> Vec<bool> {
                 }
                 Term::Not(inner) => pending.push(*inner),
                 Term::Ref(other) => {
+                    let other = terms.same(*other);
                     in_place[other.index()].push(from);
                     at_all[other.index()].push(from);
                     refers_to[from] += 1;
@@ -1707,7 +1710,7 @@ fn indefinite(terms: &Terms) -> Vec<bool> {
                 | Term::PNames(other)
                 | Term::Item(_, other)
                 | Term::AddIts(_, other)
-                | Term::Contains(other) => at_all[other.index()].push(from),
+                | Term::Contains(other) => at_all[terms.same(*other).index()].push(from),
                 Term::Unknown(leaf) => indefinite[from] |= holds_a_schema(terms.leaf(*leaf)),
                 _ => {}
             }
@@ -4486,23 +4489,25 @@ mod tests {
         // disjunctions, and only the negation of its own kind in A leaves no alternative.
         // Split in the order in which they are met, the others come first, and the steps
         // grow fivefold or more with each kind: with seven kinds they are past ten million.
+        // The one says that `extra` is a boolean by its type and the other by its two
+        // values, so that the two ways are not found to say the same before the search.
         let names = ["a", "b", "c", "d", "e", "f", "g", "h"];
-        let open = |name: &str| {
+        let open = |name: &str, extra: Value| {
             json!({
                 "type": "object",
-                "properties": {name: {"type": "string"}, "extra": {"type": "boolean"}},
+                "properties": {name: {"type": "string"}, "extra": extra},
                 "required": [name],
             })
         };
         let plain = |name: &&str| {
-            let mut kind = open(name);
+            let mut kind = open(name, json!({"type": "boolean"}));
             kind["additionalProperties"] = json!(false);
             kind
         };
         let wordy = |name: &&str| {
             let named = json!({format!("^{name}$"): true, "^extra$": true});
             json!({"allOf": [
-                open(name),
+                open(name, json!({"enum": [false, true]})),
                 {"patternProperties": named, "additionalProperties": false},
             ]})
         };
@@ -4660,9 +4665,17 @@ mod tests {
     /// the first.
     fn one_of_kinds(count: usize, in_two: bool) -> Value {
         let kind = |kind: usize| {
+            // Written in two ways, the option is a boolean by its type or by its two
+            // values, so that the two ways are not found to say the same before the
+            // search.
+            let option = if in_two {
+                json!({"enum": [false, true]})
+            } else {
+                json!({"type": "boolean"})
+            };
             let own = json!({
                 "level": {"enum": ["low", "high"]},
-                format!("option{kind}"): {"type": "boolean"},
+                format!("option{kind}"): option,
             });
             let mut schema = json!({
                 "type": "object",
