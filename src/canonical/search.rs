@@ -73,6 +73,11 @@ pub(super) trait Places {
     /// Where the value of this number may go, in the order in which the places are tried.
     fn places(&self, placed: &Placed<Self::At>, which: usize) -> Vec<Place<Self::At>>;
 
+    /// Where the value of this number may go while nothing else is placed. What is placed
+    /// adds no place to these: it takes places away, and a place that is shared asks more
+    /// of the value than the place does alone.
+    fn alone(&self, which: usize) -> Vec<Self::At>;
+
     /// What a value satisfies by its place alone.
     fn at(&self, at: Self::At) -> CRefId;
 
@@ -133,6 +138,8 @@ pub(super) fn run<P: Places>(
         depends: None,
     };
     let mut levels: Vec<Level<P::At>> = Vec::new();
+    // The values that were found to have a place while nothing else is placed.
+    let mut has_a_place: Vec<bool> = Vec::new();
     let mut onward = true;
     loop {
         if onward && places.asked(levels.len()).is_none() {
@@ -142,6 +149,9 @@ pub(super) fn run<P: Places>(
             }
         } else if onward {
             let tried = places.places(&placed, levels.len());
+            if has_a_place.len() == levels.len() {
+                has_a_place.push(false);
+            }
             levels.push(Level {
                 places: tried,
                 next: 0,
@@ -160,6 +170,18 @@ pub(super) fn run<P: Places>(
             None => {}
         }
         let Some(place) = level.places.get(level.next).copied() else {
+            // No place is left for this value. If it has none while nothing else is placed,
+            // no other places for the values before it give it one, so the search ends
+            // here. Without this, every combination of their places is tried to no end:
+            // this is backjumping, for a dead end that depends on no earlier choice. The
+            // first value is tried with nothing placed, and the search ends with it anyway.
+            let which = levels.len() - 1;
+            if which > 0 && !has_a_place[which] {
+                if !stands_alone(&mut places, which, &mut placed, with, ask)? {
+                    return Ok(Left::Nothing);
+                }
+                has_a_place[which] = true;
+            }
             levels.pop();
             onward = false;
             continue;
@@ -206,4 +228,34 @@ pub(super) fn run<P: Places>(
         Some(cause) => Left::Unknown(cause),
         None => Left::Nothing,
     })
+}
+
+/// Whether a value that there has to be has a place while nothing else is placed: one that
+/// can be reached, and of which the engine does not say that no value satisfies what the
+/// place and the value ask together. The engine is asked as the search asks it, so what it
+/// takes to accept nothing for the time being is noted in the same way.
+///
+/// # Errors
+///
+/// When the budget does not cover the places. Each one that is looked at costs a step.
+fn stands_alone<P: Places>(
+    places: &mut P,
+    which: usize,
+    placed: &mut Placed<P::At>,
+    with: &mut Solver,
+    ask: &mut dyn FnMut(CRefId) -> Option<Found>,
+) -> Result<bool, Exhausted> {
+    let asked = places.asked(which);
+    let asked = asked.expect("a level is of a value that there has to be");
+    for at in places.alone(which) {
+        with.budget.charge(1)?;
+        if !places.reaches(at, placed, with, ask)? {
+            continue;
+        }
+        let of = with.terms.both(places.at(at), asked);
+        if !matches!(ask(of), Some(Found::Nothing)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }

@@ -414,6 +414,15 @@ impl Places for Search<'_> {
         self.some.get(which).map(|(_, of)| *of)
     }
 
+    /// A name of any fragment of its language, in an object that may have a property.
+    fn alone(&self, which: usize) -> Vec<u32> {
+        let (fragments, _) = self.some[which];
+        if self.objects.max == Some(0) {
+            return Vec::new();
+        }
+        fragments.iter().rev().copied().collect()
+    }
+
     fn at(&self, fragment: u32) -> CRefId {
         self.every[fragment as usize]
     }
@@ -781,6 +790,40 @@ mod tests {
         // Three that cannot share, for two names.
         let asked = Asked::new().some("^[xy]$", &[3]).some("^[xy]$", &[4]);
         assert_eq!(asked.some("^[xy]$", &[3, 4]).given(), none());
+    }
+
+    #[test]
+    fn a_property_that_no_name_takes_ends_the_search() {
+        // Ten properties that each may have a name of three fragments, which is 3^10 ways
+        // of placing them, and after them one that no fragment of its language takes.
+        let mut asked = Asked::new();
+        for names in ["^w", "^x", "^y", "^z"] {
+            asked = asked.every(names, &[2]);
+        }
+        let ten: [&[i32]; 10] = [
+            &[3],
+            &[4],
+            &[5],
+            &[-3],
+            &[-4],
+            &[-5],
+            &[3, 5],
+            &[4, 5],
+            &[-3, 5],
+            &[-4, 5],
+        ];
+        for of in ten {
+            asked = asked.some("^[xyz]", of);
+        }
+        let mut asked = asked.some("^[wxyz]", &[0]);
+        // The ways of placing the ten are not tried one by one.
+        let left = asked.left(&mut Budget::new(1000));
+        assert!(matches!(left, Ok(Left::Nothing)), "{left:?}");
+        // A property that only lacks a name next to where another one was put first is no
+        // such end: the other one goes elsewhere.
+        let asked = Asked::new().none("=c").some("=a,b", &[3]);
+        let asked = asked.some("=b,c", &[4]);
+        assert_eq!(asked.given(), Ok(json!({"a": "3", "b": "4"})));
     }
 
     #[test]

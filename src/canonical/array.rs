@@ -239,6 +239,15 @@ impl Places for Search<'_> {
         self.some.get(which).map(|(_, of)| *of)
     }
 
+    /// Its own position and those after it, as far as the array may go: those of the head,
+    /// and the first one after the head, which asks what every later one asks.
+    fn alone(&self, which: usize) -> Vec<u64> {
+        let (from, _) = self.some[which];
+        let most = self.arrays.max.unwrap_or(u64::MAX);
+        let positions = (from..=self.head.len()).map(|position| position as u64);
+        positions.take_while(|position| *position < most).collect()
+    }
+
     /// What the item at a position satisfies by its position alone.
     fn at(&self, position: u64) -> CRefId {
         let of_the_head = usize::try_from(position).ok();
@@ -622,6 +631,29 @@ mod tests {
     }
 
     #[test]
+    fn an_item_that_no_position_takes_ends_the_search() {
+        // An item that no position takes, which is tried last, after seven that may each
+        // be at one of four positions.
+        let mut asked = Asked::new().some(0, &[0]);
+        for position in 0..3 {
+            asked = asked.at(position, &[2]);
+        }
+        let seven: [&[i32]; 7] = [&[3], &[5], &[-4], &[3, 5], &[3, -4], &[5, -4], &[3, 5, -4]];
+        for of in seven {
+            asked = asked.some(0, of);
+        }
+        let left = asked.left(&mut Budget::new(1000));
+        assert!(matches!(left, Ok(Left::Nothing)), "{left:?}");
+        // The engine is asked about the item at its own places, and not anew for each way
+        // of placing the seven.
+        assert!(asked.engine.waited < 10, "{}", asked.engine.waited);
+        // A position that the array may not get to is no place for an item.
+        let two = || Asked::new().at(0, &[3]).some(0, &[-3]).some(0, &[5]);
+        assert_eq!(two().given(), Ok(json!(["3 5", "-3"])));
+        assert_eq!(two().count(0, Some(1)).given(), none());
+    }
+
+    #[test]
     fn there_have_to_be_items_enough_for_the_least_number() {
         let asked = Asked::new().some(0, &[2]).count(3, None);
         assert_eq!(asked.given(), Ok(json!(["2", null, null])));
@@ -729,16 +761,19 @@ mod tests {
     #[test]
     fn the_search_for_an_array_costs_steps() {
         // A place that is tried costs a step. Every item satisfies 3, so none satisfies 4,
-        // and the item that has to is at no position. The other item that there has to be
-        // may be at any of three hundred, and for each of them the first is tried at every
-        // position again.
+        // and the item that has to is at no position: it is tried at each of three hundred.
         let asked = || {
             let all = Asked::new().from(0, &[3]).at(299, &[5]);
             all.some(1, &[2]).some(0, &[4])
         };
         let left = asked().left(&mut Budget::new(u64::MAX));
         assert!(matches!(left, Ok(Left::Nothing)));
-        assert!(asked().left(&mut Budget::new(10_000)).is_err());
+        assert!(asked().left(&mut Budget::new(100)).is_err());
+        // The other item that there has to be may be at any of three hundred too. The
+        // first has no position wherever that one is, so it is not tried at every position
+        // again for each of them, which would be 90,000 places.
+        let left = asked().left(&mut Budget::new(10_000));
+        assert!(matches!(left, Ok(Left::Nothing)));
         // So does the head, each time an array is looked for, however short the array is
         // that is found: here it would be the empty one.
         let mut long = Asked::new().at(99_999, &[2]);
