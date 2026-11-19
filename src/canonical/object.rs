@@ -170,11 +170,29 @@ impl Objects {
                 *all = with.terms.both(*all, *of);
             }
         }
-        // The properties that there have to be, those first that have the fewest fragments
-        // to be in.
-        let mut some: Vec<(&[u32], CRefId)> = Vec::with_capacity(self.some.len());
+        // The properties that there have to be, each with the fragments that it may be in:
+        // those of its language whose properties can have a value at all. An object that
+        // takes no property but those that it names leaves few of them, and a property
+        // that is left with none leaves no object.
+        let mut open: Vec<u32> = Vec::new();
+        let mut ends: Vec<(usize, CRefId)> = Vec::with_capacity(self.some.len());
         for (names, of) in &self.some {
-            some.push((&partition.within[names], *of));
+            let held = &partition.within[names];
+            with.budget.charge((held.len() / 8) as u64)?;
+            let before = open.len();
+            let takes_a_value = |fragment: &&u32| every[**fragment as usize] != Terms::NOTHING;
+            open.extend(held.iter().filter(takes_a_value));
+            if open.len() == before {
+                return Ok(Left::Nothing);
+            }
+            ends.push((open.len(), *of));
+        }
+        // Those first that have the fewest fragments to be in.
+        let mut some: Vec<(&[u32], CRefId)> = Vec::with_capacity(ends.len());
+        let mut from = 0;
+        for (to, of) in ends {
+            some.push((&open[from..to], of));
+            from = to;
         }
         some.sort_by_key(|(fragments, _)| fragments.len());
 
