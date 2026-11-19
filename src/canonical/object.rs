@@ -28,6 +28,14 @@
 //! names enough for the least number of properties, in fragments whose properties can have
 //! a value at all.
 //!
+//! The search for the names is forward checking with the most constrained property first.
+//! Before it begins, each property that there has to be is held against every fragment of
+//! its language by itself: a fragment whose properties accept nothing that the property
+//! may be, on the face of the two c-references, is no place for it. A property that is
+//! left with no fragment ends the search, and those with the fewest fragments are placed
+//! first. Without this, a property that can be nowhere is found only after every way of
+//! placing those before it, which is the product of their places.
+//!
 //! Whether a value can satisfy a c-reference is not decided here. The engine is asked, and
 //! what it does not know yet it is told to find out first.
 
@@ -170,11 +178,24 @@ impl Objects {
                 *all = with.terms.both(*all, *of);
             }
         }
-        // The properties that there have to be, those first that have the fewest fragments
-        // to be in.
-        let mut some: Vec<(&[u32], CRefId)> = Vec::with_capacity(self.some.len());
+        // The properties that there have to be, each with the fragments that it may be in:
+        // those of its language whose properties can have such a value at all, as far as
+        // the two c-references say on the face of them. In any other fragment it cannot
+        // be, with a name of its own or sharing one, since sharing only asks more of the
+        // value. A property that is left with no fragment leaves no object, wherever the
+        // others are put. Those with the fewest fragments come first, so that the search
+        // fails early where it fails. The fragments that are looked at cost steps as they
+        // do above, and the properties themselves were counted when the branch was copied.
+        let mut some: Vec<(Vec<u32>, CRefId)> = Vec::with_capacity(self.some.len());
         for (names, of) in &self.some {
-            some.push((&partition.within[names], *of));
+            let held = &partition.within[names];
+            with.budget.charge((held.len() / 8) as u64)?;
+            let may_hold = |fragment: &&u32| !with.terms.clash(every[**fragment as usize], *of);
+            let fragments: Vec<u32> = held.iter().filter(may_hold).copied().collect();
+            if fragments.is_empty() {
+                return Ok(Left::Nothing);
+            }
+            some.push((fragments, *of));
         }
         some.sort_by_key(|(fragments, _)| fragments.len());
 
@@ -402,7 +423,7 @@ struct Search<'s> {
     every: &'s [CRefId],
     /// The properties that there have to be: the fragments that each may be in, and what
     /// its value satisfies.
-    some: &'s [(&'s [u32], CRefId)],
+    some: &'s [(Vec<u32>, CRefId)],
     /// The slots of each fragment.
     used: Vec<Vec<usize>>,
 }
@@ -428,7 +449,7 @@ impl Places for Search<'_> {
 
     /// Where one of the properties that there have to be may go.
     fn places(&self, placed: &Placed<u32>, which: usize) -> Vec<Place<u32>> {
-        let (fragments, _) = self.some[which];
+        let (fragments, _) = &self.some[which];
         let most = self.objects.max;
         let room = most.is_none_or(|most| (placed.slots.len() as u64) < most);
         let (mut join, mut open) = (Vec::new(), Vec::new());
@@ -751,6 +772,29 @@ mod tests {
         // No name is left.
         let asked = Asked::new().every("^x", &[0]).some("^xy", &[]);
         assert_eq!(asked.given(), none());
+    }
+
+    #[test]
+    fn a_property_that_can_be_nowhere_ends_the_search_at_once() {
+        // Every name but two is closed. Twenty properties may each have one of the two,
+        // and one more has only names that are closed. Were the twenty placed before the
+        // one is looked at, that could be done in a million ways.
+        let mut asked = Asked::new().none("!a,b");
+        for index in 0..20 {
+            asked = asked.some(&format!("=a,b,c{index}"), &[]);
+        }
+        let mut asked = asked.some("=c0,c1,c2,c3", &[]);
+        let left = asked.left(&mut Budget::new(1_000));
+        assert!(matches!(left, Ok(Left::Nothing)), "{left:?}");
+        // With a name for the one, there is an object.
+        let mut asked = Asked::new().none("!a,b,c3");
+        for index in 0..20 {
+            asked = asked.some(&format!("=a,b,c{index}"), &[]);
+        }
+        let mut asked = asked.some("=c0,c1,c2,c3", &[2]);
+        let left = asked.left(&mut Budget::new(1_000));
+        let object = json!({"a": null, "b": null, "c3": "2"});
+        assert_eq!(given(left.unwrap()), Ok(object));
     }
 
     #[test]

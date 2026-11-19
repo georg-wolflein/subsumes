@@ -593,6 +593,25 @@ impl Terms {
         self.reference_of(all)
     }
 
+    /// Whether two c-references together accept nothing on the face of it: one of them
+    /// accepts nothing, or one names a variable that the other names negated. That is
+    /// whether [`Self::both`] of the two is [`Self::NOTHING`], and it makes no c-reference.
+    pub fn clash(&self, a: CRefId, b: CRefId) -> bool {
+        if a == Self::NOTHING || b == Self::NOTHING {
+            return true;
+        }
+        let (of_a, of_b) = (self.literals(a), self.literals(b));
+        let (mut at_a, mut at_b) = (0, 0);
+        while let (Some(first), Some(second)) = (of_a.get(at_a), of_b.get(at_b)) {
+            if first.0 == second.0 && first.1 != second.1 {
+                return true;
+            }
+            at_a += usize::from(first <= second);
+            at_b += usize::from(second <= first);
+        }
+        false
+    }
+
     fn reference_of(&mut self, literals: Vec<Literal>) -> CRefId {
         if let Some(known) = self.reference_ids.get(literals.as_slice()) {
             return *known;
@@ -888,6 +907,14 @@ mod tests {
         assert_eq!(terms.both(xy, Terms::NOTHING), Terms::NOTHING);
         assert_eq!(terms.both(Terms::NOTHING, xy), Terms::NOTHING);
         assert!(terms.literals(Terms::ANYTHING).is_empty());
+        // Whether two accept nothing together is seen without putting them together.
+        let not_y = terms.literal(variables[1], true);
+        let not_xz = terms.both(not_x, z);
+        let all = [Terms::ANYTHING, Terms::NOTHING, x, not_x, y, not_y, xy, yz];
+        for (a, b) in all.into_iter().flat_map(|a| all.map(|b| (a, b))) {
+            assert_eq!(terms.clash(a, b), terms.both(a, b) == Terms::NOTHING);
+        }
+        assert!(terms.clash(not_xz, xy) && !terms.clash(not_xz, yz));
     }
 
     #[test]
