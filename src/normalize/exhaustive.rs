@@ -1400,13 +1400,32 @@ enum Unknown {
 }
 
 impl Tally {
-    /// Holds the verdict of the engine against the evaluator, which looks at these
-    /// instances.
+    /// Holds the verdicts of the engine in both directions against the evaluator, which
+    /// looks at these instances. The two are checked with one load, as the harness checks
+    /// them, so the converse is held against the evaluator as well.
     fn compare(&mut self, a: &Value, b: &Value, instances: &[Value], unknown: Unknown) {
         let names = ["d", "e", "f"].into_iter();
         let fragments = names.map(|name| (name.to_owned(), format!("/$defs/{name}")));
         let fragments = fragments.collect();
         let (of_a, of_b) = (&Document::new(a, &fragments), &Document::new(b, &fragments));
+        let (check, converse) = Checker::new().check_with_converse(a, b).unwrap();
+        let context = format!("does {a} subsume {b}?");
+        self.hold(of_a, of_b, &check.verdict, instances, unknown, &context);
+        let context = format!("does {b} subsume {a}, after the converse?");
+        let converse = converse.check().verdict;
+        self.hold(of_b, of_a, &converse, instances, unknown, &context);
+    }
+
+    /// Holds a verdict of whether `a` subsumes `b` against the evaluator.
+    fn hold(
+        &mut self,
+        of_a: &Document,
+        of_b: &Document,
+        verdict: &Verdict,
+        instances: &[Value],
+        unknown: Unknown,
+        context: &str,
+    ) {
         let found: Vec<Found> = instances
             .iter()
             .map(|instance| found(of_a, of_b, instance))
@@ -1416,9 +1435,8 @@ impl Tally {
         // two apart is an instance to give.
         let mut exact = found.iter().filter(|found| found.exact);
         let one_tells_apart = exact.any(|found| found.some_tells_apart);
-        let verdict = Checker::new().subsumes(a, b).unwrap();
-        let context = format!("does {a} subsume {b}? {verdict:?}");
-        match &verdict {
+        let context = format!("{context} {verdict:?}");
+        match verdict {
             Verdict::Yes => {
                 assert!(subsumed, "{context}");
                 self.yes += 1;

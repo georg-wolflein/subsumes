@@ -76,7 +76,12 @@ pub fn run(corpus: &Path, jobs: NonZeroUsize) -> Result<Vec<Record>, String> {
     Ok(records)
 }
 
-/// Checks one case in both directions.
+/// Checks one case in both directions, with one load of the two schemas.
+///
+/// The time of a direction is that of the call that gives it. So the first direction has
+/// the time of the load, which is parsing, linking and lowering the two schemas, with that
+/// of its own search, and the second has the time of its own search and of dropping what
+/// the two shared.
 fn check(
     corpus: &Path,
     case: &str,
@@ -89,14 +94,24 @@ fn check(
         a,
         b,
     } = reader.read(&corpus.join(format!("{case}.json")))?;
+    let elapsed = |start: Instant| u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let start = Instant::now();
+    let loaded = checker.check_with_converse(&a.value, &b.value);
+    let first = elapsed(start);
+    let start = Instant::now();
+    let checks = match loaded {
+        Ok((check, converse)) => [Ok(check), Ok(converse.check())],
+        // A pair that cannot be loaded is checked the other way round by itself, so that
+        // the error names the two schemas as that check does.
+        Err(error) => [Err(error), checker.check(&b.value, &a.value)],
+    };
+    let mut checks = checks.into_iter().zip([first, elapsed(start)]);
     Ok(Direction::BOTH.map(|direction| {
         let (wide, narrow, expected) = match direction {
             Direction::ASubsumesB => (&a, &b, a_subsumes_b),
             Direction::BSubsumesA => (&b, &a, b_subsumes_a),
         };
-        let start = Instant::now();
-        let result = checker.check(&wide.value, &narrow.value);
-        let nanos = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let (result, nanos) = checks.next().expect("a check for each direction");
         let steps = result.as_ref().map_or(0, |check| check.steps);
         // The validator is asked after the clock has stopped.
         let outcome = Outcome::of(result.map(|check| check.verdict), |counterexample| {
