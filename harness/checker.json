@@ -1,0 +1,10 @@
+{
+  "$schema": "https://raw.githubusercontent.com/georg-wolflein/subsumes-benchmark/main/schemas/checker.schema.json",
+  "label": "subsumes",
+  "variant": "working tree",
+  "version": "unreleased",
+  "homepage": "https://github.com/georg-wolflein/subsumes",
+  "dialect": "2020-12",
+  "build": ["cargo", "build", "--release", "--locked", "--package", "harness"],
+  "run": ["../target/release/harness", "adapter"]
+}

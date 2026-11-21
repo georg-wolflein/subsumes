@@ -97,8 +97,13 @@ jobs:
       pull-requests: write # to post the comment
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Download the pinned corpus
+      # The benchmark is a Python package, with the corpus and the runner, which uv fetches.
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: false
+      - name: Unpack the pinned corpus
         run: make corpus
+      # Fails on a verdict against a label, on a counterexample that is none, and on an error.
       - name: Run the library over the corpus
         run: make benchmark
       - name: Run the tests that read the corpus
@@ -107,8 +112,8 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ !cancelled() }}
         with:
-          name: benchmark-results
-          path: target/results.jsonl
+          name: benchmark-run
+          path: target/results/harness
       - name: Fetch the results of the base branch
         if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         env:
@@ -119,13 +124,14 @@ jobs:
           for sha in $(gh api "repos/$GITHUB_REPOSITORY/commits?sha=$BASE_SHA&per_page=20" --jq '.[].sha'); do
             run_id=$(gh run list --workflow ci.yml --event push --commit "$sha" --status completed \
               --json databaseId --jq '.[0].databaseId')
-            if [ -n "$run_id" ] && gh run download "$run_id" --name benchmark-results --dir baseline; then
+            if [ -n "$run_id" ] && gh run download "$run_id" --name benchmark-run --dir baseline; then
               echo "baseline: $sha from run $run_id"
               echo "BASELINE_SHA=$sha" >> "$GITHUB_ENV"
               exit 0
             fi
           done
-          echo "::warning::no results found on the base branch; the comment will not compare"
+          echo "::warning::no run found on the base branch; the comment will not compare"
+      # Fails besides on a check that the base decided and this run answers Unknown.
       - name: Compare and render the comment
         if: ${{ !cancelled() }}
         env:
@@ -134,20 +140,19 @@ jobs:
         # The label is read here, so adding it and running the job again is enough.
         run: |
           arguments=()
-          if [ -f baseline/results.jsonl ]; then
-            arguments+=(--base baseline/results.jsonl --base-label "${BASELINE_SHA::7}")
+          if [ -f baseline/run.json ]; then
+            arguments+=(--base baseline --base-label "${BASELINE_SHA::7}")
           fi
           if [ -n "$PR" ] && [ "$(gh pr view "$PR" --json labels \
               --jq 'any(.labels[]; .name == "allow-lost-verdicts")')" = true ]; then
             arguments+=(--allow-lost)
           fi
-          cargo run --release --locked --quiet --package harness -- \
-            compare target/results.jsonl "${arguments[@]}" --output comment.md
+          make benchmark-comment DIFF="${arguments[*]}"
       - name: Add the comment to the job summary
         if: ${{ !cancelled() }}
-        run: cat comment.md >> "$GITHUB_STEP_SUMMARY"
+        run: cat target/benchmark-comment.md >> "$GITHUB_STEP_SUMMARY"
       - uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
         if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         with:
           header: benchmark
-          path: comment.md
+          path: target/benchmark-comment.md

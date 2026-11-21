@@ -1,9 +1,14 @@
-//! Whether a counterexample is one.
+//! The validator that is asked about counterexamples, held to the reading of the library.
 //!
-//! The library returns the counterexample of a `No` unchecked: it holds no validator. Here a
-//! validator is asked, the `jsonschema` crate. The counterexample must be valid under the
+//! The library returns the counterexample of a `No` unchecked: it holds no validator. The
+//! runner of the benchmark asks one about every counterexample of a run, `jsonschema-rs`,
+//! which is the `jsonschema` crate for Python. The counterexample must be valid under the
 //! narrow schema, whose instances were to be accepted, and invalid under the wide schema,
 //! which was to accept them.
+//!
+//! Here are only tests. They ask the crate as the runner asks it, and say where it and the
+//! library read a schema alike and where they do not, with schemas that are denser in what
+//! the two could differ on than the corpus is: formats, patterns and dynamic references.
 //!
 //! The validator reads the schemas as the library does by default: as draft 2020-12, with
 //! `format` asserted, and with every pattern as one of ECMA-262.
@@ -14,12 +19,10 @@
 //! second 60 is one, the library leaves open and gives no such string.
 
 use jsonschema::{Draft, Validator};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// What the validator makes of the counterexample of a `No`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Confirmation {
     /// The narrow schema accepts it and the wide schema rejects it.
     Confirmed,
@@ -35,13 +38,6 @@ impl Confirmation {
     /// Whether the validator found that the counterexample is none.
     pub fn is_refuted(&self) -> bool {
         matches!(self, Self::RejectedByNarrow | Self::AcceptedByWide)
-    }
-}
-
-/// What a results file says that was written before counterexamples were checked.
-impl Default for Confirmation {
-    fn default() -> Self {
-        Self::NotChecked("the run is older than the check of counterexamples".to_owned())
     }
 }
 
@@ -245,7 +241,7 @@ mod tests {
         assert!(Confirmation::RejectedByNarrow.is_refuted());
         assert!(Confirmation::AcceptedByWide.is_refuted());
         assert!(!Confirmation::Confirmed.is_refuted());
-        assert!(!Confirmation::default().is_refuted());
+        assert!(!Confirmation::NotChecked(String::new()).is_refuted());
     }
 
     #[test]
@@ -466,25 +462,5 @@ mod tests {
             confirmation(&json!(false), &elsewhere, &json!(null)),
             Confirmation::NotChecked(_)
         ));
-    }
-
-    #[test]
-    fn a_confirmation_is_one_word_in_the_results() {
-        let written = |confirmation: &Confirmation| serde_json::to_value(confirmation).unwrap();
-        assert_eq!(written(&Confirmation::Confirmed), json!("confirmed"));
-        assert_eq!(
-            written(&Confirmation::RejectedByNarrow),
-            json!("rejected_by_narrow")
-        );
-        assert_eq!(
-            written(&Confirmation::AcceptedByWide),
-            json!("accepted_by_wide")
-        );
-        let unchecked = Confirmation::NotChecked("why".to_owned());
-        assert_eq!(written(&unchecked), json!({"not_checked": "why"}));
-        for confirmation in [Confirmation::Confirmed, unchecked] {
-            let read: Confirmation = serde_json::from_value(written(&confirmation)).unwrap();
-            assert_eq!(read, confirmation);
-        }
     }
 }

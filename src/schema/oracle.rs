@@ -334,7 +334,7 @@ pub(super) fn compared(schema: &Value) -> Result<Comparison, String> {
 }
 
 #[test]
-#[ignore = "needs the corpus in benchmark/, which `make corpus` downloads"]
+#[ignore = "needs the corpus in benchmark/, which `make corpus` unpacks"]
 fn referencing_finds_the_same_targets_in_the_corpus() {
     let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("benchmark");
     let cases = corpus_cases();
