@@ -65,15 +65,13 @@ impl Checker {
     ///
     /// When `a` or `b` cannot be checked at all; see [`Error`].
     pub fn subsumes(&self, a: &Value, b: &Value) -> Result<Verdict, Error> {
-        self.check(a, b).map(|check| check.verdict)
+        self.check(a, b).map(|(verdict, _)| verdict)
     }
 
-    /// The same check as [`subsumes`](Self::subsumes), with the work it took.
-    ///
-    /// # Errors
-    ///
-    /// When `a` or `b` cannot be checked at all; see [`Error`].
-    pub fn check(&self, a: &Value, b: &Value) -> Result<Check, Error> {
+    /// The verdict of [`subsumes`](Self::subsumes) with the steps of the budget that the
+    /// check spent. The steps are for the tests of the budget and no part of the API: they
+    /// end a check and are no measure of it.
+    pub(crate) fn check(&self, a: &Value, b: &Value) -> Result<(Verdict, u64), Error> {
         let graph = schema::parse(a, b)?.link()?;
         let mut context = Context::new(self.budget, self.regex_dialect);
         let outcome = lower::lower(&graph, &mut context)
@@ -96,10 +94,7 @@ impl Checker {
                 reason: Reason::Budget,
             },
         };
-        Ok(Check {
-            verdict,
-            steps: context.budget.spent(),
-        })
+        Ok((verdict, context.budget.spent()))
     }
 
     /// What the library makes of the two schemas before it compares them, as JSON for a tool
@@ -127,17 +122,6 @@ impl Default for Checker {
     }
 }
 
-/// A verdict together with the work it took.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct Check {
-    /// The answer.
-    pub verdict: Verdict,
-    /// The steps of the work budget that the check spent. The count depends only on the two
-    /// schemas and the settings, never on the machine, so two runs can be compared exactly.
-    pub steps: u64,
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -146,28 +130,27 @@ mod tests {
     use crate::Side;
 
     #[test]
-    fn a_check_gives_one_of_three_verdicts_and_its_steps() {
+    fn a_check_gives_one_of_three_verdicts() {
         let checker = Checker::new();
         let (text, optional) = (
             json!({"type": "string"}),
             json!({"type": ["string", "null"]}),
         );
-        let check = checker.check(&optional, &text).unwrap();
-        assert_eq!(check.verdict, Verdict::Yes);
-        assert!(check.steps > 0);
+        assert_eq!(checker.subsumes(&optional, &text).unwrap(), Verdict::Yes);
 
-        let check = checker.check(&text, &optional).unwrap();
         let counterexample = json!(null);
-        assert_eq!(check.verdict, Verdict::No { counterexample });
+        assert_eq!(
+            checker.subsumes(&text, &optional).unwrap(),
+            Verdict::No { counterexample }
+        );
 
         // The engine does not model `uniqueItems`, and says which keyword stands in the way.
         let (list, set) = (
             json!({"type": "array"}),
             json!({"type": "array", "uniqueItems": true}),
         );
-        let check = checker.check(&set, &list).unwrap();
         assert_eq!(
-            check.verdict,
+            checker.subsumes(&set, &list).unwrap(),
             Verdict::Unknown {
                 reason: Reason::Unsupported {
                     schema: Side::A,
@@ -178,28 +161,18 @@ mod tests {
     }
 
     #[test]
-    fn subsumes_is_the_verdict_of_check() {
-        let checker = Checker::new();
-        let (a, b) = (json!({}), json!(false));
-        assert_eq!(
-            checker.subsumes(&a, &b).unwrap(),
-            checker.check(&a, &b).unwrap().verdict
-        );
-    }
-
-    #[test]
     fn draft_2020_12_is_accepted_with_and_without_the_empty_fragment() {
         let draft_2020_12 = "https://json-schema.org/draft/2020-12/schema";
         for dialect in [draft_2020_12.to_owned(), format!("{draft_2020_12}#")] {
             let schema = json!({"$schema": dialect});
-            assert!(Checker::new().check(&schema, &schema).is_ok());
+            assert!(Checker::new().subsumes(&schema, &schema).is_ok());
         }
     }
 
     #[test]
     fn another_dialect_is_an_error_that_names_the_side() {
         let draft_07 = json!({"$schema": "http://json-schema.org/draft-07/schema#"});
-        let error = Checker::new().check(&json!({}), &draft_07).unwrap_err();
+        let error = Checker::new().subsumes(&json!({}), &draft_07).unwrap_err();
         assert_eq!(
             error,
             Error::UnsupportedDialect {
@@ -213,7 +186,7 @@ mod tests {
     #[test]
     fn a_value_that_is_no_schema_is_an_error() {
         for value in [json!(null), json!(1), json!("string"), json!([])] {
-            let error = Checker::new().check(&value, &json!(true)).unwrap_err();
+            let error = Checker::new().subsumes(&value, &json!(true)).unwrap_err();
             assert_eq!(error, Error::NotASchema { schema: Side::A });
         }
     }
@@ -223,7 +196,7 @@ mod tests {
         let checker = Checker::new();
         let invalid = json!({"properties": {"age": {"minimum": "0"}}});
         assert_eq!(
-            checker.check(&json!({}), &invalid).unwrap_err(),
+            checker.subsumes(&json!({}), &invalid).unwrap_err(),
             Error::InvalidKeyword {
                 schema: Side::B,
                 location: "#/properties/age/minimum".to_owned(),
@@ -232,7 +205,7 @@ mod tests {
         );
         let dangling = json!({"items": {"$ref": "#/$defs/item"}});
         assert_eq!(
-            checker.check(&dangling, &json!({})).unwrap_err(),
+            checker.subsumes(&dangling, &json!({})).unwrap_err(),
             Error::UnresolvedReference {
                 schema: Side::A,
                 location: "#/items/$ref".to_owned(),
@@ -246,11 +219,11 @@ mod tests {
         let uri = "https://example.com/name.json";
         let alone = json!({"$ref": uri});
         assert!(matches!(
-            Checker::new().check(&alone, &json!(true)),
+            Checker::new().subsumes(&alone, &json!(true)),
             Err(Error::UnresolvedReference { .. })
         ));
         let bundled = json!({"$ref": uri, "$defs": {"name": {"$id": uri, "type": "string"}}});
-        assert!(Checker::new().check(&bundled, &alone).is_err());
-        assert!(Checker::new().check(&bundled, &bundled).is_ok());
+        assert!(Checker::new().subsumes(&bundled, &alone).is_err());
+        assert!(Checker::new().subsumes(&bundled, &bundled).is_ok());
     }
 }
