@@ -343,7 +343,8 @@ fn referencing_finds_the_same_targets_in_the_corpus() {
     let mut refused = BTreeMap::new();
     for case in &cases {
         for (key, schema) in schemas_of(case) {
-            // The schema `a` of `rb-testset/s87.json` is `rb-testset/s87.json#/a`.
+            // The schema `a` of `habib2021/rb-testset/s87.json` is
+            // `habib2021/rb-testset/s87.json#/a`.
             let name = format!("{}#/{key}", case.strip_prefix(&corpus).unwrap().display());
             match compared(&schema) {
                 Ok(mut comparison) => {

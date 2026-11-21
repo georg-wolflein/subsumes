@@ -31,30 +31,17 @@ impl Random {
 }
 
 /// The file of every case of the corpus in `benchmark/`, which `make corpus` downloads: every
-/// JSON file below the folder of a collection, which is a folder that holds a
-/// `collection.json`, except that file.
+/// JSON file in the folder of a collection, which `collections.json` names.
 pub(crate) fn corpus_cases() -> Vec<PathBuf> {
-    let entries = |folder: &Path| {
-        let entries = std::fs::read_dir(folder).unwrap();
-        entries
-            .map(|entry| entry.unwrap().path())
-            .collect::<Vec<_>>()
-    };
     let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("benchmark");
+    let text = std::fs::read_to_string(corpus.join("collections.json")).unwrap();
+    let collections: serde_json::Map<String, Value> = serde_json::from_str(&text).unwrap();
     let mut cases = Vec::new();
-    for collection in entries(&corpus) {
-        let described = collection.join("collection.json");
-        if !described.is_file() {
-            continue;
-        }
-        let mut pending = vec![collection];
-        while let Some(folder) = pending.pop() {
-            for path in entries(&folder) {
-                if path.is_dir() {
-                    pending.push(path);
-                } else if path.extension().is_some_and(|it| it == "json") && path != described {
-                    cases.push(path);
-                }
+    for collection in collections.keys() {
+        for entry in std::fs::read_dir(corpus.join(collection)).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() && path.extension().is_some_and(|it| it == "json") {
+                cases.push(path);
             }
         }
     }

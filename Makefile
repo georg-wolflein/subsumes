@@ -1,8 +1,8 @@
 # The benchmark corpus is a release of https://github.com/georg-wolflein/subsumes-benchmark,
 # pinned by its version and by the SHA-256 of its archive. A release of the benchmark opens a
 # pull request that raises both: .github/workflows/benchmark-release.yml.
-BENCHMARK_VERSION := 0.8.0
-BENCHMARK_SHA256 := 6af8114ba8a1a25611309653056245e20c3231e36b550a56ed78002ec7fe32ad
+BENCHMARK_VERSION := 0.10.1
+BENCHMARK_SHA256 := 678c664efde28fa9bdf0e3ff91b5d891e330282d7d315ca50ef9e17a3e58bdf5
 BENCHMARK_URL := https://github.com/georg-wolflein/subsumes-benchmark/releases/download/v$(BENCHMARK_VERSION)/corpus.tar.zst
 
 # How many cases the benchmark checks at once. One, as CI runs it, measures the time of each
