@@ -1,7 +1,7 @@
 # The benchmark is a release of https://github.com/georg-wolflein/subsumes-benchmark, pinned
 # by its version: the package `subsumes-benchmark` on PyPI, which holds the corpus of that
 # version and the runner. uv fetches it, with the Python it needs.
-BENCHMARK_VERSION := 0.9.0
+BENCHMARK_VERSION := 0.10.1
 BENCHMARK := uvx subsumes-benchmark==$(BENCHMARK_VERSION)
 
 # How many tasks the benchmark asks at once. One, as CI runs it, measures the time of each
