@@ -1,10 +1,10 @@
 name: Benchmark release
 
 # A release of https://github.com/georg-wolflein/subsumes-benchmark sends this repository the
-# event `benchmark-released`, with its version, once the corpus archive is attached to the
-# release. This workflow then pins the Makefile to that version and the SHA-256 of that
-# archive, in a pull request on the branch build/benchmark: it opens the pull request, or
-# replaces what the one that is open pins. A version that is not newer than the one on main
+# event `benchmark-released`, with its version, once the package `subsumes-benchmark` of that
+# version is on PyPI. This workflow then pins the Makefile to that version, in a pull request
+# on the branch build/benchmark: it opens the pull request, or replaces what the one that is
+# open pins. A version that is not newer than the one on main
 # changes nothing. Started by hand, it takes the version as an input.
 #
 # It acts as a GitHub App: a pull request opened with this workflow's own token would not
@@ -56,12 +56,7 @@ jobs:
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          url="https://github.com/$GITHUB_REPOSITORY_OWNER/subsumes-benchmark/releases/download/v$VERSION/corpus.tar.zst"
-          sha256="$(curl --fail --silent --show-error --location "$url" | sha256sum | cut -d ' ' -f 1)"
-          sed -i \
-            -e "s/^BENCHMARK_VERSION := .*/BENCHMARK_VERSION := $VERSION/" \
-            -e "s/^BENCHMARK_SHA256 := .*/BENCHMARK_SHA256 := $sha256/" \
-            Makefile
+          sed -i "s/^BENCHMARK_VERSION := .*/BENCHMARK_VERSION := $VERSION/" Makefile
           git diff
           echo "changed=true" >> "$GITHUB_OUTPUT"
       - name: Open the pull request, or update the one that is open
