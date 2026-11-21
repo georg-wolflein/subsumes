@@ -127,7 +127,7 @@ fn keyword(location: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Record {
     /// The id of the case: the path of its file inside the corpus without the `.json`, such
-    /// as `rb-testset/additional_items`.
+    /// as `habib2021/rb-testset/s1`.
     pub case: String,
     pub direction: Direction,
     /// The label of the corpus; `None` where it claims nothing.
@@ -145,9 +145,12 @@ impl Record {
         (&self.case, self.direction)
     }
 
-    /// The collection of the case: the first folder of its id.
+    /// The collection of the case: the folders of its id, its origin and its name, such as
+    /// `habib2021/rb-testset`.
     pub fn collection(&self) -> &str {
-        self.case.split('/').next().unwrap_or(&self.case)
+        self.case
+            .rsplit_once('/')
+            .map_or(&self.case, |(collection, _)| collection)
     }
 
     /// A `Yes` or `No` that contradicts the label, or a `No` whose counterexample is none.
@@ -471,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn the_collection_is_the_first_folder() {
-        assert_eq!(record(None, Outcome::Yes).collection(), "collection");
+    fn the_collection_is_the_folders_of_the_case() {
+        assert_eq!(record(None, Outcome::Yes).collection(), "collection/group");
     }
 }

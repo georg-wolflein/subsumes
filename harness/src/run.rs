@@ -26,8 +26,8 @@ struct Case {
     b: Value,
 }
 
-/// The file in the folder of a collection that describes the collection and is no case.
-const COLLECTION: &str = "collection.json";
+/// The file at the root of the corpus that names its collections, each by its folder.
+const COLLECTIONS: &str = "collections.json";
 
 /// The stack of a job. It is what the main thread has where nothing else is set, so a case is
 /// checked with the room that it has without jobs.
@@ -118,26 +118,25 @@ fn check(corpus: &Path, case: &str, checker: &Checker) -> Result<[Record; 2], St
 }
 
 /// The cases of the corpus, each by its id: the path of its file inside the corpus without
-/// the `.json`. A collection is a folder of the corpus that holds a `collection.json`, and a
-/// case is every other JSON file below it. The ids are sorted folder by folder.
+/// the `.json`, such as `habib2021/rb-testset/s1`. `collections.json` names the folder of each
+/// collection, `<origin>/<collection>`, and a case is every JSON file in it. The ids are
+/// sorted folder by folder.
 fn cases(corpus: &Path) -> Result<Vec<String>, String> {
+    let described = corpus.join(COLLECTIONS);
+    if !described.is_file() {
+        return Err(format!(
+            "no {COLLECTIONS} in {}; `make corpus` downloads the corpus",
+            corpus.display()
+        ));
+    }
+    let collections: serde_json::Map<String, Value> = json(&described)?;
     let mut cases = Vec::new();
-    for collection in entries(corpus)? {
-        let described = collection.join(COLLECTION);
-        if !described.is_file() {
-            continue;
-        }
-        let mut pending = vec![collection];
-        while let Some(folder) = pending.pop() {
-            for path in entries(&folder)? {
-                if path.is_dir() {
-                    pending.push(path);
-                } else if path.extension().is_some_and(|it| it == "json") && path != described {
-                    let inside = path.with_extension("");
-                    let inside = inside.strip_prefix(corpus).unwrap_or(&inside);
-                    let case = inside.to_str().ok_or("a case path is not UTF-8")?;
-                    cases.push(case.replace(std::path::MAIN_SEPARATOR, "/"));
-                }
+    for collection in collections.keys() {
+        for path in entries(&corpus.join(collection))? {
+            if path.is_file() && path.extension().is_some_and(|it| it == "json") {
+                let name = path.file_stem().and_then(|it| it.to_str());
+                let name = name.ok_or("a case path is not UTF-8")?;
+                cases.push(format!("{collection}/{name}"));
             }
         }
     }
@@ -177,31 +176,34 @@ mod tests {
     /// A corpus of so many cases in a folder of its own, which the test removes. In each
     /// case A takes strings of up to as many characters as the case has for a number, and B
     /// of one more, so no two cases have the same counterexample. The corpus has what a
-    /// release has besides the cases: the schema of a case, the description of the
-    /// collection, and a folder that is no collection.
+    /// release has besides the cases: the schema of a case, the list of the collections, the
+    /// licence of a collection, and a folder that is no collection.
     fn corpus(name: &str, cases: u64) -> PathBuf {
         let corpus = env::temp_dir().join(format!("subsumes-harness-{}-{name}", process::id()));
-        let write = |file: &str, value: Value| {
+        let write = |file: &str, text: String| {
             let path = corpus.join(file);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, value.to_string()).unwrap();
+            fs::write(path, text).unwrap();
         };
-        write("case.schema.json", json!({"type": "object"}));
-        write("licenses/notice.json", json!({"license": "MIT"}));
-        write("strings/collection.json", json!({"description": "strings"}));
+        write("case.schema.json", json!({"type": "object"}).to_string());
+        write("README.md", "# The corpus".to_owned());
+        write("drafts/strings/00.json", json!({"a": true}).to_string());
+        write(
+            "collections.json",
+            json!({"origin/strings": {"description": "strings"}}).to_string(),
+        );
+        write("origin/strings/LICENSE", "MIT".to_owned());
         for case in 0..cases {
-            write(
-                &format!("strings/{case:02}.json"),
-                json!({
-                    "$schema": "../case.schema.json",
-                    "a_subsumes_b": false,
-                    "b_subsumes_a": true,
-                    "features": ["maxLength", "type"],
-                    "upstream": "https://example.com/strings",
-                    "a": {"type": "string", "maxLength": case},
-                    "b": {"type": "string", "maxLength": case + 1},
-                }),
-            );
+            let file = json!({
+                "$schema": "../../case.schema.json",
+                "a_subsumes_b": false,
+                "b_subsumes_a": true,
+                "features": ["maxLength", "type"],
+                "upstream": "https://example.com/strings",
+                "a": {"type": "string", "maxLength": case},
+                "b": {"type": "string", "maxLength": case + 1},
+            });
+            write(&format!("origin/strings/{case:02}.json"), file.to_string());
         }
         corpus
     }
@@ -227,7 +229,9 @@ mod tests {
 
         // Both directions of each case, in the order of the case paths.
         let cases: Vec<&str> = one.iter().map(|record| record.case.as_str()).collect();
-        let expected: Vec<String> = (0..12).map(|case| format!("strings/{case:02}")).collect();
+        let expected: Vec<String> = (0..12)
+            .map(|case| format!("origin/strings/{case:02}"))
+            .collect();
         let twice = expected
             .iter()
             .flat_map(|case| [case.as_str(), case.as_str()]);
@@ -244,7 +248,7 @@ mod tests {
     fn a_case_that_cannot_be_read_ends_the_run() {
         let corpus = corpus("unreadable", 6);
         let without_b = json!({"a_subsumes_b": null, "b_subsumes_a": null, "a": true});
-        fs::write(corpus.join("strings/02.json"), without_b.to_string()).unwrap();
+        fs::write(corpus.join("origin/strings/02.json"), without_b.to_string()).unwrap();
         let results = [run(&corpus, jobs(1)), run(&corpus, jobs(3))];
         fs::remove_dir_all(&corpus).unwrap();
         for result in results {
@@ -256,24 +260,39 @@ mod tests {
     }
 
     #[test]
-    fn the_cases_are_sorted_folder_by_folder() {
+    fn the_cases_are_the_json_files_of_the_collections_sorted_folder_by_folder() {
         let corpus = corpus("sorted", 1);
-        // As plain text `strings/group.b` is before `strings/group/a`.
-        for case in ["group.b", "group/a", "group/deeper/c"] {
-            let path = corpus.join(format!("strings/{case}.json"));
+        let collections = json!({
+            "origin/strings": {"description": "strings"},
+            "origin/strings.b": {"description": "more strings"},
+        });
+        fs::write(corpus.join(COLLECTIONS), collections.to_string()).unwrap();
+        // As plain text `origin/strings.b` is before `origin/strings/…`. A folder inside a
+        // collection holds no case.
+        for case in ["strings/group.b", "strings.b/a", "strings/group/a"] {
+            let path = corpus.join(format!("origin/{case}.json"));
             fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::copy(corpus.join("strings/00.json"), path).unwrap();
+            fs::copy(corpus.join("origin/strings/00.json"), path).unwrap();
         }
         let cases = cases(&corpus);
         fs::remove_dir_all(&corpus).unwrap();
         assert_eq!(
             cases.unwrap(),
             [
-                "strings/00",
-                "strings/group/a",
-                "strings/group/deeper/c",
-                "strings/group.b",
+                "origin/strings/00",
+                "origin/strings/group.b",
+                "origin/strings.b/a",
             ]
         );
+    }
+
+    #[test]
+    fn a_corpus_without_its_list_of_collections_has_no_cases() {
+        let corpus = corpus("unlisted", 1);
+        fs::remove_file(corpus.join(COLLECTIONS)).unwrap();
+        let cases = cases(&corpus);
+        fs::remove_dir_all(&corpus).unwrap();
+        let error = cases.unwrap_err();
+        assert!(error.starts_with("no collections.json in "), "{error}");
     }
 }
