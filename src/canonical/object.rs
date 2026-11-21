@@ -31,7 +31,7 @@
 //! Whether a value can satisfy a c-reference is not decided here. The engine is asked, and
 //! what it does not know yet it is told to find out first.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
 use serde_json::{Map, Value};
@@ -40,66 +40,69 @@ use super::search::{self, Place, Placed, Places, Slot};
 use super::{Left, Solver, State, state};
 use crate::context::{Budget, Exhausted};
 use crate::language::{LanguageId, Languages, Lengths, Shape};
-use crate::normalize::{Cause, DEEPEST, Found, Witness};
+use crate::normalize::{Cause, DEEPEST, Found, Levels, Witness};
 use crate::term::{CRefId, Term, Terms};
 
-/// The objects that a branch still accepts.
+/// The objects that a branch still accepts. Each fact is kept with the decision level of
+/// the term that asked for it, the first one that did.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Objects {
     /// What the value of every property with a name of a language satisfies.
-    every: BTreeSet<(LanguageId, CRefId)>,
+    every: BTreeMap<(LanguageId, CRefId), u32>,
     /// The properties that there have to be: each with a name of a language and a value
     /// that satisfies something.
-    some: BTreeSet<(LanguageId, CRefId)>,
-    /// The least number of properties, and the most if there is a most.
-    min: u64,
-    max: Option<u64>,
-    /// Whether what was asked leaves no object on the face of it.
-    none: bool,
+    some: BTreeMap<(LanguageId, CRefId), u32>,
+    /// The least number of properties, and the most if there is a most, each with the
+    /// level of the term that asked for it.
+    min: (u64, u32),
+    max: Option<(u64, u32)>,
+    /// The levels of the facts that leave no object on the face of it, if they do.
+    none: Option<Levels>,
 }
 
 impl Objects {
-    /// Takes in what a term about objects asks of an object, as it stands or negated.
-    /// `PNames` is not among them: the engine works out the language of the names first.
-    pub fn take(&mut self, term: &Term, negated: bool, terms: &mut Terms) {
+    /// Takes in what a term about objects asks of an object, as it stands or negated, as a
+    /// fact of a level. `PNames` is not among them: the engine works out the language of
+    /// the names first.
+    pub fn take(&mut self, term: &Term, negated: bool, level: u32, terms: &mut Terms) {
         match (term, negated) {
             (Term::PProp(names, variable), false) => {
                 let of = terms.literal(*variable, false);
-                self.every(*names, of, terms);
+                self.every(*names, of, level, terms);
             }
             // Some property with such a name has a value that the schema does not accept.
             (Term::PProp(names, variable), true) => {
                 let of = terms.literal(*variable, true);
-                self.some(*names, of, terms);
+                self.some(*names, of, level, terms);
             }
-            (Term::PReq(names), false) => self.some(*names, Terms::ANYTHING, terms),
+            (Term::PReq(names), false) => self.some(*names, Terms::ANYTHING, level, terms),
             // No property has such a name: the value of one that has satisfies nothing.
-            (Term::PReq(names), true) => self.every(*names, Terms::NOTHING, terms),
-            (Term::MinProps(least), false) => self.min = self.min.max(*least),
+            (Term::PReq(names), true) => self.every(*names, Terms::NOTHING, level, terms),
+            (Term::MinProps(least), false) => self.at_least(*least, level),
             // Fewer than the least.
             (Term::MinProps(least), true) => match least.checked_sub(1) {
-                Some(most) => self.at_most(most),
-                None => self.none = true,
+                Some(most) => self.at_most(most, level),
+                None => self.leaves_none(Levels::of(level)),
             },
-            (Term::MaxProps(most), false) => self.at_most(*most),
+            (Term::MaxProps(most), false) => self.at_most(*most, level),
             // More than the most. Beyond the largest count this asks for one property less
             // than it should, which lets objects in and none out.
-            (Term::MaxProps(most), true) => self.min = self.min.max(most.saturating_add(1)),
+            (Term::MaxProps(most), true) => self.at_least(most.saturating_add(1), level),
             (other, _) => unreachable!("{other:?} is not about objects"),
         }
     }
 
     /// Takes in that every property has a name outside a language, or with `negated` that
-    /// some property has one.
-    pub fn names(&mut self, outside: LanguageId, negated: bool, terms: &mut Terms) {
+    /// some property has one, as a fact of a level.
+    pub fn names(&mut self, outside: LanguageId, negated: bool, level: u32, terms: &mut Terms) {
         if negated {
-            self.some(outside, Terms::ANYTHING, terms);
+            self.some(outside, Terms::ANYTHING, level, terms);
         } else {
-            self.every(outside, Terms::NOTHING, terms);
+            self.every(outside, Terms::NOTHING, level, terms);
         }
     }
 
-    fn every(&mut self, names: LanguageId, of: CRefId, terms: &mut Terms) {
+    fn every(&mut self, names: LanguageId, of: CRefId, level: u32, terms: &mut Terms) {
         if of == Terms::ANYTHING || names == Languages::NOTHING {
             return;
         }
@@ -107,27 +110,53 @@ impl Objects {
         let mut there = self
             .some
             .range((names, CRefId::FIRST)..=(names, CRefId::LAST));
-        if there.any(|(_, other)| terms.both(of, *other) == Terms::NOTHING) {
-            self.none = true;
+        if let Some((_, other)) =
+            there.find(|((_, other), _)| terms.both(of, *other) == Terms::NOTHING)
+        {
+            let mut both = Levels::of(level);
+            both.insert(*other);
+            self.leaves_none(both);
         }
-        self.every.insert((names, of));
+        self.every.entry((names, of)).or_insert(level);
     }
 
-    fn some(&mut self, names: LanguageId, of: CRefId, terms: &mut Terms) {
+    fn some(&mut self, names: LanguageId, of: CRefId, level: u32, terms: &mut Terms) {
+        if of == Terms::NOTHING || names == Languages::NOTHING {
+            self.leaves_none(Levels::of(level));
+        }
         let mut all = self
             .every
             .range((names, CRefId::FIRST)..=(names, CRefId::LAST));
-        if of == Terms::NOTHING
-            || names == Languages::NOTHING
-            || all.any(|(_, other)| terms.both(of, *other) == Terms::NOTHING)
+        if let Some((_, other)) =
+            all.find(|((_, other), _)| terms.both(of, *other) == Terms::NOTHING)
         {
-            self.none = true;
+            let mut both = Levels::of(level);
+            both.insert(*other);
+            self.leaves_none(both);
         }
-        self.some.insert((names, of));
+        self.some.entry((names, of)).or_insert(level);
     }
 
-    fn at_most(&mut self, most: u64) {
-        self.max = Some(self.max.map_or(most, |max| max.min(most)));
+    fn at_least(&mut self, least: u64, level: u32) {
+        if least > self.min.0 {
+            self.min = (least, level);
+        }
+    }
+
+    fn at_most(&mut self, most: u64, level: u32) {
+        if self.max.is_none_or(|(max, _)| most < max) {
+            self.max = Some((most, level));
+        }
+    }
+
+    /// Notes facts that leave no object on the face of it, unless some did before.
+    fn leaves_none(&mut self, levels: Levels) {
+        self.none.get_or_insert(levels);
+    }
+
+    /// Whether the bounds on the number of properties leave no object.
+    fn too_few_for_the_least(&self) -> bool {
+        self.max.is_some_and(|(max, _)| max < self.min.0)
     }
 
     /// How much there is to copy when the branch splits.
@@ -150,19 +179,14 @@ impl Objects {
         ask: &mut dyn FnMut(CRefId) -> Option<Found>,
         give: bool,
     ) -> Result<Left, Exhausted> {
-        if self.none || self.max.is_some_and(|max| max < self.min) {
+        if self.none.is_some() || self.too_few_for_the_least() {
             return Ok(Left::Nothing);
         }
-        let languages = self.every.iter().chain(&self.some).map(|asked| asked.0);
-        let languages: BTreeSet<LanguageId> = languages.collect();
-        let languages: Vec<LanguageId> = languages.into_iter().collect();
-        let partition = with
-            .partitions
-            .of(&languages, with.languages, with.budget)?;
+        let partition = self.partition(with)?;
 
         // What every property of a fragment satisfies.
         let mut every = vec![Terms::ANYTHING; partition.fragments.len()];
-        for (names, of) in &self.every {
+        for (names, of) in self.every.keys() {
             let held = &partition.within[names];
             with.budget.charge(1 + (held.len() / 8) as u64)?;
             for fragment in held.iter() {
@@ -173,7 +197,7 @@ impl Objects {
         // The properties that there have to be, those first that have the fewest fragments
         // to be in.
         let mut some: Vec<(&[u32], CRefId)> = Vec::with_capacity(self.some.len());
-        for (names, of) in &self.some {
+        for (names, of) in self.some.keys() {
             some.push((&partition.within[names], *of));
         }
         some.sort_by_key(|(fragments, _)| fragments.len());
@@ -186,6 +210,148 @@ impl Objects {
             used: vec![Vec::new(); partition.fragments.len()],
         };
         search::run(search, with, ask, give)
+    }
+
+    /// The partition of the names by the languages that the facts name.
+    fn partition(&self, with: &mut Solver) -> Result<Rc<Partition>, Exhausted> {
+        let languages = self
+            .every
+            .keys()
+            .chain(self.some.keys())
+            .map(|asked| asked.0);
+        let languages: BTreeSet<LanguageId> = languages.collect();
+        let languages: Vec<LanguageId> = languages.into_iter().collect();
+        with.partitions.of(&languages, with.languages, with.budget)
+    }
+
+    /// The levels of the facts that leave no object, once [`Objects::left`] has found that
+    /// none is left: the conflict set of the refutation, but for the levels that those hold
+    /// because of in turn.
+    ///
+    /// More properties that there have to be, each of one name of its own, than the most
+    /// there may be leave no object together with that most. Otherwise, a property that
+    /// there has to be leaves no object together with what is asked of
+    /// the properties of the fragments of its language, where it has no value in any of
+    /// them. Of what is asked of such a fragment, that is one fact where one alone leaves
+    /// the value nothing on the face of it, the one of the lowest level of those, and every
+    /// fact about the fragment where none does. Of several such properties, the one whose
+    /// facts are of the lowest levels is taken. Where no property that there has to be
+    /// leaves no object so, the object is none for the number of properties, or for
+    /// several properties that cannot share names, and every fact about objects is taken
+    /// to be in the way.
+    ///
+    /// `ask` says what the engine knows of a c-reference, as for [`Objects::left`]. Only
+    /// what is known counts: a value that was not asked about is not taken to be nothing.
+    ///
+    /// # Errors
+    ///
+    /// When the budget does not cover the work. Each fragment of the language of a property
+    /// that is looked at costs a step, and one more for every eight facts that are held
+    /// against it.
+    pub fn conflict(
+        &self,
+        with: &mut Solver,
+        ask: &mut dyn FnMut(CRefId) -> Option<Found>,
+    ) -> Result<Levels, Exhausted> {
+        if let Some(none) = &self.none {
+            return Ok(none.clone());
+        }
+        if let (Some((_, most)), (_, least)) = (self.max, self.min)
+            && self.too_few_for_the_least()
+        {
+            let mut both = Levels::of(most);
+            both.insert(least);
+            return Ok(both);
+        }
+        let partition = self.partition(with)?;
+        if let Some(levels) = self.too_many_names(&partition, with)? {
+            return Ok(levels);
+        }
+        let mut best: Option<Levels> = None;
+        'some: for ((names, of), level) in &self.some {
+            let mut levels = Levels::of(*level);
+            for fragment in partition.within[names].iter() {
+                // The facts about the fragment, and of those one that leaves the value
+                // nothing by itself on the face of it, the one of the lowest level.
+                with.budget.charge(1 + (self.every.len() / 8) as u64)?;
+                let about = self.every.iter().filter(|((language, _), _)| {
+                    partition.within[language].binary_search(fragment).is_ok()
+                });
+                let mut alone: Option<u32> = None;
+                let (mut all, mut both) = (Levels::default(), *of);
+                for ((_, asked), level) in about {
+                    all.insert(*level);
+                    if with.terms.contradict(*asked, *of) {
+                        alone = Some(alone.map_or(*level, |alone| alone.min(*level)));
+                    } else if alone.is_none() {
+                        both = with.terms.both(both, *asked);
+                    }
+                }
+                match alone {
+                    Some(level) => levels.insert(level),
+                    // Without such a fact, what all of them ask together.
+                    None if matches!(ask(both), Some(Found::Nothing)) => levels.union(&all),
+                    None => continue 'some,
+                }
+            }
+            if best.as_ref().is_none_or(|best| levels.below(best)) {
+                best = Some(levels);
+            }
+        }
+        Ok(best.unwrap_or_else(|| self.levels()))
+    }
+
+    /// Whether more properties that there have to be are of one name each, and of names
+    /// apart, than the most there may be. If so, the levels of the most, and for one name
+    /// more than the most, those of the lowest of the properties of each of the names of the
+    /// lowest levels.
+    fn too_many_names(
+        &self,
+        partition: &Partition,
+        with: &mut Solver,
+    ) -> Result<Option<Levels>, Exhausted> {
+        let Some((most, at)) = self.max else {
+            return Ok(None);
+        };
+        with.budget.charge(1 + (self.some.len() / 8) as u64)?;
+        // The lowest level of a property for each name.
+        let mut names: BTreeMap<u32, u32> = BTreeMap::new();
+        for ((language, _), level) in &self.some {
+            if let [fragment] = *partition.within[language]
+                && partition.fragments[fragment as usize].size == Some(1)
+            {
+                let lowest = names.entry(fragment).or_insert(*level);
+                *lowest = (*lowest).min(*level);
+            }
+        }
+        if (names.len() as u64) <= most {
+            return Ok(None);
+        }
+        let mut lowest: Vec<u32> = names.into_values().collect();
+        lowest.sort_unstable();
+        let mut levels = Levels::of(at);
+        for level in lowest
+            .iter()
+            .take(usize::try_from(most + 1).unwrap_or(usize::MAX))
+        {
+            levels.insert(*level);
+        }
+        Ok(Some(levels))
+    }
+
+    /// The levels of every fact about objects.
+    fn levels(&self) -> Levels {
+        let mut levels = Levels::default();
+        for level in self.every.values().chain(self.some.values()) {
+            levels.insert(*level);
+        }
+        if self.min.0 > 0 {
+            levels.insert(self.min.1);
+        }
+        if let Some((_, level)) = self.max {
+            levels.insert(level);
+        }
+        levels
     }
 }
 
@@ -429,7 +595,7 @@ impl Places for Search<'_> {
     /// Where one of the properties that there have to be may go.
     fn places(&self, placed: &Placed<u32>, which: usize) -> Vec<Place<u32>> {
         let (fragments, _) = self.some[which];
-        let most = self.objects.max;
+        let most = self.objects.max.map(|(most, _)| most);
         let room = most.is_none_or(|most| (placed.slots.len() as u64) < most);
         let (mut join, mut open) = (Vec::new(), Vec::new());
         // The fragments that are not of one name come last and are tried first: what their
@@ -467,7 +633,7 @@ impl Places for Search<'_> {
         ask: &mut dyn FnMut(CRefId) -> Option<Found>,
         give: bool,
     ) -> Result<Option<Left>, Exhausted> {
-        let need = self.objects.min.saturating_sub(placed.slots.len() as u64);
+        let need = self.objects.min.0.saturating_sub(placed.slots.len() as u64);
         let in_the_way = |slot: &Slot<u32>| slot.value.as_ref().err().copied().flatten();
         let mut cause = placed.slots.iter().find_map(in_the_way);
         // The properties that are known to have a value, and those that may have one.
@@ -641,7 +807,7 @@ mod tests {
         /// Every property with such a name satisfies these.
         fn every(mut self, names: &str, variables: &[i32]) -> Self {
             let (names, of) = (self.names(names), self.engine.of(variables));
-            self.objects.every(names, of, &mut self.engine.terms);
+            self.objects.every(names, of, 0, &mut self.engine.terms);
             self
         }
 
@@ -649,19 +815,20 @@ mod tests {
         fn none(mut self, names: &str) -> Self {
             let names = self.names(names);
             let terms = &mut self.engine.terms;
-            self.objects.every(names, Terms::NOTHING, terms);
+            self.objects.every(names, Terms::NOTHING, 0, terms);
             self
         }
 
         /// Some property with such a name satisfies these.
         fn some(mut self, names: &str, variables: &[i32]) -> Self {
             let (names, of) = (self.names(names), self.engine.of(variables));
-            self.objects.some(names, of, &mut self.engine.terms);
+            self.objects.some(names, of, 0, &mut self.engine.terms);
             self
         }
 
         fn count(mut self, min: u64, max: Option<u64>) -> Self {
-            (self.objects.min, self.objects.max) = (min, max);
+            self.objects.min = (min, 0);
+            self.objects.max = max.map(|max| (max, 0));
             self
         }
 
@@ -713,7 +880,7 @@ mod tests {
             none()
         );
         let on_the_face_of_it = Asked::new().every("=a", &[2]).some("=a", &[-2]);
-        assert!(on_the_face_of_it.objects.none);
+        assert!(on_the_face_of_it.objects.none.is_some());
         assert_eq!(on_the_face_of_it.given(), none());
         assert_eq!(Asked::new().none("=a").some("=a", &[]).given(), none());
         // What the engine does not know stands in the way.
@@ -808,6 +975,66 @@ mod tests {
         // The empty name is made up only where no other is left.
         let empty = Asked::new().none("(?s)^.").count(1, None);
         assert_eq!(empty.given(), Ok(json!({"": null})));
+    }
+
+    #[test]
+    fn a_property_that_has_no_value_anywhere_names_the_facts_that_leave_it_none() {
+        // Facts of levels 1 to 5: each of two names is closed by a fact of its own and by
+        // one that closes every name but the other, and a property has to be there with one
+        // of the two names.
+        let mut asked = Asked::new();
+        let (a, b, either) = (asked.names("=a"), asked.names("=b"), asked.names("=a,b"));
+        let (not_a, not_b) = (asked.names("!a"), asked.names("!b"));
+        let terms = &mut asked.engine.terms;
+        asked.objects.every(not_b, Terms::NOTHING, 1, terms);
+        asked.objects.every(a, Terms::NOTHING, 2, terms);
+        asked.objects.every(b, Terms::NOTHING, 3, terms);
+        asked.objects.every(not_a, Terms::NOTHING, 4, terms);
+        asked.objects.some(either, Terms::ANYTHING, 5, terms);
+        let budget = &mut Budget::new(u64::MAX);
+        assert!(matches!(asked.left(budget), Ok(Left::Nothing)));
+        // The property, and for each name the fact of the lowest level that closes it: `a`
+        // the one of level 1 and `b` the one of level 3.
+        let objects = &asked.objects;
+        let conflict = asked
+            .engine
+            .ask(budget, |with, ask| objects.conflict(with, ask));
+        let mut levels = Levels::of(1);
+        levels.insert(3);
+        levels.insert(5);
+        assert_eq!(conflict, Ok(levels));
+        // A property that has to be there with a value that no property of its name may
+        // have names the two facts.
+        let mut asked = Asked::new();
+        let (a, not_b) = (asked.names("=a"), asked.names("!b"));
+        let (string, other) = (asked.engine.of(&[2]), asked.engine.of(&[-2]));
+        let terms = &mut asked.engine.terms;
+        asked.objects.every(a, string, 1, terms);
+        asked.objects.every(not_b, Terms::NOTHING, 2, terms);
+        asked.objects.some(a, other, 3, terms);
+        let objects = &asked.objects;
+        let conflict = asked
+            .engine
+            .ask(budget, |with, ask| objects.conflict(with, ask));
+        let mut levels = Levels::of(1);
+        levels.insert(3);
+        assert_eq!(conflict, Ok(levels));
+        // Where the object is none for the number of properties, every fact is named.
+        let mut asked = Asked::new().count(0, Some(1));
+        let (a, b) = (asked.names("=a"), asked.names("=b"));
+        let (string, other) = (asked.engine.of(&[2]), asked.engine.of(&[-2]));
+        let terms = &mut asked.engine.terms;
+        asked.objects.some(a, string, 1, terms);
+        asked.objects.some(b, other, 2, terms);
+        assert!(matches!(asked.left(budget), Ok(Left::Nothing)));
+        let objects = &asked.objects;
+        let conflict = asked
+            .engine
+            .ask(budget, |with, ask| objects.conflict(with, ask));
+        let mut levels = Levels::of(0);
+        levels.insert(1);
+        levels.insert(2);
+        assert_eq!(conflict, Ok(levels));
     }
 
     #[test]

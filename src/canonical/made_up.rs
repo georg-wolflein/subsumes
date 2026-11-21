@@ -84,6 +84,27 @@ impl Engine {
         Found::Instance(Witness::plain(value))
     }
 
+    /// What a question about the objects or the arrays gives, with what the engine has
+    /// found so far.
+    pub fn ask<T>(
+        &mut self,
+        budget: &mut Budget,
+        question: impl FnOnce(&mut Solver, &mut dyn FnMut(CRefId) -> Option<Found>) -> T,
+    ) -> T {
+        let found = &self.found;
+        let mut ask = |of: CRefId| match of {
+            Terms::NOTHING => Some(Found::Nothing),
+            _ => found.get(&of).cloned(),
+        };
+        let mut solver = Solver {
+            terms: &mut self.terms,
+            languages: &mut self.languages,
+            budget,
+            partitions: &mut self.partitions,
+        };
+        question(&mut solver, &mut ask)
+    }
+
     /// What a search leaves, with the engine deciding what it is asked for until nothing
     /// is asked any more.
     pub fn left(

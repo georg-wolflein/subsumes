@@ -39,8 +39,9 @@
 
 #[cfg(test)]
 mod exhaustive;
+mod levels;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::rc::Rc;
 
 use serde_json::Value;
@@ -54,6 +55,8 @@ use crate::context::{Context, Exhausted};
 use crate::generate;
 use crate::language::{LanguageId, Languages};
 use crate::term::{CRefId, InstanceType, LeafId, Term, TermId, Terms, TypeSet, VarId};
+
+pub(crate) use self::levels::Levels;
 
 /// What the engine makes of two schemas.
 #[derive(Debug, PartialEq)]
@@ -148,6 +151,10 @@ struct Item {
     negated: bool,
     /// The unfolding of a variable that the term came out of, if it came out of one.
     within: Option<usize>,
+    /// The decision level of the split whose alternative brought the term: what the term
+    /// came out of was taken in after that split, so the term holds because of the
+    /// alternative that the split is at, and of what the disjunction came out of.
+    level: u32,
 }
 
 /// One of the alternatives of a disjunction: terms that hold together.
@@ -159,6 +166,7 @@ impl Item {
             term,
             negated,
             within: None,
+            level: 0,
         }
     }
 }
@@ -170,23 +178,37 @@ struct Unfolding {
     negated: bool,
     /// The unfolding in which that reference stood, if it stood in one.
     within: Option<usize>,
+    /// The level of the reference.
+    level: u32,
 }
 
+/// What became of a branch that took something in: refuted, with the levels of the facts
+/// that leave it no instance, or not.
+type Taken = Result<(), Levels>;
+
+/// What a branch takes in is kept with the levels of the facts that it came from, so that a
+/// refutation can say which facts it takes: see [`Engine::back_up`].
 #[derive(Debug, Clone)]
 struct Branch {
-    /// The types that an instance may still have.
+    /// The types that an instance may still have, and for each type that it may no longer
+    /// have, the levels of the facts that ruled it out.
     types: TypeSet,
-    /// Whether an instance may still be `false`, and whether `true`.
+    gone: [Levels; 6],
+    /// Whether an instance may still be `false`, and whether `true`, with the levels of the
+    /// facts that ruled out one that it may not be.
     booleans: [bool; 2],
-    /// The numbers that an instance may still be, and whether anything was asked of them
-    /// since it was last seen that there are some.
+    excluded: [Levels; 2],
+    /// The numbers that an instance may still be, whether anything was asked of them since
+    /// it was last seen that there are some, and the levels of what was asked.
     numbers: Numbers,
     numbers_asked: bool,
+    numbers_from: Levels,
     /// The same for the strings.
     strings: Strings,
     strings_asked: bool,
-    /// And for the objects. An object may be left only as far as the engine knows: then
-    /// this stands between the branch and an object.
+    strings_from: Levels,
+    /// And for the objects, which keep the levels themselves. An object may be left only as
+    /// far as the engine knows: then this stands between the branch and an object.
     objects: Objects,
     objects_asked: bool,
     objects_depend: Option<Cause>,
@@ -194,17 +216,18 @@ struct Branch {
     arrays: Arrays,
     arrays_asked: bool,
     arrays_depend: Option<Cause>,
+    arrays_from: Levels,
     /// The leaves that must hold, and the types that they are about.
-    holds: BTreeSet<LeafId>,
+    holds: BTreeMap<LeafId, Levels>,
     covered: TypeSet,
     /// The leaves that must not hold.
-    fails: BTreeSet<LeafId>,
+    fails: BTreeMap<LeafId, Levels>,
     /// The variables taken for true, with `false`, and those taken for false, with `true`.
     /// Each is unfolded once in a branch, and this is its unfolding.
     taken: BTreeMap<(VarId, bool), usize>,
     /// The references to a variable that was taken before: the unfolding of the variable,
-    /// and the unfolding in which the reference stands.
-    met: BTreeSet<(usize, usize)>,
+    /// and the unfolding in which the reference stands, with the level of the reference.
+    met: BTreeMap<(usize, usize), u32>,
     /// What is still to be taken in, in the order in which it came up. What a term unfolds
     /// to waits behind everything that was there before, so that a variable meets its own
     /// negation before either is opened.
@@ -217,22 +240,27 @@ impl Default for Branch {
     fn default() -> Self {
         Self {
             types: TypeSet::ALL,
+            gone: Default::default(),
             booleans: [true; 2],
+            excluded: Default::default(),
             numbers: Numbers::default(),
             numbers_asked: false,
+            numbers_from: Levels::default(),
             strings: Strings::default(),
             strings_asked: false,
+            strings_from: Levels::default(),
             objects: Objects::default(),
             objects_asked: false,
             objects_depend: None,
             arrays: Arrays::default(),
             arrays_asked: false,
             arrays_depend: None,
-            holds: BTreeSet::new(),
+            arrays_from: Levels::default(),
+            holds: BTreeMap::new(),
             covered: TypeSet::NONE,
-            fails: BTreeSet::new(),
+            fails: BTreeMap::new(),
             taken: BTreeMap::new(),
-            met: BTreeSet::new(),
+            met: BTreeMap::new(),
             todo: VecDeque::new(),
             choices: VecDeque::new(),
         }
@@ -255,34 +283,76 @@ impl Branch {
         copied + self.numbers.weight() + self.strings.weight() + values
     }
 
-    /// Keeps only instances of these types. Returns whether any are left.
-    fn restrict(&mut self, types: TypeSet) -> bool {
-        self.types = self.types.intersection(types);
+    /// Keeps only instances of these types, as a fact of a level asks. Returns whether any
+    /// are left.
+    fn restrict(&mut self, types: TypeSet, level: u32) -> bool {
+        self.restrict_by(types, || Levels::of(level))
+    }
+
+    /// Keeps only instances of these types, as facts of the levels that `why` gives ask.
+    /// Returns whether any are left.
+    fn restrict_by(&mut self, types: TypeSet, why: impl FnOnce() -> Levels) -> bool {
+        let ruled_out = self.types.intersection(types.complement());
+        if !ruled_out.is_empty() {
+            let why = why();
+            for kind in ruled_out.iter() {
+                self.gone[kind as usize] = why.clone();
+            }
+            self.types = self.types.intersection(types);
+        }
         !self.types.is_empty()
     }
 
-    /// Rules out one boolean. Returns whether any instance is left.
-    fn exclude(&mut self, value: bool) -> bool {
-        self.booleans[usize::from(value)] = false;
+    /// The levels of the facts that ruled out every type, when no type is left.
+    fn no_type(&self) -> Levels {
+        let mut levels = Levels::default();
+        for why in &self.gone {
+            levels.union(why);
+        }
+        levels
+    }
+
+    /// Rules out one boolean, as a fact of a level asks. Returns whether any instance is
+    /// left.
+    fn exclude(&mut self, value: bool, level: u32) -> bool {
+        let at = usize::from(value);
+        if self.booleans[at] {
+            self.booleans[at] = false;
+            self.excluded[at] = Levels::of(level);
+        }
         if self.booleans == [false; 2] {
-            return self.restrict(BOOLEAN.complement());
+            let [one, other] = &self.excluded;
+            let mut both = one.clone();
+            both.union(other);
+            return self.restrict_by(BOOLEAN.complement(), || both);
         }
         true
     }
 
-    /// Takes in a leaf that must hold, or with `negated` one that must not. Returns whether
-    /// the branch still stands.
-    fn take(&mut self, leaf: LeafId, negated: bool, terms: &Terms) -> bool {
+    /// Takes in a leaf that must hold, or with `negated` one that must not, as a fact of a
+    /// level asks.
+    fn take(&mut self, leaf: LeafId, negated: bool, level: u32, terms: &Terms) -> Taken {
         let about = terms.leaf(leaf).domain;
+        let (asked, against) = if negated {
+            (&mut self.fails, &self.holds)
+        } else {
+            (&mut self.holds, &self.fails)
+        };
+        asked.entry(leaf).or_insert_with(|| Levels::of(level));
+        if let Some(against) = against.get(&leaf) {
+            let mut both = against.clone();
+            both.insert(level);
+            return Err(both);
+        }
         if negated {
             // A leaf fails only for an instance that it is about.
-            self.fails.insert(leaf);
-            self.restrict(about) && !self.holds.contains(&leaf)
+            if !self.restrict(about, level) {
+                return Err(self.no_type());
+            }
         } else {
-            self.holds.insert(leaf);
             self.covered = self.covered.union(about);
-            !self.fails.contains(&leaf)
         }
+        Ok(())
     }
 
     /// The types of which the branch is known to accept an instance if it stands: no leaf
@@ -310,8 +380,8 @@ impl Branch {
             let about = terms.leaf(**leaf).domain;
             !about.intersection(self.types).is_empty()
         };
-        let must_not_hold = self.fails.first();
-        let leaf = must_not_hold.or_else(|| self.holds.iter().find(about_what_is_left));
+        let must_not_hold = self.fails.keys().next();
+        let leaf = must_not_hold.or_else(|| self.holds.keys().find(about_what_is_left));
         let leaf = leaf.map(|leaf| Cause::Leaf(*leaf));
         leaf.or(self.objects_depend)
             .or(self.arrays_depend)
@@ -341,13 +411,22 @@ struct Task {
     began: u64,
 }
 
-/// A branch that was split on one of its disjunctions.
+/// A branch that was split on one of its disjunctions. Its depth on the stack of splits is
+/// its decision level.
 struct Split {
     branch: Branch,
     /// The alternatives of the disjunction that are still to come.
     still_to_come: Box<dyn Iterator<Item = Alternative>>,
     /// The disjunction, unless this is the split in one that a task begins as.
     choice: Option<Disjunction>,
+    /// The level of the disjunction: what it came out of was taken in after the split at
+    /// that level. What the alternatives of this split bring holds because of the
+    /// alternative that it is at, and of what the disjunction holds because of.
+    from: u32,
+    /// Whether every alternative that was followed to its end was refuted, and the union
+    /// of their conflict sets, without this level.
+    refuted: bool,
+    conflict: Levels,
     /// Whether the disjunction came with the alternative that the split below was at: it
     /// was not among those that the branch of that split had met.
     brought: bool,
@@ -373,7 +452,8 @@ struct Assumed {
 
 /// Whether a branch stands when it has taken in what needs no split.
 enum Settled {
-    Refuted,
+    /// With the levels of the facts that leave it no instance.
+    Refuted(Levels),
     Stands,
     /// That depends on c-references of which the engine knows nothing yet.
     Needs(Vec<CRefId>),
@@ -474,6 +554,9 @@ impl Engine<'_> {
                 branch: Branch::default(),
                 still_to_come: whole,
                 choice: None,
+                from: 0,
+                refuted: false,
+                conflict: Levels::default(),
                 brought: false,
                 stood: true,
             }],
@@ -554,18 +637,36 @@ impl Engine<'_> {
                     return Ok(None);
                 }
                 let Some(alternative) = split.still_to_come.next() else {
+                    let split = task.splits.pop().expect("the split is at work");
+                    // What refuted the alternatives, if they were, holds whichever
+                    // alternative this split is at, with what the disjunction holds because
+                    // of.
+                    let mut conflict = split.conflict;
+                    conflict.insert(split.from);
                     let dead_end = !split.stood;
                     if let (Some(choice), true) = (split.choice, dead_end) {
+                        // A dead end that backs up past splits counts once more for each:
+                        // backed up through one split at a time, it would have been met
+                        // again under the next alternative of each.
+                        let past = u32::try_from(backs_past(task, &conflict)).unwrap_or(u32::MAX);
                         let count = self.dead_ends.entry(choice).or_default();
-                        *count = count.saturating_add(1);
+                        *count = count.saturating_add(past).saturating_add(1);
                     }
                     // An alternative that brought the disjunction and was left with no
                     // alternative of it did not stand by more than itself.
-                    let stood = !(split.brought && dead_end);
-                    task.splits.pop();
-                    if stood {
-                        self.stood();
+                    if !(split.brought && dead_end)
+                        && let Some(below) = task.splits.last_mut()
+                    {
+                        below.stood = true;
                     }
+                    if !split.refuted {
+                        // What came out of the alternative that the split below is at stood.
+                        if let Some(below) = task.splits.last_mut() {
+                            below.refuted = false;
+                        }
+                        return Ok(None);
+                    }
+                    self.back_up(conflict)?;
                     return Ok(None);
                 };
                 self.context.budget.charge(1 + split.branch.weight() / 32)?;
@@ -575,7 +676,10 @@ impl Engine<'_> {
             }
         };
         match self.settle(&mut branch)? {
-            Settled::Refuted => return Ok(None),
+            Settled::Refuted(conflict) => {
+                self.back_up(conflict)?;
+                return Ok(None);
+            }
             Settled::Needs(wanted) => {
                 self.wait(branch, wanted);
                 return Ok(None);
@@ -587,12 +691,16 @@ impl Engine<'_> {
             return Ok(None);
         }
         if let Some((choice, brought)) = self.choose(&mut branch) {
-            let still_to_come = alternatives(&self.context.terms, &choice);
             let task = self.tasks.last_mut().expect("a task is at work");
+            let level = u32::try_from(task.splits.len()).expect("fewer than 2^32 splits");
+            let still_to_come = alternatives(&self.context.terms, &choice, level);
             task.splits.push(Split {
                 branch,
                 still_to_come,
                 choice: Some((choice.term, choice.negated)),
+                from: choice.level,
+                refuted: true,
+                conflict: Levels::default(),
                 brought,
                 stood: false,
             });
@@ -611,12 +719,38 @@ impl Engine<'_> {
         Ok(None)
     }
 
-    /// Notes that an alternative of the split at work stood by more than itself.
+    /// Notes that an alternative of the split at work stood: it was not refuted, so it
+    /// stood by more than itself.
     fn stood(&mut self) {
         let task = self.tasks.last_mut().expect("a task is at work");
         if let Some(split) = task.splits.last_mut() {
+            split.refuted = false;
             split.stood = true;
         }
+    }
+
+    /// Backs up from a refutation to the deepest split of its conflict set, which goes on
+    /// with its next alternative. The splits after that one are dropped with the
+    /// alternatives that they have still to come: the facts of the conflict set leave no
+    /// instance, and each of those alternatives holds every one of them. This is
+    /// conflict-directed backjumping. Without a split in the conflict set, the facts that
+    /// the task begins with leave no instance, and the task has no branch left.
+    ///
+    /// `conflict` holds the levels of the facts that the refutation takes, and not the
+    /// levels of what those hold because of in turn: each of those is below the level that
+    /// holds because of it, so the deepest split is the same, and each comes in when the
+    /// split that holds because of it runs out of alternatives, as its disjunction.
+    fn back_up(&mut self, mut conflict: Levels) -> Result<(), Exhausted> {
+        // Level 0 is the split that the task begins as, which has no other alternative.
+        conflict.remove(0);
+        let task = self.tasks.last_mut().expect("a task is at work");
+        let dropped = backs_past(task, &conflict);
+        task.splits.truncate(task.splits.len() - dropped);
+        if let Some(deepest) = conflict.last() {
+            conflict.remove(deepest);
+            task.splits[deepest as usize].conflict.union(&conflict);
+        }
+        self.context.budget.charge(dropped as u64)
     }
 
     /// Takes the disjunction that the branch splits on next, and says whether the branch
@@ -663,19 +797,22 @@ impl Engine<'_> {
     fn settle(&mut self, branch: &mut Branch) -> Result<Settled, Exhausted> {
         while let Some(item) = branch.todo.pop_front() {
             self.context.budget.charge(1)?;
-            if !self.take(branch, item)? {
-                return Ok(Settled::Refuted);
+            if let Err(levels) = self.take(branch, item)? {
+                return Ok(Settled::Refuted(levels));
             }
         }
         // What was asked of numbers may have left none. Then the branch has no number among
         // its instances, and stands by what else it accepts. So it is with strings and with
-        // objects.
+        // objects. Which of the facts about numbers leave none is not worked out: all of them
+        // are taken to.
         if std::mem::take(&mut branch.numbers_asked)
             && branch.types.contains(InstanceType::Number)
             && branch.numbers.is_empty(&mut self.context.budget)?
-            && !branch.restrict(NUMBER.complement())
         {
-            return Ok(Settled::Refuted);
+            let why = branch.numbers_from.clone();
+            if !branch.restrict_by(NUMBER.complement(), || why) {
+                return Ok(Settled::Refuted(branch.no_type()));
+            }
         }
         let Context {
             languages, budget, ..
@@ -683,9 +820,11 @@ impl Engine<'_> {
         if std::mem::take(&mut branch.strings_asked)
             && branch.types.contains(InstanceType::String)
             && branch.strings.is_empty(languages, budget)?
-            && !branch.restrict(STRING.complement())
         {
-            return Ok(Settled::Refuted);
+            let why = branch.strings_from.clone();
+            if !branch.restrict_by(STRING.complement(), || why) {
+                return Ok(Settled::Refuted(branch.no_type()));
+            }
         }
         // The objects come last: a branch that waits for the engine to decide what the
         // value of a property satisfies is asked again from here.
@@ -693,8 +832,9 @@ impl Engine<'_> {
             match self.left(branch, InstanceType::Object, false)? {
                 Left::Needs(wanted) => return Ok(Settled::Needs(wanted)),
                 Left::Nothing => {
-                    if !branch.restrict(OBJECT.complement()) {
-                        return Ok(Settled::Refuted);
+                    let why = self.objects_conflict(&branch.objects)?;
+                    if !branch.restrict_by(OBJECT.complement(), || why) {
+                        return Ok(Settled::Refuted(branch.no_type()));
                     }
                 }
                 Left::Unknown(cause) => branch.objects_depend = Some(cause),
@@ -703,13 +843,15 @@ impl Engine<'_> {
         }
         branch.objects_asked = false;
         // And the arrays after them, which wait for the values of their items in the same
-        // way. A branch that waits here has been asked about its objects.
+        // way. A branch that waits here has been asked about its objects. Which of the facts
+        // about arrays leave none is not worked out: all of them are taken to.
         if branch.arrays_asked && branch.types.contains(InstanceType::Array) {
             match self.left(branch, InstanceType::Array, false)? {
                 Left::Needs(wanted) => return Ok(Settled::Needs(wanted)),
                 Left::Nothing => {
-                    if !branch.restrict(ARRAY.complement()) {
-                        return Ok(Settled::Refuted);
+                    let why = branch.arrays_from.clone();
+                    if !branch.restrict_by(ARRAY.complement(), || why) {
+                        return Ok(Settled::Refuted(branch.no_type()));
                     }
                 }
                 Left::Unknown(cause) => branch.arrays_depend = Some(cause),
@@ -741,7 +883,9 @@ impl Engine<'_> {
         let mut lowest = tasks.last().map_or(usize::MAX, |task| task.lowest);
         // What the engine knows of a c-reference. One that a task is deciding, or that was
         // found to accept nothing only as long as tasks are at work, is taken to accept
-        // nothing, and the task at work notes the lowest of those tasks.
+        // nothing, and the task at work notes the lowest of those tasks. Such an answer holds
+        // for as long as the task at work does, so a refutation that takes it holds whichever
+        // alternatives the splits of the task are at, and it has no level.
         let mut ask = |of: CRefId| match of {
             Terms::NOTHING => Some(Found::Nothing),
             Terms::ANYTHING => Some(Found::Instance(Witness::plain(Value::Null))),
@@ -773,6 +917,35 @@ impl Engine<'_> {
             task.lowest = lowest;
         }
         Ok(left)
+    }
+
+    /// The levels of the facts that leave no object, where the search found none. Of what
+    /// the engine knows of c-references, only what it knows for good is taken: an answer
+    /// that holds only as long as a task is at work would make the task at work depend on
+    /// that task, which the search itself may not have done.
+    fn objects_conflict(&mut self, objects: &Objects) -> Result<Levels, Exhausted> {
+        let Self {
+            context,
+            found,
+            partitions,
+            ..
+        } = self;
+        let Context {
+            terms,
+            languages,
+            budget,
+        } = &mut **context;
+        let mut ask = |of: CRefId| match of {
+            Terms::NOTHING => Some(Found::Nothing),
+            _ => found.get(&of).cloned(),
+        };
+        let mut solver = Solver {
+            terms,
+            languages,
+            budget,
+            partitions,
+        };
+        objects.conflict(&mut solver, &mut ask)
     }
 
     /// What the branch gives: an instance, if it is known to accept one that can be given.
@@ -812,24 +985,27 @@ impl Engine<'_> {
         ))
     }
 
-    /// Takes one term into a branch. Returns whether the branch still stands.
-    fn take(&mut self, branch: &mut Branch, item: Item) -> Result<bool, Exhausted> {
+    /// Takes one term into a branch, and says whether that refuted it.
+    fn take(&mut self, branch: &mut Branch, item: Item) -> Result<Taken, Exhausted> {
         let Item {
             term,
             negated,
             within,
+            level,
         } = item;
         if let Term::Ref(variable) = self.context.terms.term(term) {
-            return self.unfold(branch, *variable, negated, within);
+            return self.unfold(branch, *variable, negated, within, level);
         }
         let found = self.context.terms.term(term);
         let stands = match (found, negated) {
             (Term::True, false) | (Term::False, true) => true,
-            (Term::False, false) | (Term::True, true) => false,
-            (Term::TypeIs(types), false) => branch.restrict(*types),
-            (Term::TypeIs(types), true) => branch.restrict(types.complement()),
-            (Term::BoolConst(value), false) => branch.restrict(BOOLEAN) && branch.exclude(!*value),
-            (Term::BoolConst(value), true) => branch.exclude(*value),
+            (Term::False, false) | (Term::True, true) => return Ok(Err(Levels::of(level))),
+            (Term::TypeIs(types), false) => branch.restrict(*types, level),
+            (Term::TypeIs(types), true) => branch.restrict(types.complement(), level),
+            (Term::BoolConst(value), false) => {
+                branch.restrict(BOOLEAN, level) && branch.exclude(!*value, level)
+            }
+            (Term::BoolConst(value), true) => branch.exclude(*value, level),
             // Only a number is a certain number. What is no number satisfies every other
             // term about numbers, so only a number fails one.
             (
@@ -842,10 +1018,11 @@ impl Engine<'_> {
                 _,
             ) => {
                 let of_numbers_only = negated != matches!(found, Term::NumConst(_));
-                let stands = !of_numbers_only || branch.restrict(NUMBER);
+                let stands = !of_numbers_only || branch.restrict(NUMBER, level);
                 if stands && branch.types.contains(InstanceType::Number) {
                     branch.numbers.take(found, negated);
                     branch.numbers_asked = true;
+                    branch.numbers_from.insert(level);
                 }
                 stands
             }
@@ -853,11 +1030,12 @@ impl Engine<'_> {
             // fails another term about strings.
             (Term::StrConst(_) | Term::Patt(_) | Term::MinLen(_) | Term::MaxLen(_), _) => {
                 let of_strings_only = negated != matches!(found, Term::StrConst(_));
-                let stands = !of_strings_only || branch.restrict(STRING);
+                let stands = !of_strings_only || branch.restrict(STRING, level);
                 if stands && branch.types.contains(InstanceType::String) {
                     let languages = &mut self.context.languages;
                     branch.strings.take(found, negated, languages);
                     branch.strings_asked = true;
+                    branch.strings_from.insert(level);
                 }
                 stands
             }
@@ -871,12 +1049,12 @@ impl Engine<'_> {
                 | Term::MaxProps(_),
                 _,
             ) => {
-                let stands = !negated || branch.restrict(OBJECT);
-                if !stands || !branch.types.contains(InstanceType::Object) {
-                    return Ok(stands);
+                let stands = !negated || branch.restrict(OBJECT, level);
+                if stands && branch.types.contains(InstanceType::Object) {
+                    let found = found.clone();
+                    return self.take_about_objects(branch, &found, negated, level);
                 }
-                let found = found.clone();
-                return self.take_about_objects(branch, &found, negated);
+                stands
             }
             // And what is no array satisfies every term about arrays.
             (
@@ -887,7 +1065,7 @@ impl Engine<'_> {
                 | Term::MaxIts(_),
                 _,
             ) => {
-                let stands = !negated || branch.restrict(ARRAY);
+                let stands = !negated || branch.restrict(ARRAY, level);
                 if stands && branch.types.contains(InstanceType::Array) {
                     let found = found.clone();
                     let Context { terms, budget, .. } = &mut *self.context;
@@ -896,16 +1074,20 @@ impl Engine<'_> {
                     budget.charge(branch.arrays.weight() / 8)?;
                     branch.arrays.take(&found, negated, terms);
                     branch.arrays_asked = true;
+                    branch.arrays_from.insert(level);
                 }
                 stands
             }
-            (Term::Unknown(leaf), _) => branch.take(*leaf, negated, &self.context.terms),
+            (Term::Unknown(leaf), _) => {
+                return Ok(branch.take(*leaf, negated, level, &self.context.terms));
+            }
             (Term::AllOf(parts), false) | (Term::AnyOf(parts), true) => {
                 let parts = parts.iter();
                 branch.todo.extend(parts.map(|part| Item {
                     term: *part,
                     negated,
                     within,
+                    level,
                 }));
                 true
             }
@@ -918,40 +1100,48 @@ impl Engine<'_> {
                     term: *inner,
                     negated: !negated,
                     within,
+                    level,
                 });
                 true
             }
             (Term::Ref(_), _) => unreachable!("a reference was unfolded above"),
         };
-        Ok(stands)
+        Ok(if stands {
+            Ok(())
+        } else {
+            Err(branch.no_type())
+        })
     }
 
-    /// Takes a term about objects into a branch that may still be an object. Returns
-    /// whether the branch still stands.
+    /// Takes a term about objects into a branch that may still be an object, as a fact of
+    /// a level asks.
     fn take_about_objects(
         &mut self,
         branch: &mut Branch,
         term: &Term,
         negated: bool,
-    ) -> Result<bool, Exhausted> {
+        level: u32,
+    ) -> Result<Taken, Exhausted> {
         let Term::PNames(variable) = term else {
-            branch.objects.take(term, negated, &mut self.context.terms);
+            branch
+                .objects
+                .take(term, negated, level, &mut self.context.terms);
             branch.objects_asked = true;
-            return Ok(true);
+            return Ok(Ok(()));
         };
         // Every name is of the language of the strings that the schema accepts: none is
         // outside it. Where no language says which strings those are, this is a leaf.
         let Some(names) = self.names(*variable)? else {
             let leaf = self.context.terms.names(*variable);
-            return Ok(branch.take(leaf, negated, &self.context.terms));
+            return Ok(branch.take(leaf, negated, level, &self.context.terms));
         };
         let Context {
             terms, languages, ..
         } = &mut *self.context;
         let outside = languages.outside([names]);
-        branch.objects.names(outside, negated, terms);
+        branch.objects.names(outside, negated, level, terms);
         branch.objects_asked = true;
-        Ok(true)
+        Ok(Ok(()))
     }
 
     /// The language of the strings that the schema of a variable accepts, or `None` if no
@@ -986,7 +1176,7 @@ impl Engine<'_> {
                 continue;
             }
             if let Some(choice) = branch.choices.pop_front() {
-                let alternatives = alternatives(&self.context.terms, &choice);
+                let alternatives = alternatives(&self.context.terms, &choice, 0);
                 splits.push((branch, alternatives));
                 continue;
             }
@@ -1018,95 +1208,139 @@ impl Engine<'_> {
         variable: VarId,
         negated: bool,
         within: Option<usize>,
-    ) -> Result<bool, Exhausted> {
+        level: u32,
+    ) -> Result<Taken, Exhausted> {
         if let Some(&open) = branch.taken.get(&(variable, !negated)) {
             // The variable and its negation in one branch: nothing is both. Unless the one
             // asks for the other, which is the schema that is negated inside itself.
-            return match within {
-                Some(from) if self.leads_to(branch, open, from, false)? => {
-                    self.depend_on_recursion(branch, variable, from);
-                    Ok(true)
-                }
-                _ => Ok(false),
+            let way = match within {
+                Some(from) => self.leads_to(branch, open, from, false)?,
+                None => None,
             };
+            if let (Some(from), Some(mut way)) = (within, way) {
+                way.insert(level);
+                self.depend_on_recursion(branch, variable, from, way);
+                return Ok(Ok(()));
+            }
+            let mut both = Levels::of(level);
+            both.insert(self.unfoldings[open].level);
+            return Ok(Err(both));
         }
         if let Some(&open) = branch.taken.get(&(variable, negated)) {
             // Taken before, so there is nothing to take in. A reference of A or B themselves
             // stands in no unfolding and closes no cycle.
             let Some(from) = within else {
-                return Ok(true);
+                return Ok(Ok(()));
             };
-            if !negated && self.leads_to(branch, open, from, true)? {
-                return Ok(false);
+            if !negated && let Some(mut way) = self.leads_to(branch, open, from, true)? {
+                way.insert(level);
+                return Ok(Err(way));
             }
-            if self.leads_to(branch, open, from, false)? {
-                self.depend_on_recursion(branch, variable, from);
+            if let Some(mut way) = self.leads_to(branch, open, from, false)? {
+                way.insert(level);
+                self.depend_on_recursion(branch, variable, from, way);
             } else {
-                branch.met.insert((open, from));
+                branch.met.entry((open, from)).or_insert(level);
             }
-            return Ok(true);
+            return Ok(Ok(()));
         }
         let unfolding = self.unfoldings.len();
         self.unfoldings.push(Unfolding {
             variable,
             negated,
             within,
+            level,
         });
         branch.taken.insert((variable, negated), unfolding);
         branch.todo.push_back(Item {
             term: self.context.terms.variable(variable).body,
             negated,
             within: Some(unfolding),
+            level,
         });
-        Ok(true)
+        Ok(Ok(()))
     }
 
     /// Whether what the unfolding `open` asks for leads to the unfolding `from`: by the
     /// references that were unfolded, and by those that met a variable taken before. With
-    /// `positive`, only by way of variables that are taken for true.
+    /// `positive`, only by way of variables that are taken for true. If it does, the levels
+    /// of the references on the way.
     fn leads_to(
         &mut self,
         branch: &Branch,
         open: usize,
         from: usize,
         positive: bool,
-    ) -> Result<bool, Exhausted> {
-        // The way is looked for from its end: from an unfolding to those that ask for it.
-        let (mut seen, mut pending) = (BTreeSet::new(), vec![from]);
-        while let Some(index) = pending.pop() {
+    ) -> Result<Option<Levels>, Exhausted> {
+        // The way is looked for from its end: from an unfolding to those that ask for it,
+        // each with the one that it was reached from and the level of the reference between.
+        let mut seen: BTreeMap<usize, Option<(usize, u32)>> = BTreeMap::new();
+        let mut pending = vec![(from, None)];
+        while let Some((index, reached)) = pending.pop() {
             let unfolding = self.unfoldings[index];
-            if (positive && unfolding.negated) || !seen.insert(index) {
+            if (positive && unfolding.negated) || seen.contains_key(&index) {
                 continue;
             }
+            seen.insert(index, reached);
             self.context.budget.charge(1)?;
             if index == open {
-                return Ok(true);
+                // The levels of the references from `open` back to `from`, and of the
+                // reference that unfolded `open`. The way back is no longer than the search
+                // that found it, which charged for every unfolding that it looked at.
+                let mut way = Levels::of(unfolding.level);
+                let mut at = index;
+                while let Some(Some((next, level))) = seen.get(&at) {
+                    way.insert(*level);
+                    at = *next;
+                }
+                return Ok(Some(way));
             }
-            pending.extend(unfolding.within);
+            if let Some(asks) = unfolding.within {
+                pending.push((asks, Some((index, unfolding.level))));
+            }
             let references = branch.met.range((index, 0)..=(index, usize::MAX));
-            pending.extend(references.map(|&(_, stands_in)| stands_in));
+            pending.extend(
+                references.map(|(&(_, stands_in), &level)| (stands_in, Some((index, level)))),
+            );
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// Makes a branch depend on a leaf for a cycle that is not modelled. `from` is the
-    /// unfolding in which the reference stands that closes the cycle.
-    fn depend_on_recursion(&mut self, branch: &mut Branch, variable: VarId, from: usize) {
+    /// unfolding in which the reference stands that closes the cycle, and `way` the levels
+    /// of the references of the cycle.
+    fn depend_on_recursion(
+        &mut self,
+        branch: &mut Branch,
+        variable: VarId,
+        from: usize,
+        way: Levels,
+    ) {
         let closes = self.unfoldings[from].variable;
         let closes = self.context.terms.variable(closes).node;
         let leaf = self.context.terms.recursion(variable, closes);
-        branch.holds.insert(leaf);
+        branch.holds.entry(leaf).or_insert(way);
         branch.covered = TypeSet::ALL;
     }
 }
 
-/// The alternatives of a disjunction, each made when it is asked for.
-fn alternatives(terms: &Terms, choice: &Item) -> Box<dyn Iterator<Item = Alternative>> {
+/// How many splits of a task a refutation with this conflict set backs up past: those after
+/// the deepest split of the set, which the split that the task begins as stands in for.
+fn backs_past(task: &Task, conflict: &Levels) -> usize {
+    let deepest = conflict.last().filter(|deepest| *deepest > 0);
+    let kept = deepest.map_or(0, |deepest| deepest as usize + 1);
+    task.splits.len().saturating_sub(kept)
+}
+
+/// The alternatives of a disjunction, each made when it is asked for, for a split at a
+/// level.
+fn alternatives(terms: &Terms, choice: &Item, level: u32) -> Box<dyn Iterator<Item = Alternative>> {
     let within = choice.within;
     let item = move |term: TermId, negated| Item {
         term,
         negated,
         within,
+        level,
     };
     match (terms.term(choice.term), choice.negated) {
         // One of them holds, or one of them does not.
@@ -3672,6 +3906,26 @@ mod tests {
     }
 
     #[test]
+    fn a_refutation_backs_up_past_the_splits_that_have_no_part_in_it() {
+        // Five choices of a hundred ways each, every one of which a string of a hundred
+        // characters satisfies, and then one that no string satisfies. The choices are met
+        // first and split first, and the last one leaves no alternative under the ways of all
+        // five. Backing up one split at a time takes every remaining way of each choice, five
+        // hundred alternatives. The refutation takes no fact of the five, so the check backs
+        // up past all of them at once.
+        let ways = |choice: u64| {
+            let ways = (0..100)
+                .map(|way| json!({"minLength": way, "maxLength": 1000 * (choice + 1) + way}));
+            json!({"anyOf": ways.collect::<Vec<_>>()})
+        };
+        let mut all: Vec<Value> = (0..5).map(ways).collect();
+        all.push(json!({"anyOf": [{"type": "number"}, {"type": "boolean"}]}));
+        let b = json!({"type": "string", "allOf": all});
+        let small = Checker::new().budget(500);
+        assert_eq!(small.subsumes(&json!(false), &b).unwrap(), Verdict::Yes);
+    }
+
+    #[test]
     fn a_split_tries_every_alternative() {
         let terms = &mut Terms::default();
         let parts: Vec<TermId> = [true, false]
@@ -3690,7 +3944,7 @@ mod tests {
                     term
                 }
             };
-            alternatives(terms, &choice)
+            alternatives(terms, &choice, 0)
                 .map(|all| all.iter().map(literal).collect::<Vec<_>>().join(" and "))
                 .collect::<Vec<_>>()
         };

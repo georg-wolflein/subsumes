@@ -564,6 +564,20 @@ impl Terms {
         }
     }
 
+    /// Whether two c-references accept nothing together on the face of it: one of them
+    /// accepts nothing, or one holds a variable that the other holds negated. Their
+    /// conjunction is not made.
+    pub fn contradict(&self, a: CRefId, b: CRefId) -> bool {
+        if a == Self::NOTHING || b == Self::NOTHING {
+            return true;
+        }
+        let of_b = self.literals(b);
+        let negated = |(variable, negated): &Literal| of_b.binary_search(&(*variable, !negated));
+        self.literals(a)
+            .iter()
+            .any(|literal| negated(literal).is_ok())
+    }
+
     /// The c-reference that says what two say together. A variable and its negation
     /// together accept nothing.
     pub fn both(&mut self, a: CRefId, b: CRefId) -> CRefId {
