@@ -1,5 +1,6 @@
 //! What several tests share.
 
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -31,11 +32,20 @@ impl Random {
 }
 
 /// The file of every case of the corpus in `benchmark/`, which `make corpus` unpacks: every
-/// JSON file in the folder of a collection, which `collections.json` names.
+/// JSON file in the folder of a collection listed in `manifest.json` or `collections.json`.
 pub(crate) fn corpus_cases() -> Vec<PathBuf> {
     let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("benchmark");
-    let text = std::fs::read_to_string(corpus.join("collections.json")).unwrap();
-    let collections: serde_json::Map<String, Value> = serde_json::from_str(&text).unwrap();
+    let collections: Value = match std::fs::read_to_string(corpus.join("manifest.json")) {
+        Ok(text) => serde_json::from_str::<Value>(&text).unwrap()["collections"].take(),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let text = std::fs::read_to_string(corpus.join("collections.json")).unwrap();
+            serde_json::from_str(&text).unwrap()
+        }
+        Err(error) => panic!("could not read benchmark/manifest.json: {error}"),
+    };
+    let collections = collections
+        .as_object()
+        .expect("collections must be an object");
     let mut cases = Vec::new();
     for collection in collections.keys() {
         for entry in std::fs::read_dir(corpus.join(collection)).unwrap() {
